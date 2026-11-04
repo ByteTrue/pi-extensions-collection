@@ -128,6 +128,9 @@ hook `session_before_compact`.
 
 ## Install
 
-Run the repo's installer and tick `pi-context-guard` in the menu — it is **opt-in** (unticked by default, marked in the menu). The command is in [Install](../#install).
+Run the repo's installer and tick `pi-context-guard` in the menu — the command is in
+[Install](../#install). It registers `ctx_reduce` / `ctx_search` / `ctx_expand`, so
+the installer skips it when `@cortexkit/pi-magic-context` is installed: Pi refuses to
+start when two extensions register one tool name. Remove one of the two first.
 
 Restart or reload Pi afterwards.

@@ -8,6 +8,7 @@
 // Idempotent: re-running overwrites in place - that IS the update path. No cache
 // and no ref pinning: the files always come from the repo's main branch on GitHub raw.
 import { promises as fs } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { emitKeypressEvents } from 'node:readline';
@@ -15,20 +16,26 @@ import { emitKeypressEvents } from 'node:readline';
 const REPO_RAW = 'https://raw.githubusercontent.com/ByteTrue/pi-extensions-collection/main';
 const EXTENSIONS_DIR = join(homedir(), '.pi', 'agent', 'extensions');
 
+// Pi refuses to start when two extensions register the same tool name ("Tool "ctx_reduce"
+// conflicts with ..."), and the second extension's whole load fails. So an extension
+// whose tool names another installed package already provides is skipped, not installed.
+const TOOL_CONFLICTS = [
+  { entry: 'pi-context-guard', providedBy: 'pi-magic-context', tools: 'ctx_reduce / ctx_search / ctx_expand' },
+];
+
 // One entry per installable extension: the repo-relative source file (its base name
 // is the file name it keeps under EXTENSIONS_DIR) and the label shown in the picker.
 // Adding an extension is one line here; scripts/check-installer.mjs fails when a
 // pi-*/ directory never made it into this list.
 //
-// Entries are ticked by default (plain <enter> installs them). An extension that is
-// opinionated or niche opts out with optIn: true - it still shows in the menu and
-// --all still installs it, it is just not pre-selected.
+// Every entry starts ticked: plain <enter> installs all of them, space is how you
+// drop the ones a machine does not want.
 const EXTENSIONS = [
   { source: 'pi-bash-timeout/pi-bash-timeout.ts', summary: '300s default + cap for the built-in bash / powershell tools' },
   { source: 'pi-background-terminal/pi-background-terminal.ts', summary: 'background_run / background_status / background_kill tools + the /background menu' },
   { source: 'pi-ask-user/pi-ask-user.ts', summary: 'minimal ask_user tool: 1-4 single/multi-select questions with back-navigation' },
   { source: 'pi-goal/pi-goal.ts', summary: 'minimal /goal: one objective per session, auto-continued until goal_done' },
-  { source: 'pi-context-guard/pi-context-guard.ts', optIn: true, summary: 'compact at 400k, session file in prompt, deterministic tool-result pruning + ctx_reduce/search/expand' },
+  { source: 'pi-context-guard/pi-context-guard.ts', summary: 'compact at 400k, session file in prompt, deterministic tool-result pruning + ctx_reduce/search/expand' },
   {
     source: 'pi-vendor/pi-vendor.ts',
     summary: '/vendor TUI + /vendor-ai prompt: manage providers and models in Pi models.json',
@@ -48,11 +55,10 @@ function usage(stream) {
 }
 
 // Arrow-key multi-select. Resolves with the chosen entries, or null when cancelled
-// (esc / ctrl-c). Default-on entries start ticked and optIn entries start unticked,
-// so plain <enter> installs the safe baseline and space is how you add or drop one.
+// (esc / ctrl-c). Everything starts ticked, so plain <enter> installs the full set.
 function pick(items) {
   let index = 0;
-  const selected = items.map((item) => !item.optIn);
+  const selected = items.map(() => true);
   let drawn = 0;
 
   const frame = () => {
@@ -61,7 +67,7 @@ function pick(items) {
     const width = process.stdout.columns > 0 ? process.stdout.columns - 1 : Infinity;
     return [
       'Select the extensions to install:',
-      ...items.map((item, i) => `${i === index ? '❯' : ' '} ${selected[i] ? '◉' : '○'} ${basename(item.source, '.ts')}${item.optIn ? ' (opt-in)' : ''}  ${item.summary}`),
+      ...items.map((item, i) => `${i === index ? '❯' : ' '} ${selected[i] ? '◉' : '○'} ${basename(item.source, '.ts')}  ${item.summary}`),
       '↑/↓ move · space toggle · a all · enter install · esc cancel',
     ].map((line) => (line.length > width ? `${line.slice(0, width - 1)}…` : line));
   };
@@ -135,7 +141,29 @@ async function installFile(source, dest) {
   console.log(`Installed ${basename(source)} → ${dest}`);
 }
 
+/** Settings text of the user and the current project, concatenated: whatever is
+ * installed by path here is what Pi will load. */
+function settingsText() {
+  let text = '';
+  for (const file of [join(homedir(), '.pi', 'agent', 'settings.json'), join(process.cwd(), '.pi', 'settings.json')]) {
+    try {
+      text += readFileSync(file, 'utf8');
+    } catch {
+      // no settings file there
+    }
+  }
+  return text;
+}
+
 async function install(entry) {
+  const conflict = TOOL_CONFLICTS.find((c) => entry.source.startsWith(`${c.entry}/`) && settingsText().includes(c.providedBy));
+  if (conflict) {
+    console.log(
+      `Skipped ${conflict.entry}: it registers ${conflict.tools}, which ${conflict.providedBy} already provides. ` +
+        `Pi will not start with both, so remove one of them first.`,
+    );
+    return;
+  }
   await installFile(entry.source, join(EXTENSIONS_DIR, basename(entry.source)));
   for (const resource of entry.resources ?? []) {
     await installFile(resource.source, join(EXTENSIONS_DIR, resource.destination));

@@ -25,10 +25,15 @@ It opens with an arrow-key checklist — `↑`/`↓` move, `space` toggles, `a` 
 all, `enter` installs — so a machine keeps only the extensions it wants. `--all`
 skips the menu and installs everything (for scripts, where there is no terminal).
 
-Most extensions are pre-ticked, so plain `<enter>` installs them.
-`pi-context-guard` is `opt-in`: it starts unticked (marked in the menu) because it
-changes compaction behavior for the whole session. `space` ticks it; `--all`
-installs it too.
+Every extension starts ticked, so plain `<enter>` installs all of them and `space`
+is how you drop the ones a machine does not want.
+
+One extension is skipped automatically: `pi-context-guard` registers
+`ctx_reduce` / `ctx_search` / `ctx_expand`, the same tool names
+[`@cortexkit/pi-magic-context`](https://github.com/ByteTrue) provides. Pi refuses to
+start when two extensions register one tool name, so the installer detects that
+package in your settings and leaves `pi-context-guard` out. Remove one of the two if
+you want the other.
 
 ```bash
 # macOS / Linux
@@ -58,7 +63,7 @@ You can also skip the script entirely: copy a `pi-*` directory into
 | [`pi-bash-timeout`](./pi-bash-timeout/) | Optional 300s default-and-cap for the built-in `bash`/`powershell` tools (two event hooks; registers no tools) |
 | [`pi-ask-user`](./pi-ask-user/) | Minimal `ask_user` tool: 1–4 single- or multi-select decision questions per call with back-navigation, answered via Pi's built-in dialogs |
 | [`pi-goal`](./pi-goal/) | Minimal `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until the model calls `goal_done` with evidence. The model can draft the objective itself via `goal_start` |
-| [`pi-context-guard`](./pi-context-guard/) | **Opt-in.** Large-window models (>400k) compact at 400k; the system prompt names the session file; stale/duplicate oversized tool results are deterministically pruned with `ctx_reduce` / `ctx_search` / `ctx_expand` and `/context-guard` |
+| [`pi-context-guard`](./pi-context-guard/) | Large-window models (>400k) compact at 400k; the system prompt names the session file; stale/duplicate oversized tool results are deterministically pruned with `ctx_reduce` / `ctx_search` / `ctx_expand` and `/context-guard` |
 | [`pi-vendor`](./pi-vendor/) | Pi-specific `/vendor` TUI plus the `/vendor-ai` prompt command: manage providers and models in Pi's `models.json`, with catalog/discovery and atomic writes. The only extension here with companion files |
 
 ## Development
