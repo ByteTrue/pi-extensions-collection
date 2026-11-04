@@ -89,3 +89,10 @@ extension simply can never be installed by the documented command.
 
 Editing an installed copy in `~/.pi/agent/extensions/` works too, but re-running
 `install.mjs` overwrites it.
+
+## Design notes
+
+The constraints this repo lives by — why drop-in means no npm dependencies, why tool
+names must be globally unique, what has already been ruled out — are in
+[`byissue/`](./byissue): `spec/index.md` for the current truth, `decisions/` for the
+calls that were made, and the epic that split this repo out of its predecessor.
