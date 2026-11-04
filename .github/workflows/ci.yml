@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Superseded runs on the same branch/PR are cancelled automatically.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      # Install-channel gate: every pi-*/ directory is listed in install.mjs.
+      - run: node scripts/check-installer.mjs
+      - run: npm ci
+      # Type-check any workspace that defines a `typecheck` script.
+      - run: npm run typecheck --workspaces --if-present
+      # Run every workspace's test suite (vitest).
+      - run: npm test

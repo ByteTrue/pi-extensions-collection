@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+coverage/
+*.tsbuildinfo
+.claude
+.pi/
+.tmp/
+.pi-subagents/
+.playwright-mcp/
+.codegraph/
+

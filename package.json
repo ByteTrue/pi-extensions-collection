@@ -1,0 +1,14 @@
+{
+  "name": "pi-extensions-collection",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Drop-in Pi extensions: copy a directory into ~/.pi/agent/extensions/ and it works. No npm publishing, no install step, no third-party dependencies.",
+  "type": "module",
+  "workspaces": [
+    "pi-*"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}
