@@ -469,6 +469,19 @@ describe("decideNudge", () => {
 		expect(postReduceTool).toBeUndefined();
 	});
 
+	it("applies queued drops at the next agent turn without requiring another user message", async () => {
+		const { handlers, tools, ctx } = harness({ usage: { tokens: 1000, contextWindow: 200_000 } });
+		const msgs = [bigResult("drop", 5000), { role: "assistant", content: "working" }];
+		handlers["context"]?.({ messages: msgs }, ctx);
+		await tools["ctx_reduce"]?.execute("r1", { ids: ["drop"] }, undefined, undefined, ctx);
+		handlers["context"]?.({ messages: msgs }, ctx);
+		expect(firstTextLength(msgs[0])).toBe(5000);
+
+		await handlers["agent_settled"]?.({}, ctx);
+		handlers["context"]?.({ messages: [...msgs, { role: "assistant", content: "automatic follow-up" }] }, ctx);
+		expect(msgs[0]?.content).toEqual([{ type: "text", text: "[pruned drop]" }]);
+	});
+
 	it("accumulates baseline across multiple tool_result events in one turn so a small tool never resets lastLevel", () => {
 		const { handlers, ctx } = harness();
 		const msgs = [{ role: "user", content: "u".repeat(240_000) }, bigResult("b0", 92_000)];
@@ -517,23 +530,45 @@ describe("protectedIds, measureTail, and ctx_reduce", () => {
 		expect(firstTextLength(messages[2])).toBe(4000);
 	});
 
-	it("returns the oldest 5 large reclaimable outputs in hints and uses true totals in buildNudgeReminder", () => {
+	it("offers one batch of the 15 largest candidates, not the oldest small outputs", () => {
 		const messages = [
-			...Array.from({ length: 7 }, (_, i) => bigResult(`id-${i + 1}`, 3000)),
+			...Array.from({ length: 20 }, (_, i) => bigResult(`id-${i + 1}`, 4000 + i)),
 			{ role: "user", content: "n" },
 		];
-		const tail = measureTail(messages, new Set(), new Set(["id-2"]));
-		// id-2 is already requested so excluded; oldest 5 remaining are id-1, id-3, id-4, id-5, id-6.
-		expect(tail.hints.map((h) => h.id)).toEqual(["id-1", "id-3", "id-4", "id-5", "id-6"]);
-		expect(tail.reclaimableCount).toBe(6);
+		const tail = measureTail(messages, new Set(), new Set(["id-20"]));
+		expect(tail.hints.map((h) => h.id)).toEqual(Array.from({ length: 15 }, (_, i) => `id-${19 - i}`));
+		expect(tail.reclaimableCount).toBe(19);
 
 		const reminder = buildNudgeReminder(
-			{ fire: true, sticky: false, level: "gentle", reason: "band-crossing" },
+			{ fire: true, sticky: false, level: "urgent", reason: "band-crossing" },
 			tail.hints,
 			{ count: tail.reclaimableCount, tokens: tail.reclaimableTokens },
 		);
-		expect(reminder).toContain("6 tool output(s), ~4500 tokens");
-		expect(reminder).toContain("Oldest reclaimable: bash id-1 (3000 chars)");
+		expect(reminder).toContain("Largest reclaimable: bash id-19");
+		expect(reminder).toContain("one ctx_reduce call");
+	});
+
+	it("does not offer small tool results for manual reduction", async () => {
+		const { handlers, tools, ctx } = harness();
+		handlers["context"]?.({ messages: [bigResult("small", 2029), { role: "assistant", content: "working" }] }, ctx);
+		const listed = await tools["ctx_reduce"]?.execute("list", {}, undefined, undefined, ctx);
+		expect(listed?.content[0]?.text).toBe("No tool results available to drop.");
+
+		const explicit = await tools["ctx_reduce"]?.execute("drop", { ids: ["small"] }, undefined, undefined, ctx);
+		expect(explicit?.content[0]?.text).toContain("Queued 1 result(s)");
+	});
+
+	it("counts thinking and tool arguments when measuring the tail", () => {
+		const messages = [{
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "t".repeat(3000) },
+				{ type: "toolCall", id: "call", name: "write", arguments: { content: "x".repeat(5000) } },
+			],
+		}];
+		const tail = measureTail(messages, new Set());
+		expect(tail.tailTokens).toBeGreaterThanOrEqual(estimateTokens(8000));
+		expect(tail.reclaimableTokens).toBe(0);
 	});
 
 	it("age pruning never touches a protected result", () => {

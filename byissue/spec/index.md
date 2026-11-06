@@ -18,6 +18,7 @@
 - **子目录 `package.json` 永远 private、永不发布**：它存在只为让 CI 能 typecheck 和跑测试。
 - **宿主模块不得进 `dependencies`**：物理拷贝会绕过 Pi 的扩展模块映射，造出重复的类、注册表和初始化开销（Pi 会就此报警告）。它们只属于 `peerDependencies`。
 - **工具名必须全局唯一**：Pi 遇到两个扩展注册同名工具会**拒绝启动**，后加载的那个扩展整个不加载（连它别的工具一起失去）。`pi-context-guard` 的 `ctx_reduce` / `ctx_search` / `ctx_expand` 与 `@cortexkit/pi-magic-context` 同名，所以安装器在用户设置里读到该包就跳过 `pi-context-guard`。这件事只能在安装器里判断：扩展在加载期调用 `pi.getAllTools()` 会抛「runtime not initialized」，看不到别人注册了什么。
+- **裁剪只在 agent 边界落地**：`pi-context-guard` 在工具循环中只排队，新的用户轮次或 `agent_settled` 后的下一次上下文才改写，不能为了立即缩小上下文破坏当前缓存前缀。手动候选与自动裁剪共用 4000 字符门槛；小结果只能通过显式 ID 裁剪，不能进入提醒诱导重复操作。
 
 ## 做 / 不做
 

@@ -43,6 +43,9 @@ export const PRUNE_AGE_RESULTS = 40;
 /** …and only if its text is at least this long. Small results are not worth a
  * cache bust. */
 export const PRUNE_MIN_CHARS = 4000;
+/** One actionable batch: both the reminder and ctx_reduce list use these. */
+export const REDUCE_HINT_LIMIT = 15;
+export const REDUCE_HINT_TEXT = "Largest reclaimable";
 /** ctx_expand returns at most this many characters per call, then says where to
  * continue — otherwise expanding one huge output undoes the prune. */
 export const EXPAND_CHAR_BUDGET = 60_000;
@@ -162,13 +165,13 @@ export function buildNudgeReminder(
 	const count = totals?.count ?? hints.length;
 	const summary = `${count} tool output(s), ~${tokens} tokens`;
 	const hint = hints.length
-		? ` Oldest reclaimable: ${hints.map((h) => `${h.toolName || "tool"} ${h.id} (${h.chars} chars)`).join(", ")}.`
+		? ` ${REDUCE_HINT_TEXT}: ${hints.map((h) => `${h.toolName || "tool"} ${h.id} (${h.chars} chars)`).join(", ")}. Submit the used ids in one ctx_reduce call; no preliminary listing is needed.`
 		: "";
 	let body: string;
 	if (verdict.sticky) body = `Still unstamped: ${summary}. Stamp the ones you've used with ctx_reduce now.`;
 	else if (verdict.level === "gentle") body = `Housekeeping: ${summary} are reclaimable. Stamp each output with ctx_reduce as soon as you've taken what you need from it; don't wait for the task to finish.`;
 	else if (verdict.level === "firm") body = `${summary} are reclaimable. Make a ctx_reduce pass now over the outputs you've already used, then continue.`;
-	else body = `${summary} are still unstamped. Call ctx_reduce now, before your next tool call, on every output you've already used.`;
+	else body = `${summary} are still unstamped. Call ctx_reduce once now, before your next tool call, with the listed outputs you've already used. Small outputs are not candidates.`;
 	return `\n\n${NUDGE_SENTINEL}\n${body}${hint}\n</system-reminder>`;
 }
 
@@ -218,6 +221,7 @@ interface ToolResultLike {
 		id?: string;
 		name?: string;
 		arguments?: unknown;
+		thinking?: string;
 	}>;
 }
 
@@ -233,7 +237,10 @@ export interface PruneReport {
 function textLength(msg: ToolResultLike): number {
 	if (typeof msg.content === "string") return msg.content.length;
 	let n = 0;
-	for (const block of msg.content ?? []) if (block.type === "text") n += block.text?.length ?? 0;
+	for (const block of msg.content ?? []) {
+		if (block.type === "text" || block.type === "thinking") n += block.text?.length ?? block.thinking?.length ?? 0;
+		if (block.type === "toolCall") n += JSON.stringify(block.arguments ?? {}).length;
+	}
 	return n;
 }
 
@@ -269,6 +276,8 @@ export interface TailMeasurement {
 	reclaimableCount: number;
 	reclaimable: ReclaimHint[];
 	hints: ReclaimHint[];
+	/** Small active results are not advertised, but remain addressable by id. */
+	addressable: ReclaimHint[];
 	userTurn: number;
 }
 
@@ -281,6 +290,7 @@ export function measureTail(messages: ToolResultLike[], pruned: Set<string>, req
 	let reclaimableTokens = 0;
 	let userTurn = 0;
 	const reclaimable: ReclaimHint[] = [];
+	const addressable: ReclaimHint[] = [];
 	for (const msg of messages) {
 		const chars = typeof msg.content === "string" ? msg.content.length : textLength(msg);
 		tailTokens += estimateTokens(chars);
@@ -295,11 +305,13 @@ export function measureTail(messages: ToolResultLike[], pruned: Set<string>, req
 		) {
 			continue;
 		}
+		addressable.push({ id: msg.toolCallId, toolName: msg.toolName ?? "", chars });
+		if (chars < PRUNE_MIN_CHARS) continue;
 		reclaimableTokens += estimateTokens(chars);
 		reclaimable.push({ id: msg.toolCallId, toolName: msg.toolName ?? "", chars });
 	}
-	const hints = reclaimable.filter((r) => r.chars >= 2000).slice(0, 5);
-	return { tailTokens, reclaimableTokens, reclaimableCount: reclaimable.length, reclaimable, hints, userTurn };
+	const hints = [...reclaimable].sort((a, b) => b.chars - a.chars).slice(0, REDUCE_HINT_LIMIT);
+	return { tailTokens, reclaimableTokens, reclaimableCount: reclaimable.length, reclaimable, hints, addressable, userTurn };
 }
 
 /** Signatures of other extensions that also rewrite `context`. Running two
@@ -409,7 +421,7 @@ export function pruneMessages(messages: ToolResultLike[], options: PruneOptions)
 			if (!allowNew) {
 				// Batched: applying a drop mid tool loop changes the prefix on every
 				// model call of the loop. All requested drops of one turn land together
-				// at the next user turn, one bust instead of one per reduce call.
+				// at the next agent turn, one bust instead of one per reduce call.
 				report.queued++;
 				continue;
 			}
@@ -598,6 +610,7 @@ interface SessionState {
 	nudge: NudgeState;
 	lastNudgeReason: string;
 	dropsAppliedOnLastPass: boolean;
+	agentSettled: boolean;
 	foreignRewriter: string | null;
 }
 
@@ -608,10 +621,11 @@ function newSessionState(): SessionState {
 		protectedIds: new Set<string>(),
 		seenContext: false,
 		lastReport: { pruned: 0, replayed: 0, charsSaved: 0, candidates: 0, queued: 0 },
-		baseline: { tailTokens: 0, reclaimableTokens: 0, reclaimableCount: 0, reclaimable: [], hints: [], userTurn: 0 },
+		baseline: { tailTokens: 0, reclaimableTokens: 0, reclaimableCount: 0, reclaimable: [], hints: [], addressable: [], userTurn: 0 },
 		nudge: newNudgeState(),
 		lastNudgeReason: "",
 		dropsAppliedOnLastPass: false,
+		agentSettled: false,
 		foreignRewriter: null,
 	};
 }
@@ -640,6 +654,7 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 	};
 
 	pi.on("agent_settled", async (_event, ctx) => {
+		stateFor(ctx).agentSettled = true;
 		const usage = ctx.getContextUsage();
 		if (!usage || !shouldCompact(usage)) return;
 		// ctx.compact() is fire-and-forget inside Pi; awaiting its callbacks keeps
@@ -725,7 +740,8 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		// New prunes are admitted only at the start of a user turn. Mid-loop the
 		// model is comparing against the prefix it already has; changing it then
 		// costs a cache bust per tool call instead of one per turn.
-		const allowNew = last?.role === "user";
+		const allowNew = last?.role === "user" || s.agentSettled;
+		s.agentSettled = false;
 		s.lastReport = pruneMessages(messages, {
 			allowNew,
 			pruned: s.pruned,
@@ -738,7 +754,7 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		s.protectedIds = protectedIds(messages);
 		s.baseline = measureTail(messages, s.pruned, s.requested);
 
-		// Queued drops from ctx_reduce only land at the next user turn (allowNew).
+		// Queued drops from ctx_reduce land at the next agent turn (allowNew).
 		// Hold grace pending through the rest of the current tool loop, then capture
 		// the post-reduce baseline once the drops have actually been applied.
 		if (allowNew && s.nudge.grace && s.nudge.grace.baselineU === null) {
@@ -777,12 +793,14 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		const isProtected = (PROTECTED_TOOLS[(event.toolName ?? "").toLowerCase().replace(/^mcp_/, "")] ?? 0) > 0;
 		const addedTokens = estimateTokens(chars);
 		s.baseline.tailTokens += addedTokens;
-		if (!isProtected && !event.isError && event.toolCallId && !s.pruned.has(event.toolCallId) && !s.requested.has(event.toolCallId)) {
+		if (chars >= PRUNE_MIN_CHARS && !isProtected && !event.isError && event.toolCallId && !s.pruned.has(event.toolCallId) && !s.requested.has(event.toolCallId)) {
 			s.baseline.reclaimableTokens += addedTokens;
 			s.baseline.reclaimableCount++;
 			const item: ReclaimHint = { id: event.toolCallId, toolName: event.toolName ?? "", chars };
 			s.baseline.reclaimable.push(item);
-			if (chars >= 2000 && s.baseline.hints.length < 5) s.baseline.hints.push(item);
+			s.baseline.hints.push(item);
+			s.baseline.hints.sort((a, b) => b.chars - a.chars);
+			s.baseline.hints.length = Math.min(s.baseline.hints.length, REDUCE_HINT_LIMIT);
 		}
 		if (s.nudge.grace && s.nudge.grace.baselineU === null) return; // waiting for the post-reduce measurement
 		const verdict = decideNudge(s.nudge, {
@@ -831,7 +849,7 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		description:
 			"Drop tool results you no longer need, to shrink the context. Takes tool call ids (the id of the tool call whose output you want gone, or the id from a [pruned <id>] placeholder). " +
 			"The original stays in the session file and ctx_expand(id) brings it back, so this is never irreversible. " +
-			"Call with no ids to list the largest results currently taking space. The drops are batched and applied at the start of your next turn, so the cached prefix is never rewritten mid tool loop.",
+			"Call with no ids to list the largest results currently taking space. The drops are batched and applied at the start of the next agent turn, so the cached prefix is never rewritten mid tool loop.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -845,9 +863,11 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params: { ids?: string[] }, _signal, _onUpdate, ctx: ExtensionContext) {
 			const s = stateFor(ctx);
 			let active: ReclaimHint[];
+			let addressable: ReclaimHint[];
 			let protectedSet: Set<string>;
 			if (s.seenContext) {
 				active = s.baseline.reclaimable.filter((r) => !s.pruned.has(r.id) && !s.requested.has(r.id));
+				addressable = s.baseline.addressable.filter((r) => !s.pruned.has(r.id) && !s.requested.has(r.id));
 				protectedSet = s.protectedIds;
 			} else {
 				const contextEntries = (ctx.sessionManager as { buildContextEntries?: () => unknown[] } | undefined)?.buildContextEntries?.();
@@ -862,11 +882,12 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 				if (!entries) return err("No session file: this session is not persisted.");
 				const msgs = entries.map((e) => e.message as ToolResultLike | undefined).filter((m): m is ToolResultLike => Boolean(m?.role));
 				protectedSet = protectedIds(msgs);
-				active = measureTail(msgs, s.pruned, s.requested).reclaimable;
+				addressable = measureTail(msgs, s.pruned, s.requested).addressable;
+				active = addressable.filter((r) => r.chars >= PRUNE_MIN_CHARS);
 			}
 
 			if (!params.ids || params.ids.length === 0) {
-				const sized = [...active].sort((a, b) => b.chars - a.chars).slice(0, 15);
+				const sized = [...active].sort((a, b) => b.chars - a.chars).slice(0, REDUCE_HINT_LIMIT);
 				if (sized.length === 0) return ok("No tool results available to drop.");
 				return ok(
 					"Largest tool results still taking context space:\n" +
@@ -875,7 +896,7 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 				);
 			}
 
-			const known = new Set(active.map((r) => r.id));
+			const known = new Set(addressable.map((r) => r.id));
 			const accepted: string[] = [];
 			const unknown: string[] = [];
 			const already: string[] = [];
@@ -890,7 +911,7 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 				}
 			}
 			const parts: string[] = [];
-			if (accepted.length) parts.push(`Queued ${accepted.length} result(s) for dropping at the start of your next turn: ${accepted.join(", ")}. Nothing changes during this tool loop, so the cached prefix stays intact. Recover any of them with ctx_expand(id).`);
+			if (accepted.length) parts.push(`Queued ${accepted.length} result(s) for dropping at the start of the next agent turn: ${accepted.join(", ")}. Nothing changes during this tool loop, so the cached prefix stays intact. Recover any of them with ctx_expand(id).`);
 			if (already.length) parts.push(`Already dropped: ${already.join(", ")}.`);
 			if (protectedRejected.length) parts.push(`Protected (kept in context): ${protectedRejected.join(", ")}.`);
 			if (unknown.length) parts.push(`Not found in this session: ${unknown.join(", ")}.`);

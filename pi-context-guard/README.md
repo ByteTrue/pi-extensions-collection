@@ -56,8 +56,9 @@ stay pruned across restarts without any database.
 ## Tools
 
 - **`ctx_reduce({ ids? })`** — queues active tool results for dropping at the
-  start of the next user turn (keeping the current tool-loop prefix intact). Call
-  with no `ids` to list the 15 largest unpruned tool results currently in context.
+  start of the next agent turn (keeping the current tool-loop prefix intact). Call
+  with no `ids` to list the 15 largest unpruned tool results of at least 4000
+  characters currently in context. Smaller results can still be dropped by explicit id.
 - **`ctx_expand({ id, offset? })`** — returns the original content of a pruned tool
   result (by its tool call id) or of any earlier session entry (by entry id, as
   returned by `ctx_search`). Returns at most 60k characters per call and says which
@@ -82,12 +83,14 @@ time and replayed byte-identical afterwards:
 - **Channel 1 (nudge).** When a tool result finishes and the reclaimable share of
   the tail crosses a band — `U/T ≥ 0.2` gentle, `0.4` firm, `0.6` urgent, with
   `T ≥ 60k` and `U ≥ 25k` floors — a `<system-reminder>` is appended to that
-  result naming the oldest reclaimable ids. Bands only announce on the upward
+  result naming the 15 largest reclaimable ids, so one `ctx_reduce` call can handle
+  the batch without a preliminary listing. Only results of at least 4000 characters
+  count toward U. Bands only announce on the upward
   crossing; same-band re-fires need the reclaimable mass to regrow past
   `max(25k, 8% of T)` and five user turns; a band drop is observed silently.
 - **Grace after a reduce.** Once the agent calls `ctx_reduce`, reminders hold
   through the rest of the current tool loop and after the queued drops land at the
-  next user turn, until the reclaimable mass regrows past the refire threshold or
+  next agent turn, until the reclaimable mass regrows past the refire threshold or
   the band escalates above its pre-reduce level. Nagging right after compliance is
   the fastest way to make an agent ignore every future reminder.
 - **No search hint.** Magic Context appends a `<ctx-search-hint>` to new user
