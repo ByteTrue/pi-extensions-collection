@@ -2,7 +2,7 @@
   "name": "pi-vendor",
   "version": "0.0.0",
   "private": true,
-  "description": "Small extension (never published to npm): /vendor interactive wizard and /vendor-ai prompt command for Pi models.json, with relative bundled scripts. Installed as one TypeScript file by install.mjs.",
+  "description": "Small extension (never published to npm): /vendor interactive wizard for adding a provider or model to Pi models.json. The workflow that edits models.json with an agent lives in the provider-model-config skill instead.",
   "type": "module",
   "types": "./types/index.d.ts",
   "exports": {
@@ -13,7 +13,6 @@
   },
   "files": [
     "pi-vendor.ts",
-    "scripts/**",
     "README.md"
   ],
   "scripts": {

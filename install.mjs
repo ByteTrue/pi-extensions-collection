@@ -36,14 +36,7 @@ const EXTENSIONS = [
   { source: 'pi-ask-user/pi-ask-user.ts', summary: 'minimal ask_user tool: 1-4 single/multi-select questions with back-navigation' },
   { source: 'pi-goal/pi-goal.ts', summary: 'minimal /goal: one objective per session, auto-continued until goal_done' },
   { source: 'pi-context-guard/pi-context-guard.ts', summary: 'compact at 400k, session file in prompt, deterministic tool-result pruning + ctx_reduce/search/expand' },
-  {
-    source: 'pi-vendor/pi-vendor.ts',
-    summary: '/vendor TUI + /vendor-ai prompt: manage providers and models in Pi models.json',
-    resources: [
-      { source: 'pi-vendor/scripts/vendor.mjs', destination: 'pi-vendor/scripts/vendor.mjs' },
-      { source: 'pi-vendor/scripts/vendor-shared.js', destination: 'pi-vendor/scripts/vendor-shared.js' },
-    ],
-  },
+  { source: 'pi-vendor/pi-vendor.ts', summary: '/vendor TUI: add a provider or model to Pi models.json' },
 ];
 
 const ERASE_LINE = '\x1b[2K';
@@ -165,9 +158,6 @@ async function install(entry) {
     return;
   }
   await installFile(entry.source, join(EXTENSIONS_DIR, basename(entry.source)));
-  for (const resource of entry.resources ?? []) {
-    await installFile(resource.source, join(EXTENSIONS_DIR, resource.destination));
-  }
 }
 
 const args = process.argv.slice(2);

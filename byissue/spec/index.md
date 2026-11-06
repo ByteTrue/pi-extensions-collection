@@ -9,7 +9,7 @@
 ## 统一语言
 
 - **drop-in**：复制文件即生效的扩展。本仓唯一的分发形态。
-- **伴生资源**：必须与扩展文件一起复制的非入口文件。目前只有 `pi-vendor/scripts/*`（`/vendor-ai` 命令以相对路径调用它们）。
+- **伴生资源**：必须与扩展文件一起复制的非入口文件。`pi-vendor` 的 `scripts/` 与 `/vendor-ai` 迁出为 `provider-model-config` skill 后，已无扩展使用该机制，安装器里的复制通路一并删掉了。
 - **安装器清单**：`install.mjs` 的 `EXTENSIONS` 数组。它是分发真源，`scripts/check-installer.mjs` 守住它与 `pi-*` 目录一一对应。
 
 ## 不可破的约束

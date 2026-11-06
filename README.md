@@ -7,8 +7,7 @@ build step, no `node_modules` next to the extension.
 That constraint is the whole point of this repo, and it decides what may live here:
 
 - **Allowed**: `node:*` built-ins, Pi host modules (`@earendil-works/*`, `typebox` —
-  Pi maps them to its own copies), and companion files that the installer copies
-  alongside the extension (`pi-vendor/scripts/` is the one example).
+  Pi maps them to its own copies).
 - **Not allowed**: third-party npm dependencies, a bundler or build step, or anything
   that needs `npm install` in `~/.pi/agent/extensions/`. Anything that grows that far
   does not belong in this repo.
@@ -52,8 +51,8 @@ Picking a subset never deletes anything: extensions you leave unticked stay as t
 are. Restart or reload Pi afterwards; files in that directory load automatically.
 
 You can also skip the script entirely: copy a `pi-*` directory into
-`~/.pi/agent/extensions/<name>/` by hand. `pi-vendor` additionally needs its
-`scripts/` subdirectory copied next to `pi-vendor.ts`.
+`~/.pi/agent/extensions/<name>/` by hand. Every extension is a single file, so that is
+the whole copy.
 
 ## What is here
 
@@ -64,7 +63,7 @@ You can also skip the script entirely: copy a `pi-*` directory into
 | [`pi-ask-user`](./pi-ask-user/) | Minimal `ask_user` tool: 1–4 single- or multi-select decision questions per call with back-navigation, answered via Pi's built-in dialogs |
 | [`pi-goal`](./pi-goal/) | Minimal `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until the model calls `goal_done` with evidence. The model can draft the objective itself via `goal_start` |
 | [`pi-context-guard`](./pi-context-guard/) | Large-window models (>400k) compact at 400k; the system prompt names the session file; stale/duplicate oversized tool results are deterministically pruned with `ctx_reduce` / `ctx_search` / `ctx_expand` and `/context-guard` |
-| [`pi-vendor`](./pi-vendor/) | Pi-specific `/vendor` TUI plus the `/vendor-ai` prompt command: manage providers and models in Pi's `models.json`, with catalog/discovery and atomic writes. The only extension here with companion files |
+| [`pi-vendor`](./pi-vendor/) | Pi-specific `/vendor` TUI: add a custom provider or model to Pi's `models.json` with catalog lookup, upstream discovery and atomic writes. The agent-facing half of this work moved to the `provider-model-config` skill, which also covers opencode |
 
 ## Development
 
