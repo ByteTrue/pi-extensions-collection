@@ -84,9 +84,10 @@ Continuing is automatic, but it is not unconditional:
 One goal per session (a new `/goal` replaces the previous one). The state is
 written to the session transcript, so resuming the session restores the
 objective, its continuation count, and any recorded evidence — and `/tree`
-navigation follows the branch you land on. The two tools never coexist:
-`goal_start` is offered while no goal runs and `goal_done` while one does, so an
-ordinary session sees only the short `goal_start` schema.
+navigation follows the branch you land on. A session without a goal sees only
+the short `goal_start` schema. A paused goal keeps both tools: `goal_done` still
+works, because the work may finish in user-driven turns while the loop is off,
+and `goal_start` stays available so the objective can be replaced instead.
 
 Use it for work with a durable objective and a checkable finish line. For a
 one-off edit or a question, a normal prompt is still the right tool.
@@ -117,7 +118,7 @@ package.json      private, never published — exists only so workspace CI runs 
 | --- | --- |
 | `/goal` command | Parses `status`/`pause`/`resume`/`clear` as control words; anything else is the objective |
 | `goal_start` tool | Drafts + starts a goal; active only while no goal runs |
-| `goal_done` tool | Registered but inactive until a goal is active; requires `summary` + `evidence` |
+| `goal_done` tool | Registered but inactive until a goal is unfinished (active or paused); requires `summary` + `evidence` |
 | `before_agent_start` | Adds the objective as a `<goal>` system section — inside the cached prefix, and it survives compaction |
 | `agent_before_settle` | The loop: while active, appends one hidden continuation message and returns `continue: true` |
 | `agent_start` / `tool_call` | Count whether the current segment did real work |

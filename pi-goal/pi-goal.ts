@@ -24,7 +24,7 @@
  *      own suppression rule), and an aborted or failed run pauses it too.
  *
  * Surface: one command (`/goal` + status|pause|resume|clear), one tool (`goal_done`,
- * activated only while a goal is active), three event hooks (session_start /
+ * activated while a goal is unfinished: active or paused), three event hooks (session_start /
  * session_tree restore, turn_start+tool_call+agent_before_settle drive the loop,
  * before_agent_start injects the goal section), and a footer status line.
  */
@@ -263,16 +263,24 @@ export function registerGoal(pi: ExtensionAPI): void {
     publish(ctx);
   };
 
-  // The two tools are mutually exclusive by design: goal_done exists only while a goal runs
-  // (so it cannot be mistaken for a general "I'm done" signal), and goal_start only while
-  // none runs (so it cannot silently replace an active objective). Rewriting the set only
-  // when it actually differs keeps unrelated loadout changes untouched.
+  // goal_done lives while a goal is unfinished — active, or paused after an error or a
+  // text-only continuation. A pause does not erase the objective, and the agent may still
+  // reach the end of the work (user-driven turns), so it keeps a way to record completion.
+  // Without a goal the tool never exists, so it cannot pass as a general "I'm done"
+  // signal; goal_start comes back whenever the goal is not active, so a paused objective
+  // can still be replaced. Rewriting the set only when it actually differs keeps
+  // unrelated loadout changes untouched.
   const syncTool = () => {
-    const wanted = goal?.status === "active" ? GOAL_DONE_TOOL : GOAL_START_TOOL;
-    const unwanted = goal?.status === "active" ? GOAL_START_TOOL : GOAL_DONE_TOOL;
+    const done = goal?.status === "active" || goal?.status === "paused";
+    const start = goal?.status !== "active";
     const current = pi.getActiveTools();
-    if (current.includes(wanted) && !current.includes(unwanted)) return;
-    pi.setActiveTools([...current.filter((name) => name !== unwanted), wanted]);
+    const next = current.filter((name) =>
+      name === GOAL_DONE_TOOL ? done : name === GOAL_START_TOOL ? start : true,
+    );
+    if (start && !next.includes(GOAL_START_TOOL)) next.push(GOAL_START_TOOL);
+    if (done && !next.includes(GOAL_DONE_TOOL)) next.push(GOAL_DONE_TOOL);
+    if (next.length === current.length && next.every((name, index) => name === current[index])) return;
+    pi.setActiveTools(next);
   };
 
   // Branch-aware: after /tree navigation the active branch decides which goal is real.
@@ -395,9 +403,9 @@ export function registerGoal(pi: ExtensionAPI): void {
     name: GOAL_DONE_TOOL,
     label: "Complete Goal",
     description:
-      "Mark the active session goal complete. Valid only while a goal set with /goal is active: it is the one signal that stops the automatic continuation loop. Call it only after checking that the objective is actually true, and pass the evidence you checked. Never use it to report progress or to stop early — if you are blocked on the user, stop without calling tools instead.",
+      "Mark the session goal complete. Valid while a goal set with /goal exists and is unfinished (active or paused): on an active goal this is the one signal that stops the automatic continuation loop; on a paused one it records the completion. Call it only after checking that the objective is actually true, and pass the evidence you checked. Never use it to report progress or to stop early — if you are blocked on the user, stop without calling tools instead.",
     promptSnippet:
-      "The active /goal objective is verified complete — the only way the goal loop stops.",
+      "The /goal objective is verified complete — the only way the active goal loop stops.",
     promptGuidelines: [
       "Call goal_done only when the active goal's objective is verifiably true: summary says what was achieved, evidence names the concrete check (command and result, passing test, existing file or artifact)",
       "Do not call goal_done to report progress, to pause, or to stop early; a blocker for the user is reported by stopping without further tool calls",
@@ -407,7 +415,7 @@ export function registerGoal(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const input = params as GoalDoneParams;
       if (!goal) {
-        return toolText("No goal is active in this session; there is nothing to complete.", true);
+        return toolText("No goal is set in this session; there is nothing to complete.", true);
       }
       if (goal.status === "done") {
         return toolText("This goal is already complete.", true);

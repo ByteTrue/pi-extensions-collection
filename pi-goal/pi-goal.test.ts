@@ -234,7 +234,8 @@ describe("goal command", () => {
 
     await command(h, "pause");
     expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused" });
-    expect(h.activeTools()).not.toContain(GOAL_DONE_TOOL);
+    // Paused keeps goal_done: the objective is still there, and the work may finish later.
+    expect(h.activeTools()).toEqual(expect.arrayContaining([GOAL_START_TOOL, GOAL_DONE_TOOL]));
     expect(h.setStatusCalls.at(-1)).toBe("goal:paused");
 
     await command(h, "resume");
@@ -303,7 +304,8 @@ describe("continuation loop", () => {
     expect(result).toBeUndefined();
     expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused", runs: 1 });
     expect(h.notices.at(-1)?.text).toContain("the continuation called no tools");
-    expect(h.activeTools()).not.toContain(GOAL_DONE_TOOL);
+    // The loop stops but the objective stays completable: goal_done is still offered.
+    expect(h.activeTools()).toEqual(expect.arrayContaining([GOAL_START_TOOL, GOAL_DONE_TOOL]));
   });
 
   it("continues after the kickoff run even when it only answers in text", async () => {
@@ -447,6 +449,27 @@ describe("goal_done tool", () => {
     expect(result.continue).toBe(true);
   });
 
+  it("records completion of a paused goal without restarting the loop", async () => {
+    const h = harness();
+    await command(h, "Ship the release");
+    await command(h, "pause");
+
+    runTurn(h, true);
+    const result = await h.tools[GOAL_DONE_TOOL]!.execute(
+      "call-1",
+      { summary: "Release is out", evidence: "gh release view v1.2.3 -> published" },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+
+    expect(result.content[0].text).toContain("Goal marked complete.");
+    expect(lastGoalEntry(h.entries)).toMatchObject({ status: "done" });
+    expect(await settle(h)).toBeUndefined();
+    expect(h.activeTools()).not.toContain(GOAL_DONE_TOOL);
+    expect(h.setStatusCalls.at(-1)).toBeUndefined();
+  });
+
   it("refuses without a goal or without evidence", async () => {
     const h = harness();
     const rejected = await h.tools[GOAL_DONE_TOOL]!.execute("call-1", { summary: "x", evidence: "y" }, undefined, undefined, h.ctx);
@@ -484,6 +507,16 @@ describe("session wiring", () => {
     const options: { sections: Record<string, string> } = { sections: {} };
     await h.handlers.before_agent_start!({ systemPromptOptions: options }, h.ctx);
     expect(options.sections.goal).toBeDefined();
+  });
+
+  it("restores a paused goal with both tools", async () => {
+    const h = harness([
+      { type: "custom", customType: GOAL_ENTRY, data: goal({ status: "paused", objective: "Finish later" }) },
+    ]);
+    await h.handlers.session_start!({ type: "session_start" }, h.ctx);
+
+    expect(h.activeTools()).toEqual(expect.arrayContaining([GOAL_START_TOOL, GOAL_DONE_TOOL]));
+    expect(h.setStatusCalls.at(-1)).toBe("goal:paused");
   });
 
   it("injects the objective as a system section only while active", async () => {
