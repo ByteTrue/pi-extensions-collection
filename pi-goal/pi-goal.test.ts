@@ -519,7 +519,7 @@ describe("session wiring", () => {
     expect(h.setStatusCalls.at(-1)).toBe("goal:paused");
   });
 
-  it("injects the objective as a system section only while active", async () => {
+  it("injects the objective as a system section while the goal is unfinished", async () => {
     const h = harness();
     await command(h, "Cut p95 below 100ms");
 
@@ -531,7 +531,25 @@ describe("session wiring", () => {
     await command(h, "pause");
     const paused: { sections: Record<string, string> } = { sections: {} };
     await h.handlers.before_agent_start!({ systemPromptOptions: paused }, h.ctx);
-    expect(paused.sections.goal).toBeUndefined();
+    expect(paused.sections.goal).toContain("Paused goal");
+    expect(paused.sections.goal).toContain("Cut p95 below 100ms");
+    expect(paused.sections.goal).toContain("goal_done");
+    expect(paused.sections.goal).not.toContain("continues the run automatically");
+  });
+
+  it("drops the goal section once the goal is done", async () => {
+    const h = harness([
+      {
+        type: "custom",
+        customType: GOAL_ENTRY,
+        data: goal({ status: "done", summary: "shipped", evidence: "test passed" }),
+      },
+    ]);
+    await h.handlers.session_start!({ type: "session_start" }, h.ctx);
+
+    const options: { sections: Record<string, string> } = { sections: {} };
+    await h.handlers.before_agent_start!({ systemPromptOptions: options }, h.ctx);
+    expect(options.sections.goal).toBeUndefined();
   });
 
   it("follows the active branch after tree navigation", async () => {

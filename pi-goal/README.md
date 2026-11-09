@@ -119,7 +119,7 @@ package.json      private, never published — exists only so workspace CI runs 
 | `/goal` command | Parses `status`/`pause`/`resume`/`clear` as control words; anything else is the objective |
 | `goal_start` tool | Drafts + starts a goal; active only while no goal runs |
 | `goal_done` tool | Registered but inactive until a goal is unfinished (active or paused); requires `summary` + `evidence` |
-| `before_agent_start` | Adds the objective as a `<goal>` system section — inside the cached prefix, and it survives compaction |
+| `before_agent_start` | Adds the objective as a `<goal>` system section while the goal is unfinished (active or paused) — inside the cached prefix, and it survives compaction |
 | `agent_before_settle` | The loop: while active, appends one hidden continuation message and returns `continue: true` |
 | `agent_start` / `tool_call` | Count whether the current segment did real work |
 | `session_start` / `session_tree` | Restore the goal from the transcript branch |

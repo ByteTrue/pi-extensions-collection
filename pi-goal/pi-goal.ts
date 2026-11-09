@@ -105,12 +105,22 @@ export const RESUME_MESSAGE = "Continue the goal from where it stopped.";
 /** The system-prompt section. Constant while the goal is unchanged, so it stays inside
  * the cached prefix; no run counters here for exactly that reason. */
 export function goalSection(goal: GoalRecord): string {
+  const evidence = "Evidence must name something actually checked (a command and its result, a test that passed, a file that now exists), never a claim of intent.";
+  if (goal.status === "paused") {
+    return [
+      `Paused goal (this session): ${goal.objective}`,
+      "",
+      "The automatic continuation loop is off. Do not continue this goal on your own; the user decides with /goal resume or /goal clear.",
+      "",
+      `If the objective is already verifiably true, call goal_done with a summary and the evidence that proves it. ${evidence}`,
+    ].join("\n");
+  }
   return [
     `Active goal (this session): ${goal.objective}`,
     "",
     "This is a durable objective for this thread, not a one-turn request. Pi continues the run automatically after each turn: do not stop to ask whether to continue, and do not treat intermediate progress as the final answer.",
     "",
-    "Work until the objective is verifiably true, then call goal_done with a summary and the evidence that proves it. Evidence must name something actually checked (a command and its result, a test that passed, a file that now exists), never a claim of intent.",
+    "Work until the objective is verifiably true, then call goal_done with a summary and the evidence that proves it. " + evidence,
     "",
     "If a decision only the user can make blocks progress, ask it (ask_user when it offers options) and stop without further tool calls: the goal pauses and /goal resume continues it.",
   ].join("\n");
@@ -455,7 +465,7 @@ export function registerGoal(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event) => {
-    if (goal?.status !== "active") return;
+    if (!goal || goal.status === "done") return;
     event.systemPromptOptions.sections[GOAL_SECTION] = goalSection(goal);
   });
 
