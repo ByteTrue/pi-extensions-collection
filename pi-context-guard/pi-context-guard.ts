@@ -10,8 +10,8 @@
 //    after compaction replaces them in the model's view. So a detail a summary
 //    dropped stays reachable, instead of having to be re-derived or guessed.
 //
-// 3. Deterministic pruning: stale, oversized tool results are replaced by a fixed
-//    placeholder; ctx_expand returns the original, ctx_search finds it again.
+// 3. Deterministic pruning: tool results that are far behind are replaced by a
+//    fixed placeholder; ctx_expand returns the original, ctx_search finds it again.
 //    Nothing is summarised, generated, embedded, or sent anywhere. Compaction
 //    stays Pi's own synchronous, main-model job — pruning only makes it rarer.
 //
@@ -27,34 +27,42 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { readFileSync } from "node:fs";
+import { Buffer } from "node:buffer";
 
 /** Compact once the context passes this many tokens — but only for models whose
  * window is larger, so small-window models keep Pi's own compaction policy. */
 export const COMPACT_AT_TOKENS = 400_000;
 
-/** A tool result older than this many user turns may be pruned. Newer ones are
- * never touched, so the model always sees its recent work in full. */
-export const PRUNE_AGE_TURNS = 6;
-/** Second age measure: a result older than this many later tool results is also
- * stale. Long sessions are often a handful of user turns around hundreds of tool
- * calls, where a turn-only window would protect almost everything. The newest
- * this many results always stay whole. */
-export const PRUNE_AGE_RESULTS = 40;
-/** …and only if its text is at least this long. Small results are not worth a
- * cache bust. */
-export const PRUNE_MIN_CHARS = 4000;
+/** Magic Context's age distance: an output is far behind once this many user
+ * turns, or this fraction of the usable window of content, follow it. */
+export const AGE_DISTANCE_TURNS = 3;
+export const AGE_DISTANCE_WINDOW_FRACTION = 0.25;
+/** …and only once it holds at least this many tokens. */
+export const AGE_RECLAIM_MIN_TOKENS = 250;
+/** Automatic drops and queued agent drops ride a pass only when they reclaim at
+ * least this fraction of the usable window, or after this many held passes. */
+export const DROP_PRESSURE_FRACTION = 0.02;
+export const HELD_PASS_LIMIT = 3;
+/** The protected window: a token floor derived from the usable window, the same
+ * formula Magic Context uses. */
+export const PROTECTED_FLOOR_FRACTION = 0.05;
+export const PROTECTED_FLOOR_MIN = 16_000;
+export const PROTECTED_FLOOR_MAX = 64_000;
+/** Fallback when the host exposes no model window (Magic Context's Pi default). */
+export const DEFAULT_USABLE_WINDOW = 200_000;
 /** One actionable batch: both the reminder and ctx_reduce list use these. */
 export const REDUCE_HINT_LIMIT = 15;
-export const REDUCE_HINT_TEXT = "Largest reclaimable";
+export const REDUCE_HINT_TEXT = "Oldest reclaimable";
 /** ctx_expand returns at most this many characters per call, then says where to
  * continue — otherwise expanding one huge output undoes the prune. */
 export const EXPAND_CHAR_BUDGET = 60_000;
 /** Set to "1" to only report what would be pruned, changing no message bytes. */
 export const DRY_RUN_ENV = "PI_CONTEXT_GUARD_DRY_RUN";
 
-/** Tokens per character for budgeting. Magic Context uses bytes*0.25; characters
- * are close enough for a reminder that only has to be roughly right. */
-export const TOKENS_PER_CHAR = 0.25;
+/** Tokens per UTF-8 byte. Magic Context measures local token mass this way; for
+ * non-ASCII text the byte count matters, so characters would undercount CJK
+ * about 3x and keep the nudge bands out of reach. */
+export const TOKENS_PER_BYTE = 0.25;
 /** Nudge thresholds, in estimated tokens, following Magic Context's bands. */
 export const NUDGE_MIN_TAIL_TOKENS = 60_000;
 export const NUDGE_FLOOR_TOKENS = 25_000;
@@ -66,8 +74,15 @@ export const NUDGE_SENTINEL = "<system-reminder>";
 
 export type NudgeLevel = "gentle" | "firm" | "urgent";
 
-export function estimateTokens(chars: number): number {
-	return Math.round(chars * TOKENS_PER_CHAR);
+export function estimateTokens(text: string): number {
+	return Math.ceil(Buffer.byteLength(text, "utf8") * TOKENS_PER_BYTE);
+}
+
+export interface ReclaimHint {
+	id: string;
+	toolName: string;
+	chars: number;
+	tokens: number;
 }
 
 export function nudgeBand(reclaimableTokens: number, tailTokens: number): NudgeLevel | "" {
@@ -150,18 +165,12 @@ export function decideNudge(state: NudgeState, input: {
 	return { fire: true, sticky: !crossed, level, reason: crossed ? "band-crossing" : "cadence-refire" };
 }
 
-export interface ReclaimHint {
-	id: string;
-	toolName: string;
-	chars: number;
-}
-
 export function buildNudgeReminder(
 	verdict: NudgeVerdict,
 	hints: readonly ReclaimHint[],
 	totals?: { count: number; tokens: number },
 ): string {
-	const tokens = totals?.tokens ?? hints.reduce((a, h) => a + estimateTokens(h.chars), 0);
+	const tokens = totals?.tokens ?? hints.reduce((a, h) => a + h.tokens, 0);
 	const count = totals?.count ?? hints.length;
 	const summary = `${count} tool output(s), ~${tokens} tokens`;
 	const hint = hints.length
@@ -171,7 +180,7 @@ export function buildNudgeReminder(
 	if (verdict.sticky) body = `Still unstamped: ${summary}. Stamp the ones you've used with ctx_reduce now.`;
 	else if (verdict.level === "gentle") body = `Housekeeping: ${summary} are reclaimable. Stamp each output with ctx_reduce as soon as you've taken what you need from it; don't wait for the task to finish.`;
 	else if (verdict.level === "firm") body = `${summary} are reclaimable. Make a ctx_reduce pass now over the outputs you've already used, then continue.`;
-	else body = `${summary} are still unstamped. Call ctx_reduce once now, before your next tool call, with the listed outputs you've already used. Small outputs are not candidates.`;
+	else body = `${summary} are still unstamped. Call ctx_reduce once now, before your next tool call, with the listed outputs you've already used.`;
 	return `\n\n${NUDGE_SENTINEL}\n${body}${hint}\n</system-reminder>`;
 }
 
@@ -229,17 +238,47 @@ export interface PruneReport {
 	pruned: number;
 	replayed: number;
 	charsSaved: number;
+	tokensSaved: number;
 	candidates: number;
 	/** Requested drops held back because this pass is mid tool loop. */
 	queued: number;
 }
 
+/** Remove the reminder spans this extension appends, so its own copy is not
+ * counted as content. Only trailing spans are stripped: a tool result may
+ * legitimately contain the sentinel in the middle (reading this file, for
+ * example). */
+function stripOwnReminder(text: string): string {
+	let out = text;
+	const close = "</system-reminder>";
+	while (out.trimEnd().endsWith(close)) {
+		const end = out.trimEnd().length;
+		const start = out.lastIndexOf(NUDGE_SENTINEL, end - close.length);
+		if (start < 0) break;
+		out = out.slice(0, start);
+	}
+	return out;
+}
+
+/** Characters of the provider-visible text, for display only. */
 function textLength(msg: ToolResultLike): number {
 	if (typeof msg.content === "string") return msg.content.length;
 	let n = 0;
 	for (const block of msg.content ?? []) {
-		if (block.type === "text" || block.type === "thinking") n += block.text?.length ?? block.thinking?.length ?? 0;
+		if (block.type === "text") n += block.text?.length ?? 0;
 		if (block.type === "toolCall") n += JSON.stringify(block.arguments ?? {}).length;
+	}
+	return n;
+}
+
+/** Byte-based token mass of the parts Magic Context counts: text, tool inputs
+ * and tool outputs. Reasoning and signatures are excluded. */
+function messageTokens(msg: ToolResultLike): number {
+	if (typeof msg.content === "string") return estimateTokens(stripOwnReminder(msg.content));
+	let n = 0;
+	for (const block of msg.content ?? []) {
+		if (block.type === "text") n += estimateTokens(stripOwnReminder(block.text ?? ""));
+		else if (block.type === "toolCall") n += estimateTokens(JSON.stringify(block.arguments ?? {}));
 	}
 	return n;
 }
@@ -247,6 +286,11 @@ function textLength(msg: ToolResultLike): number {
 function textOf(msg: ToolResultLike): string {
 	if (typeof msg.content === "string") return msg.content;
 	return (msg.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("\n");
+}
+
+/** The tool output as the provider sees it, without this extension's reminders. */
+function toolOutputText(msg: ToolResultLike): string {
+	return stripOwnReminder(textOf(msg));
 }
 
 function isPlaceholder(msg: ToolResultLike): boolean {
@@ -270,48 +314,55 @@ export function protectedIds(messages: ToolResultLike[]): Set<string> {
 	return out;
 }
 
-export interface TailMeasurement {
-	tailTokens: number;
-	reclaimableTokens: number;
-	reclaimableCount: number;
-	reclaimable: ReclaimHint[];
-	hints: ReclaimHint[];
-	/** Small active results are not advertised, but remain addressable by id. */
-	addressable: ReclaimHint[];
-	userTurn: number;
+/** Token floor protected from automatic pruning, derived like Magic Context's
+ * `protected_tokens` default: clamp(5% of the usable window, min(16k, 8%), 64k). */
+export function protectionFloor(usableWindow: number): number {
+	const usable = Math.max(0, usableWindow);
+	const lower = Math.min(PROTECTED_FLOOR_MIN, Math.round(0.08 * usable));
+	return Math.min(PROTECTED_FLOOR_MAX, Math.max(lower, Math.round(PROTECTED_FLOOR_FRACTION * usable)));
 }
 
-/** The numbers every nudge decision eats: T (everything still in view) and
- * U (the part of it that is reclaimable tool output). Placeholders, errors,
- * queued drops and protected results carry nothing reclaimable. */
-export function measureTail(messages: ToolResultLike[], pruned: Set<string>, requested?: Set<string>): TailMeasurement {
-	const protectedSet = protectedIds(messages);
-	let tailTokens = 0;
-	let reclaimableTokens = 0;
-	let userTurn = 0;
-	const reclaimable: ReclaimHint[] = [];
-	const addressable: ReclaimHint[] = [];
-	for (const msg of messages) {
-		const chars = typeof msg.content === "string" ? msg.content.length : textLength(msg);
-		tailTokens += estimateTokens(chars);
-		if (msg.role === "user") userTurn++;
-		if (msg.role !== "toolResult" || !msg.toolCallId) continue;
-		if (
-			msg.isError ||
-			pruned.has(msg.toolCallId) ||
-			requested?.has(msg.toolCallId) ||
-			isPlaceholder(msg) ||
-			protectedSet.has(msg.toolCallId)
-		) {
-			continue;
-		}
-		addressable.push({ id: msg.toolCallId, toolName: msg.toolName ?? "", chars });
-		if (chars < PRUNE_MIN_CHARS) continue;
-		reclaimableTokens += estimateTokens(chars);
-		reclaimable.push({ id: msg.toolCallId, toolName: msg.toolName ?? "", chars });
+/** The window the model actually has for input: context minus output reserve,
+ * with Magic Context's Pi default when the host exposes no model. */
+export function usableWindowFor(model?: { contextWindow?: number; maxTokens?: number }): number {
+	const window = model?.contextWindow;
+	if (!window || !Number.isFinite(window) || window <= 0) return DEFAULT_USABLE_WINDOW;
+	return Math.max(1, window - (model?.maxTokens ?? 0));
+}
+
+/** The newest results whose mass reaches the protected floor, and at least the
+ * newest three. They stay whole and never count as reclaimable. */
+function protectionWindow(messages: ToolResultLike[], usableWindow: number): Set<string> {
+	const floor = protectionFloor(usableWindow);
+	const out = new Set<string>();
+	let mass = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.role !== "toolResult" || !msg.toolCallId || isPlaceholder(msg)) continue;
+		if (mass >= floor && out.size >= 3) break;
+		mass += messageTokens(msg);
+		out.add(msg.toolCallId);
 	}
-	const hints = [...reclaimable].sort((a, b) => b.chars - a.chars).slice(0, REDUCE_HINT_LIMIT);
-	return { tailTokens, reclaimableTokens, reclaimableCount: reclaimable.length, reclaimable, hints, addressable, userTurn };
+	return out;
+}
+
+/** Magic Context's age distance, per message: how many user turns and how much
+ * content follow it. A result's own payload cannot age it. */
+function farBehindFlags(messages: ToolResultLike[], usableWindow: number): boolean[] {
+	const flags = new Array<boolean>(messages.length).fill(false);
+	const distance = usableWindow * AGE_DISTANCE_WINDOW_FRACTION;
+	let turns = 0;
+	let tokens = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg) continue;
+		if (msg.role === "toolResult" && msg.toolCallId && !isPlaceholder(msg)) {
+			flags[i] = turns >= AGE_DISTANCE_TURNS || tokens >= distance;
+		}
+		if (msg.role === "user") turns++;
+		tokens += messageTokens(msg);
+	}
+	return flags;
 }
 
 /** Signatures of other extensions that also rewrite `context`. Running two
@@ -336,25 +387,7 @@ export function detectForeignRewriter(messages: ToolResultLike[]): string | null
 	return null;
 }
 
-/** Turn age = number of user messages after this one. Result age = number of
- * tool results after it. Both are stable while a tool loop appends messages:
- * appending only ages what is already there, never re-ages a pruned result back
- * into the protected window. */
-function messageAges(messages: ToolResultLike[]): { turns: number[]; results: number[] } {
-	const turns = new Array<number>(messages.length).fill(0);
-	const results = new Array<number>(messages.length).fill(0);
-	let turn = 0;
-	let result = 0;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		turns[i] = turn;
-		results[i] = result;
-		if (messages[i]?.role === "user") turn++;
-		if (messages[i]?.role === "toolResult") result++;
-	}
-	return { turns, results };
-}
-
-/** JSON with sorted keys, so {"a":1,"b":2} and {"b":2,"a":1} are the same call. */
+/** Canonical JSON of tool arguments: sorted keys, undefined properties ignored. */
 export function stableArgs(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
 	if (Array.isArray(value)) return `[${value.map(stableArgs).join(",")}]`;
@@ -364,31 +397,78 @@ export function stableArgs(value: unknown): string {
 	return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableArgs(v)}`).join(",")}}`;
 }
 
-export interface PruneOptions {
-	ageTurns?: number;
-	ageResults?: number;
-	minChars?: number;
-	/** When false, no new prune is admitted — only already-pruned results are
-	 * replayed. The caller passes false inside a tool loop, so the prefix the
-	 * model is currently working against never changes mid-turn. */
-	allowNew?: boolean;
-	dryRun?: boolean;
-	/** Results already pruned in this session, by toolCallId. */
-	pruned: Set<string>;
-	/** Ids the model explicitly asked to drop. These bypass the age and size
-	 * gates — an explicit request is the audit trail, so it needs no heuristic. */
-	requested?: Set<string>;
+function isControlPlaneHint(toolName: string): boolean {
+	const name = toolName.toLowerCase().replace(/^mcp_/, "");
+	return name.startsWith("ctx_") || name === "todowrite" || name === "todoread";
 }
 
-/** Replace stale oversized tool results with a placeholder, in place.
+export interface TailMeasurement {
+	tailTokens: number;
+	reclaimableTokens: number;
+	reclaimableCount: number;
+	reclaimable: ReclaimHint[];
+	hints: ReclaimHint[];
+	/** Active results that stay addressable by id, including the protected window. */
+	addressable: ReclaimHint[];
+	userTurn: number;
+}
+
+/** The numbers every nudge decision eats: T is the content the provider sees
+ * without reasoning, U is every active tool output outside the protected window
+ * that is not queued for a drop. Both are in UTF-8-byte tokens. */
+export function measureTail(
+	messages: ToolResultLike[],
+	pruned: Set<string>,
+	requested?: Set<string>,
+	usableWindow = DEFAULT_USABLE_WINDOW,
+): TailMeasurement {
+	const protectedSet = protectedIds(messages);
+	const windowSet = protectionWindow(messages, usableWindow);
+	const queue = requested ?? new Set<string>();
+	let tailTokens = 0;
+	let reclaimableTokens = 0;
+	let userTurn = 0;
+	const reclaimable: ReclaimHint[] = [];
+	const addressable: ReclaimHint[] = [];
+	for (const msg of messages) {
+		if (msg.role === "user") userTurn++;
+		if (isPlaceholder(msg)) continue;
+		tailTokens += messageTokens(msg);
+		if (msg.role !== "toolResult" || !msg.toolCallId) continue;
+		const id = msg.toolCallId;
+		if (pruned.has(id) || protectedSet.has(id)) continue;
+		const hint = { id, toolName: msg.toolName ?? "", chars: textLength(msg), tokens: messageTokens(msg) };
+		if (!queue.has(id)) addressable.push(hint);
+		if (queue.has(id) || msg.isError || windowSet.has(id)) continue;
+		reclaimableTokens += hint.tokens;
+		reclaimable.push(hint);
+	}
+	const hints = reclaimable
+		.filter((hint) => hint.tokens >= AGE_RECLAIM_MIN_TOKENS && !isControlPlaneHint(hint.toolName))
+		.slice(0, REDUCE_HINT_LIMIT);
+	return { tailTokens, reclaimableTokens, reclaimableCount: reclaimable.length, reclaimable, hints, addressable, userTurn };
+}
+
+export interface PruneOptions {
+	pruned: Set<string>;
+	/** Queued drops from ctx_reduce; applied when `allowNew` and cleared then. */
+	requested?: Set<string>;
+	/** False mid tool loop: placeholders replay, but nothing new lands. */
+	allowNew?: boolean;
+	dryRun?: boolean;
+	usableWindow?: number;
+}
+
+/** Replace stale tool results with a placeholder, in place.
  * Only tool results are ever touched: user and assistant text is left alone, and
  * a tool result is replaced rather than removed, so call/result pairing and the
  * positions of every other message survive. */
 export function pruneMessages(messages: ToolResultLike[], options: PruneOptions): PruneReport {
-	const { ageTurns = PRUNE_AGE_TURNS, ageResults = PRUNE_AGE_RESULTS, minChars = PRUNE_MIN_CHARS, allowNew = true, dryRun = false, pruned, requested } = options;
-	const report: PruneReport = { pruned: 0, replayed: 0, charsSaved: 0, candidates: 0, queued: 0 };
-	const ages = messageAges(messages);
+	const { usableWindow = DEFAULT_USABLE_WINDOW, allowNew = true, dryRun = false, pruned, requested } = options;
+	const report: PruneReport = { pruned: 0, replayed: 0, charsSaved: 0, tokensSaved: 0, candidates: 0, queued: 0 };
 	const protectedSet = protectedIds(messages);
+	const windowSet = protectionWindow(messages, usableWindow);
+	const far = farBehindFlags(messages, usableWindow);
 
 	// Newest-first: for duplicate calls the newest result is the one kept whole.
 	const seen = new Set<string>();
@@ -399,6 +479,15 @@ export function pruneMessages(messages: ToolResultLike[], options: PruneOptions)
 			if (block.type === "toolCall" && block.id) argsById.set(block.id, `${block.name ?? ""}:${stableArgs(block.arguments)}`);
 		}
 	}
+
+	const drop = (msg: ToolResultLike, id: string, tokens: number) => {
+		report.pruned++;
+		report.charsSaved += textLength(msg);
+		report.tokensSaved += tokens;
+		pruned.add(id);
+		requested?.delete(id);
+		if (!dryRun) msg.content = [{ type: "text", text: placeholder(id) }];
+	};
 
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
@@ -417,49 +506,37 @@ export function pruneMessages(messages: ToolResultLike[], options: PruneOptions)
 			continue;
 		}
 		if (msg.isError && !requested?.has(id)) continue;
+		const tokens = messageTokens(msg);
 		if (requested?.has(id)) {
 			if (!allowNew) {
 				// Batched: applying a drop mid tool loop changes the prefix on every
 				// model call of the loop. All requested drops of one turn land together
-				// at the next agent turn, one bust instead of one per reduce call.
+				// at the next allowed pass, one bust instead of one per reduce call.
 				report.queued++;
 				continue;
 			}
-			// Explicitly requested: no age, size or turn gate. The model named
-			// this exact result, so the request itself is the justification.
-			report.pruned++;
-			report.charsSaved += textLength(msg);
-			pruned.add(id);
-			requested.delete(id);
-			if (!dryRun) msg.content = [{ type: "text", text: placeholder(id) }];
+			// Explicitly requested: no age or size gate. The model named this exact
+			// result, so the request itself is the justification.
+			drop(msg, id, tokens);
 			continue;
 		}
-		if (msg.isError) continue;
-		const chars = textLength(msg);
+		if (windowSet.has(id)) continue;
 		const signature = argsById.get(id);
 		if (signature) {
 			if (seen.has(signature)) {
-				if (chars < minChars) continue;
+				if (tokens < AGE_RECLAIM_MIN_TOKENS) continue;
 				// An identical later call already returned this; age does not matter.
 				report.candidates++;
-				if (allowNew) {
-					report.charsSaved += chars;
-					report.pruned++;
-					pruned.add(id);
-					if (!dryRun) msg.content = [{ type: "text", text: placeholder(id) }];
-				}
+				if (allowNew) drop(msg, id, tokens);
 				continue;
 			}
 			seen.add(signature);
 		}
-		if ((ages.turns[i] ?? 0) < ageTurns && (ages.results[i] ?? 0) < ageResults) continue;
-		if (chars < minChars) continue;
+		if (!far[i]) continue;
+		if (tokens < AGE_RECLAIM_MIN_TOKENS) continue;
 		report.candidates++;
 		if (!allowNew) continue;
-		report.pruned++;
-		report.charsSaved += chars;
-		pruned.add(id);
-		if (!dryRun) msg.content = [{ type: "text", text: placeholder(id) }];
+		drop(msg, id, tokens);
 	}
 	return report;
 }
@@ -611,6 +688,8 @@ interface SessionState {
 	lastNudgeReason: string;
 	dropsAppliedOnLastPass: boolean;
 	agentSettled: boolean;
+	/** Allow-new passes held because the batch was not worth a prefix rewrite. */
+	heldPasses: number;
 	foreignRewriter: string | null;
 }
 
@@ -620,12 +699,13 @@ function newSessionState(): SessionState {
 		requested: new Set<string>(),
 		protectedIds: new Set<string>(),
 		seenContext: false,
-		lastReport: { pruned: 0, replayed: 0, charsSaved: 0, candidates: 0, queued: 0 },
+		lastReport: { pruned: 0, replayed: 0, charsSaved: 0, tokensSaved: 0, candidates: 0, queued: 0 },
 		baseline: { tailTokens: 0, reclaimableTokens: 0, reclaimableCount: 0, reclaimable: [], hints: [], addressable: [], userTurn: 0 },
 		nudge: newNudgeState(),
 		lastNudgeReason: "",
 		dropsAppliedOnLastPass: false,
 		agentSettled: false,
+		heldPasses: 0,
 		foreignRewriter: null,
 	};
 }
@@ -711,10 +791,11 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 			s.requested.clear();
 			return;
 		}
-		pruneMessages(msgs, { allowNew: true, pruned: s.pruned, requested: s.requested, dryRun: true });
+		const usableWindow = usableWindowFor(ctx.model);
+		pruneMessages(msgs, { allowNew: true, pruned: s.pruned, requested: s.requested, dryRun: true, usableWindow });
 		s.requested.clear();
 		s.protectedIds = protectedIds(msgs);
-		s.baseline = measureTail(msgs, s.pruned);
+		s.baseline = measureTail(msgs, s.pruned, undefined, usableWindow);
 		if (msgs.some((m) => m.role === "toolResult" && textOf(m).includes(NUDGE_SENTINEL))) {
 			s.nudge.lastLevel = nudgeBand(s.baseline.reclaimableTokens, s.baseline.tailTokens);
 			s.nudge.lastNudgeU = s.baseline.reclaimableTokens;
@@ -740,19 +821,40 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		// New prunes are admitted only at the start of a user turn. Mid-loop the
 		// model is comparing against the prefix it already has; changing it then
 		// costs a cache bust per tool call instead of one per turn.
-		const allowNew = last?.role === "user" || s.agentSettled;
+		const usableWindow = usableWindowFor(ctx.model);
+		let allowNew = last?.role === "user" || s.agentSettled;
 		s.agentSettled = false;
+		// A batch rewrites the whole message prefix, so it has to be worth it:
+		// Magic Context applies at 2% of the usable window, or holds at most three
+		// passes. Small batches wait instead of busting the cache for a few tokens.
+		if (allowNew) {
+			const wouldBe = pruneMessages(messages, {
+				allowNew: true,
+				pruned: new Set(s.pruned),
+				requested: new Set(s.requested),
+				dryRun: true,
+				usableWindow,
+			});
+			const worth = wouldBe.tokensSaved >= Math.round(DROP_PRESSURE_FRACTION * usableWindow);
+			if (wouldBe.pruned > 0 && !worth && s.heldPasses + 1 < HELD_PASS_LIMIT) {
+				s.heldPasses++;
+				allowNew = false;
+			} else {
+				s.heldPasses = 0;
+			}
+		}
 		s.lastReport = pruneMessages(messages, {
 			allowNew,
 			pruned: s.pruned,
 			requested: s.requested,
 			dryRun: process.env[DRY_RUN_ENV] === "1",
+			usableWindow,
 		});
 		if (allowNew) s.requested.clear();
 		s.dropsAppliedOnLastPass = s.lastReport.pruned > 0;
 		s.seenContext = true;
 		s.protectedIds = protectedIds(messages);
-		s.baseline = measureTail(messages, s.pruned, s.requested);
+		s.baseline = measureTail(messages, s.pruned, s.requested, usableWindow);
 
 		// Queued drops from ctx_reduce land at the next agent turn (allowNew).
 		// Hold grace pending through the rest of the current tool loop, then capture
@@ -789,19 +891,10 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 			.map((c) => c.text ?? "")
 			.join("");
 		if (!text || text.includes(NUDGE_SENTINEL)) return;
-		const chars = text.length;
-		const isProtected = (PROTECTED_TOOLS[(event.toolName ?? "").toLowerCase().replace(/^mcp_/, "")] ?? 0) > 0;
-		const addedTokens = estimateTokens(chars);
-		s.baseline.tailTokens += addedTokens;
-		if (chars >= PRUNE_MIN_CHARS && !isProtected && !event.isError && event.toolCallId && !s.pruned.has(event.toolCallId) && !s.requested.has(event.toolCallId)) {
-			s.baseline.reclaimableTokens += addedTokens;
-			s.baseline.reclaimableCount++;
-			const item: ReclaimHint = { id: event.toolCallId, toolName: event.toolName ?? "", chars };
-			s.baseline.reclaimable.push(item);
-			s.baseline.hints.push(item);
-			s.baseline.hints.sort((a, b) => b.chars - a.chars);
-			s.baseline.hints.length = Math.min(s.baseline.hints.length, REDUCE_HINT_LIMIT);
-		}
+		// A result that just arrived sits inside the protected window, so it adds to
+		// T but never to U. U only moves at the next context pass, when older
+		// results leave that window.
+		s.baseline.tailTokens += estimateTokens(text);
 		if (s.nudge.grace && s.nudge.grace.baselineU === null) return; // waiting for the post-reduce measurement
 		const verdict = decideNudge(s.nudge, {
 			reclaimableTokens: s.baseline.reclaimableTokens,
@@ -849,7 +942,7 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		description:
 			"Drop tool results you no longer need, to shrink the context. Takes tool call ids (the id of the tool call whose output you want gone, or the id from a [pruned <id>] placeholder). " +
 			"The original stays in the session file and ctx_expand(id) brings it back, so this is never irreversible. " +
-			"Call with no ids to list the largest results currently taking space. The drops are batched and applied at the start of the next agent turn, so the cached prefix is never rewritten mid tool loop.",
+			"Call with no ids to list the largest results currently taking space. The drops are queued and land together at the next pass that can rewrite the prefix, and only when the batch is worth that rewrite, so the cached prefix is never rewritten mid tool loop.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -882,8 +975,10 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 				if (!entries) return err("No session file: this session is not persisted.");
 				const msgs = entries.map((e) => e.message as ToolResultLike | undefined).filter((m): m is ToolResultLike => Boolean(m?.role));
 				protectedSet = protectedIds(msgs);
-				addressable = measureTail(msgs, s.pruned, s.requested).addressable;
-				active = addressable.filter((r) => r.chars >= PRUNE_MIN_CHARS);
+				const usableWindow = usableWindowFor(ctx.model);
+				const measured = measureTail(msgs, s.pruned, s.requested, usableWindow);
+				addressable = measured.addressable;
+				active = measured.reclaimable.filter((r) => r.tokens >= AGE_RECLAIM_MIN_TOKENS);
 			}
 
 			if (!params.ids || params.ids.length === 0) {
@@ -911,7 +1006,7 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 				}
 			}
 			const parts: string[] = [];
-			if (accepted.length) parts.push(`Queued ${accepted.length} result(s) for dropping at the start of the next agent turn: ${accepted.join(", ")}. Nothing changes during this tool loop, so the cached prefix stays intact. Recover any of them with ctx_expand(id).`);
+			if (accepted.length) parts.push(`Queued ${accepted.length} result(s) for dropping at the next pass that can rewrite the prefix: ${accepted.join(", ")}. Nothing changes during this tool loop, so the cached prefix stays intact. Recover any of them with ctx_expand(id).`);
 			if (already.length) parts.push(`Already dropped: ${already.join(", ")}.`);
 			if (protectedRejected.length) parts.push(`Protected (kept in context): ${protectedRejected.join(", ")}.`);
 			if (unknown.length) parts.push(`Not found in this session: ${unknown.join(", ")}.`);

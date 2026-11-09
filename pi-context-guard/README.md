@@ -12,8 +12,8 @@ and `/context-guard`.
    message even after compaction replaces them in the model's view, so a detail
    a summary dropped stays reachable by searching the JSONL instead of being
    re-derived or guessed.
-3. **Deterministic pruning of stale tool results.** Old, oversized tool results
-   are replaced by a short placeholder. The original never leaves the session
+3. **Deterministic pruning of far-behind tool results.** Old outputs are replaced
+   by a short placeholder once enough newer work follows them. The original never leaves the session
    file, and recovery tools get it back.
 
 The pointer lives in the system prompt rather than the compaction instructions:
@@ -28,13 +28,18 @@ Two rules, both deterministic — nothing is summarised, generated, or embedded:
 
 - **Exact duplicates.** The same tool called with canonically identical arguments
   (JSON keys sorted, `undefined` properties ignored) keeps only its newest result,
-  provided the older duplicate is at least 4000 characters long (short outputs are
-  never worth a cache bust).
-- **Stale large results.** A result at least 4000 characters long is pruned once
-  it is older than **6 user turns** *or* older than **40 later tool results**.
-  The second measure matters because long sessions are often a few user turns
-  around hundreds of tool calls, where a turn-only window would protect nearly
-  everything. Both windows keep the newest work whole.
+  provided the older duplicate holds at least 250 tokens.
+- **Far-behind results.** An output is pruned once **three user turns** or **a
+  quarter of the usable window** of newer content follow it, and it holds at
+  least 250 tokens. A result's own payload, including later chunks of a
+  multipart output, cannot age it.
+
+The newest part of the conversation is protected by a token floor, derived the
+way Magic Context derives it: `clamp(5% of the usable window, 16k, 64k)`, where
+the usable window is `contextWindow - maxTokens` (200k when the host exposes no
+model). The newest three results are protected regardless, and so are the newest
+three `ctx_reduce` results and the newest `todowrite`. Token mass is UTF-8 bytes
+× 0.25, so non-ASCII text is not undercounted.
 
 Only `toolResult` content is replaced. User and assistant messages are never
 touched, and a result is replaced rather than removed, so tool call/result
@@ -44,10 +49,12 @@ The placeholder is `[pruned <toolCallId>]` and nothing else. It is a pure
 function of the id — a placeholder derived from the content would differ between
 passes and bust the prompt-cache prefix on every turn.
 
-**New prunes are admitted only at the start of a user turn.** Mid tool-loop the
-model is working against a prefix it already has; changing it then costs a cache
-bust per tool call instead of one per turn. Existing placeholders are replayed
-verbatim on every pass, so once something is pruned it stays byte-identical.
+**New prunes are admitted only when the batch is worth a rewrite.** Mid tool-loop
+nothing changes: the model is working against a prefix it already has. At the
+start of a user turn (or after a settle) a batch is applied only when it
+reclaims at least 2% of the usable window; smaller batches wait, for at most
+three passes. Existing placeholders are replayed verbatim on every pass, so once
+something is pruned it stays byte-identical.
 
 State is in memory only. On resume or `/reload`, earlier `ctx_reduce` calls and
 stale/duplicate results are re-derived from the session entries, so pruned results
@@ -55,10 +62,10 @@ stay pruned across restarts without any database.
 
 ## Tools
 
-- **`ctx_reduce({ ids? })`** — queues active tool results for dropping at the
-  start of the next agent turn (keeping the current tool-loop prefix intact). Call
-  with no `ids` to list the 15 largest unpruned tool results of at least 4000
-  characters currently in context. Smaller results can still be dropped by explicit id.
+- **`ctx_reduce({ ids? })`** — queues active tool results for dropping at the next
+  pass that can rewrite the prefix, and only when the batch is worth that rewrite.
+  Call with no `ids` to list the 15 largest results outside the protected window;
+  any addressable result, of any size, can be dropped by explicit id.
 - **`ctx_expand({ id, offset? })`** — returns the original content of a pruned tool
   result (by its tool call id) or of any earlier session entry (by entry id, as
   returned by `ctx_search`). Returns at most 60k characters per call and says which
@@ -83,15 +90,18 @@ time and replayed byte-identical afterwards:
 - **Channel 1 (nudge).** When a tool result finishes and the reclaimable share of
   the tail crosses a band — `U/T ≥ 0.2` gentle, `0.4` firm, `0.6` urgent, with
   `T ≥ 60k` and `U ≥ 25k` floors — a `<system-reminder>` is appended to that
-  result naming the 15 largest reclaimable ids, so one `ctx_reduce` call can handle
-  the batch without a preliminary listing. Only results of at least 4000 characters
-  count toward U. Bands only announce on the upward
-  crossing; same-band re-fires need the reclaimable mass to regrow past
-  `max(25k, 8% of T)` and five user turns; a band drop is observed silently.
+  result naming the 15 oldest reclaimable ids, so one `ctx_reduce` call can handle
+  the batch without a preliminary listing. `T` is the provider-visible content
+  without reasoning: text, tool arguments, tool outputs and user text, with this
+  extension's own reminders stripped. `U` is every active tool output outside the
+  protected window, of any size. Control-plane tools and outputs under 250 tokens
+  are not listed as hints. Bands only announce on the upward crossing; same-band
+  re-fires need the reclaimable mass to regrow past `max(25k, 8% of T)` and five
+  user turns; a band drop is observed silently.
 - **Grace after a reduce.** Once the agent calls `ctx_reduce`, reminders hold
   through the rest of the current tool loop and after the queued drops land at the
-  next agent turn, until the reclaimable mass regrows past the refire threshold or
-  the band escalates above its pre-reduce level. Nagging right after compliance is
+  next allowed pass, until the reclaimable mass regrows past the refire threshold
+  or the band escalates above its pre-reduce level. Nagging right after compliance is
   the fastest way to make an agent ignore every future reminder.
 - **No search hint.** Magic Context appends a `<ctx-search-hint>` to new user
   messages when an auto-search scores. Here that would rewrite an earlier

@@ -10,6 +10,7 @@ import contextGuardDefault, {
 	measureTail,
 	newNudgeState,
 	pruneMessages,
+	protectionFloor,
 	registerContextGuard,
 	searchEntries,
 	sessionFileSection,
@@ -24,7 +25,7 @@ type ToolDef = {
 	execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }>;
 };
 
-function harness(opts: { usage?: Usage; sessionFile?: string; entries?: unknown[] } = {}) {
+function harness(opts: { usage?: Usage; sessionFile?: string; entries?: unknown[]; model?: { contextWindow: number; maxTokens?: number } } = {}) {
 	const handlers: Record<string, (event: unknown, ctx: unknown) => unknown> = {};
 	const tools: Record<string, ToolDef> = {};
 	const compactCalls: CompactCall[] = [];
@@ -39,6 +40,7 @@ function harness(opts: { usage?: Usage; sessionFile?: string; entries?: unknown[
 	} as unknown as ExtensionAPI;
 	registerContextGuard(pi);
 	const ctx = {
+		model: opts.model,
 		getContextUsage: () => opts.usage,
 		compact: (call: CompactCall) => {
 			compactCalls.push(call);
@@ -161,12 +163,12 @@ describe("module surface", () => {
 		const { handlers } = harness();
 		const ctxA = { sessionManager: { getSessionId: () => "session-A", getSessionFile: () => undefined } };
 		const ctxB = { sessionManager: { getSessionId: () => "session-B", getSessionFile: () => undefined } };
-		const msgsA = [bigResult("shared-id"), ...Array.from({ length: 8 }, () => ({ role: "user", content: "n" }))];
-		const msgsB = [bigResult("shared-id"), { role: "user", content: "recent" }];
+		const msgsA = [bigResult("shared-id", 20_000), ...Array.from({ length: 4 }, (_, i) => bigResult(`n${i}`, 20_000)), ...users(3)];
+		const msgsB = [bigResult("shared-id", 20_000), { role: "user", content: "recent" }];
 		handlers["context"]?.({ messages: msgsA }, ctxA);
 		handlers["context"]?.({ messages: msgsB }, ctxB);
 		expect(msgsA[0]?.content).toEqual([{ type: "text", text: "[pruned shared-id]" }]);
-		expect(firstTextLength(msgsB[0])).toBe(5000);
+		expect(firstTextLength(msgsB[0])).toBe(20_000);
 	});
 
 	it("steps aside when another context rewriter is already active on the transcript, but never on file reads", () => {
@@ -243,61 +245,64 @@ function call(id: string, args: unknown = { cmd: "ls" }) {
 	return { role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: args }] };
 }
 
+/** Floor 0 and zero content distance: only the newest three results stay whole,
+ * so a test can focus on one rule at a time. */
+const ZERO_WINDOW = 0;
+function users(n: number) {
+	return Array.from({ length: n }, () => ({ role: "user", content: "n" }));
+}
+
 describe("pruneMessages", () => {
-	it("replaces an old oversized tool result with the canonical placeholder", () => {
-		const messages = [bigResult("t1"), ...Array.from({ length: 6 }, () => ({ role: "user", content: "next" }))];
-		const report = pruneMessages(messages, { pruned: new Set() });
+	it("replaces a result that is far behind with the canonical placeholder", () => {
+		const messages = [bigResult("t1"), bigResult("a"), bigResult("b"), bigResult("c")];
+		const report = pruneMessages(messages, { pruned: new Set(), usableWindow: ZERO_WINDOW });
 		expect(report.pruned).toBe(1);
 		expect(messages[0]?.content).toEqual([{ type: "text", text: "[pruned t1]" }]);
 	});
 
-	it("never touches recent results, small results, or errors", () => {
-		const recent = [bigResult("t1"), { role: "user", content: "next" }];
-		expect(pruneMessages(recent, { pruned: new Set() }).pruned).toBe(0);
+	it("keeps the protected window, small results, and errors whole", () => {
+		const recent = [bigResult("t1"), ...users(3)];
+		expect(pruneMessages(recent, { pruned: new Set(), usableWindow: 1_000_000 }).pruned).toBe(0);
 
-		const small = [{ ...bigResult("t1", 100) }, ...Array.from({ length: 8 }, () => ({ role: "user", content: "n" }))];
-		expect(pruneMessages(small, { pruned: new Set() }).pruned).toBe(0);
+		const small = [bigResult("t1", 100), bigResult("a"), bigResult("b"), bigResult("c")];
+		expect(pruneMessages(small, { pruned: new Set(), usableWindow: ZERO_WINDOW }).pruned).toBe(0);
 
-		const failed = [{ ...bigResult("t1"), isError: true }, ...Array.from({ length: 8 }, () => ({ role: "user", content: "n" }))];
-		expect(pruneMessages(failed, { pruned: new Set() }).pruned).toBe(0);
+		const failed = [{ ...bigResult("t1"), isError: true }, bigResult("a"), bigResult("b"), bigResult("c")];
+		expect(pruneMessages(failed, { pruned: new Set(), usableWindow: ZERO_WINDOW }).pruned).toBe(0);
 	});
 
 	it("placeholder bytes are identical on every pass", () => {
-		const messages = [bigResult("t1"), ...Array.from({ length: 8 }, () => ({ role: "user", content: "n" }))];
+		const messages = [bigResult("t1"), bigResult("a"), bigResult("b"), bigResult("c")];
 		const pruned = new Set<string>();
-		pruneMessages(messages, { pruned });
+		pruneMessages(messages, { pruned, usableWindow: ZERO_WINDOW });
 		const once = JSON.stringify(messages);
-		const second = pruneMessages(messages, { pruned });
+		const second = pruneMessages(messages, { pruned, usableWindow: ZERO_WINDOW });
 		expect(second.pruned).toBe(0);
 		expect(second.replayed).toBe(1);
 		expect(JSON.stringify(messages)).toBe(once);
 	});
 
 	it("admits no new prune mid tool loop, but still replays existing ones", () => {
-		const messages = [bigResult("t1"), ...Array.from({ length: 8 }, () => ({ role: "user", content: "n" }))];
+		const messages = [bigResult("t1"), bigResult("a"), bigResult("b"), bigResult("c")];
 		const pruned = new Set<string>();
-		const midLoop = pruneMessages(messages, { pruned, allowNew: false });
+		const midLoop = pruneMessages(messages, { pruned, allowNew: false, usableWindow: ZERO_WINDOW });
 		expect(midLoop.pruned).toBe(0);
 		expect(midLoop.candidates).toBe(1);
 		expect(firstTextLength(messages[0])).toBe(5000);
 	});
 
 	it("deduplicates identical calls keeping the newest, whatever the age", () => {
-		const messages = [call("t1"), bigResult("t1"), call("t2"), bigResult("t2"), { role: "user", content: "n" }];
-		const report = pruneMessages(messages, { pruned: new Set() });
+		const messages = [call("t1"), bigResult("t1"), call("t2"), bigResult("t2"), bigResult("a"), bigResult("b"), bigResult("c")];
+		const report = pruneMessages(messages, { pruned: new Set(), usableWindow: 20_000 });
 		expect(report.pruned).toBe(1);
 		expect(messages[1]?.content).toEqual([{ type: "text", text: "[pruned t1]" }]);
 		expect(firstTextLength(messages[3])).toBe(5000);
 	});
 
-	it("does not bust the cache on tiny duplicate results, but still prunes an older large duplicate when the newer one is small", () => {
-		const tiny = [call("t1"), bigResult("t1", 20), call("t2"), bigResult("t2", 20), { role: "user", content: "n" }];
-		expect(pruneMessages(tiny, { pruned: new Set() }).pruned).toBe(0);
+	it("does not bust the cache on tiny duplicates", () => {
+		const tiny = [call("t1"), bigResult("t1", 20), call("t2"), bigResult("t2", 20), bigResult("a"), bigResult("b"), bigResult("c")];
+		expect(pruneMessages(tiny, { pruned: new Set(), usableWindow: 20_000 }).pruned).toBe(0);
 		expect(firstTextLength(tiny[1])).toBe(20);
-
-		const bigThenSmall = [call("t1"), bigResult("t1", 5000), call("t2"), bigResult("t2", 20), { role: "user", content: "n" }];
-		expect(pruneMessages(bigThenSmall, { pruned: new Set() }).pruned).toBe(1);
-		expect(bigThenSmall[1]?.content).toEqual([{ type: "text", text: "[pruned t1]" }]);
 	});
 
 	it("treats argument key order and undefined properties as irrelevant when deduplicating", () => {
@@ -307,62 +312,59 @@ describe("pruneMessages", () => {
 			bigResult("t1"),
 			call("t2", { b: 2, a: 1 }),
 			bigResult("t2"),
-			{ role: "user", content: "n" },
+			bigResult("a"), bigResult("b"), bigResult("c"),
 		];
-		expect(pruneMessages(messages, { pruned: new Set() }).pruned).toBe(1);
+		expect(pruneMessages(messages, { pruned: new Set(), usableWindow: 20_000 }).pruned).toBe(1);
 	});
 
-	it("ages by result count too, so a long single-turn tool loop still prunes", () => {
-		const messages = [
-			{ role: "user", content: "one long task" },
-			bigResult("old"),
-			...Array.from({ length: 45 }, (_, i) => bigResult(`r${i}`, 10)),
-		];
-		const report = pruneMessages(messages, { pruned: new Set() });
-		expect(report.pruned).toBe(1);
-		expect(messages[1]?.content).toEqual([{ type: "text", text: "[pruned old]" }]);
+	it("ages by three user turns even when little content follows", () => {
+		// 100k window: floor 8000 tokens (32k chars), token distance 25k tokens.
+		// The 10 later results (40k chars) push the first one out of the floor.
+		const newer = Array.from({ length: 10 }, (_, i) => bigResult(`n${i}`, 4000));
+		const kept = [bigResult("old"), ...newer];
+		pruneMessages(kept, { pruned: new Set(), usableWindow: 100_000 });
+		expect(firstTextLength(kept[0])).toBe(5000);
+
+		const messages = [bigResult("old"), ...newer, ...users(3)];
+		pruneMessages(messages, { pruned: new Set(), usableWindow: 100_000 });
+		expect(messages[0]?.content).toEqual([{ type: "text", text: "[pruned old]" }]);
 	});
 
 	it("keeps the newest results whole even past the turn window", () => {
-		const messages = [
-			...Array.from({ length: 10 }, () => ({ role: "user", content: "n" })),
-			bigResult("newest"),
-		];
-		expect(pruneMessages(messages, { pruned: new Set() }).pruned).toBe(0);
+		const messages = [...users(10), bigResult("newest")];
+		expect(pruneMessages(messages, { pruned: new Set(), usableWindow: ZERO_WINDOW }).pruned).toBe(0);
 	});
 
-	it("batches requested drops to the next user turn and applies them there", () => {
-		// Mid tool loop: the request is queued, nothing changes now.
+	it("batches requested drops and applies them at the next allowed pass", () => {
 		const mid = [bigResult("keep"), bigResult("drop", 10), { role: "assistant", content: "working" }];
 		const pruned = new Set<string>();
 		const requested = new Set(["drop"]);
-		const midReport = pruneMessages(mid, { pruned, allowNew: false, requested });
+		const midReport = pruneMessages(mid, { pruned, allowNew: false, requested, usableWindow: ZERO_WINDOW });
 		expect(midReport.queued).toBe(1);
 		expect(midReport.pruned).toBe(0);
 		expect(firstTextLength(mid[1])).toBe(10);
-		// Next user turn: the queued drop lands, age and size gates irrelevant.
 		const turn = [...mid, { role: "user", content: "next" }];
-		const turnReport = pruneMessages(turn, { pruned, allowNew: true, requested });
+		const turnReport = pruneMessages(turn, { pruned, allowNew: true, requested, usableWindow: ZERO_WINDOW });
 		expect(turnReport.pruned).toBe(1);
 		expect(turn[1]?.content).toEqual([{ type: "text", text: "[pruned drop]" }]);
 		expect(firstTextLength(turn[0])).toBe(5000);
 	});
 
 	it("an unrequested recent result is untouched when only others are requested", () => {
-		const messages = [bigResult("a"), bigResult("b")];
+		const messages = [bigResult("a"), bigResult("b"), bigResult("c")];
 		const pruned = new Set<string>();
-		pruneMessages(messages, { pruned, allowNew: false, requested: new Set(["nope"]) });
+		pruneMessages(messages, { pruned, allowNew: false, requested: new Set(["nope"]), usableWindow: ZERO_WINDOW });
 		expect(reportZero(pruned)).toBe(true);
-		expect(firstTextLength(messages[0])).toBe(5000);
-		expect(firstTextLength(messages[1])).toBe(5000);
+		for (const message of messages) expect(firstTextLength(message)).toBe(5000);
 	});
 
 	it("dry run reports without changing any bytes", () => {
-		const messages = [bigResult("t1"), ...Array.from({ length: 8 }, () => ({ role: "user", content: "n" }))];
+		const messages = [bigResult("t1"), bigResult("a"), bigResult("b"), bigResult("c")];
 		const before = JSON.stringify(messages);
-		const report = pruneMessages(messages, { pruned: new Set(), dryRun: true });
+		const report = pruneMessages(messages, { pruned: new Set(), dryRun: true, usableWindow: ZERO_WINDOW });
 		expect(report.pruned).toBe(1);
 		expect(report.charsSaved).toBe(5000);
+		expect(report.tokensSaved).toBe(estimateTokens("x".repeat(5000)));
 		expect(JSON.stringify(messages)).toBe(before);
 	});
 });
@@ -442,22 +444,18 @@ describe("decideNudge", () => {
 		];
 		handlers["context"]?.({ messages: msgs }, ctx);
 
-		// Agent calls ctx_reduce({ ids: ["old-big"] }) during the tool loop.
 		await tools["ctx_reduce"]?.execute("r1", { ids: ["old-big"] }, undefined, undefined, ctx);
 		handlers["tool_result"]?.({ toolCallId: "r1", toolName: "ctx_reduce", content: [{ type: "text", text: "Queued" }] }, ctx);
 
-		// Next LLM call in the same tool loop: last message is toolResult (allowNew = false).
 		msgs.push({ role: "toolResult", toolCallId: "r1", toolName: "ctx_reduce", content: [{ type: "text", text: "Queued" }] });
 		handlers["context"]?.({ messages: msgs }, ctx);
 
-		// Another tool call in the same loop must NOT re-nudge.
 		const midTool = handlers["tool_result"]?.(
 			{ toolCallId: "mid", toolName: "bash", isError: false, content: [{ type: "text", text: "x".repeat(4000) }] },
 			ctx,
 		);
 		expect(midTool).toBeUndefined();
 
-		// Next user turn: queued drop lands (pruned = 1), baselineU is captured, and grace holds on the next tool call.
 		msgs.push({ role: "user", content: "turn 3" });
 		handlers["context"]?.({ messages: msgs }, ctx);
 		expect(msgs[1]?.content).toEqual([{ type: "text", text: "[pruned old-big]" }]);
@@ -469,44 +467,50 @@ describe("decideNudge", () => {
 		expect(postReduceTool).toBeUndefined();
 	});
 
-	it("applies queued drops at the next agent turn without requiring another user message", async () => {
+	it("applies a queued drop at the next allowed pass when the batch is worth a rewrite", async () => {
 		const { handlers, tools, ctx } = harness({ usage: { tokens: 1000, contextWindow: 200_000 } });
-		const msgs = [bigResult("drop", 5000), { role: "assistant", content: "working" }];
+		const msgs = [bigResult("drop", 20_000), { role: "assistant", content: "working" }];
 		handlers["context"]?.({ messages: msgs }, ctx);
 		await tools["ctx_reduce"]?.execute("r1", { ids: ["drop"] }, undefined, undefined, ctx);
 		handlers["context"]?.({ messages: msgs }, ctx);
-		expect(firstTextLength(msgs[0])).toBe(5000);
+		expect(firstTextLength(msgs[0])).toBe(20_000);
 
 		await handlers["agent_settled"]?.({}, ctx);
 		handlers["context"]?.({ messages: [...msgs, { role: "assistant", content: "automatic follow-up" }] }, ctx);
 		expect(msgs[0]?.content).toEqual([{ type: "text", text: "[pruned drop]" }]);
 	});
 
-	it("accumulates baseline across multiple tool_result events in one turn so a small tool never resets lastLevel", () => {
-		const { handlers, ctx } = harness();
-		const msgs = [{ role: "user", content: "u".repeat(240_000) }, bigResult("b0", 92_000)];
-		handlers["context"]?.({ messages: msgs }, ctx); // T=83k, U=23k (just under 25k floor)
+	it("holds a small batch that is not worth a rewrite, then applies it on the third pass", async () => {
+		const { handlers, tools, ctx } = harness();
+		const msgs = [bigResult("small-drop", 5000), { role: "assistant", content: "working" }];
+		handlers["context"]?.({ messages: msgs }, ctx);
+		await tools["ctx_reduce"]?.execute("r1", { ids: ["small-drop"] }, undefined, undefined, ctx);
+		handlers["context"]?.({ messages: msgs }, ctx);
+		expect(firstTextLength(msgs[0])).toBe(5000);
 
-		// Tool 1 in the turn: +16k tokens -> U=39k, T=99k (~0.39, gentle) -> fires once.
-		const res1 = handlers["tool_result"]?.(
-			{ toolCallId: "b1", toolName: "read", isError: false, content: [{ type: "text", text: "x".repeat(64_000) }] },
+		msgs.push({ role: "user", content: "next" });
+		handlers["context"]?.({ messages: msgs }, ctx);
+		expect(firstTextLength(msgs[0])).toBe(5000);
+
+		msgs.push({ role: "user", content: "next" });
+		handlers["context"]?.({ messages: msgs }, ctx);
+		expect(firstTextLength(msgs[0])).toBe(5000);
+
+		msgs.push({ role: "user", content: "next" });
+		handlers["context"]?.({ messages: msgs }, ctx);
+		expect(msgs[0]?.content).toEqual([{ type: "text", text: "[pruned small-drop]" }]);
+	});
+
+	it("fires a reminder from the baseline measured at the last context pass", () => {
+		const { handlers, ctx } = harness();
+		const msgs = [{ role: "user", content: "u".repeat(160_000) }, ...Array.from({ length: 20 }, (_, i) => bigResult(`b${i}`, 10_000))];
+		handlers["context"]?.({ messages: msgs }, ctx);
+
+		const res = handlers["tool_result"]?.(
+			{ toolCallId: "n1", toolName: "bash", isError: false, content: [{ type: "text", text: "x".repeat(400) }] },
 			ctx,
 		) as { content?: Array<{ text: string }> } | undefined;
-		expect(res1?.content?.some((c) => c.text.includes("<system-reminder>"))).toBe(true);
-
-		// Tool 2 in the SAME turn is tiny (100 chars): must not reset lastLevel back to "".
-		const res2 = handlers["tool_result"]?.(
-			{ toolCallId: "b2", toolName: "bash", isError: false, content: [{ type: "text", text: "x".repeat(100) }] },
-			ctx,
-		);
-		expect(res2).toBeUndefined();
-
-		// Tool 3 in the SAME turn is also small (400 chars): still in gentle band, must not fire a second gentle reminder.
-		const res3 = handlers["tool_result"]?.(
-			{ toolCallId: "b3", toolName: "bash", isError: false, content: [{ type: "text", text: "x".repeat(400) }] },
-			ctx,
-		);
-		expect(res3).toBeUndefined();
+		expect(res?.content?.some((c) => c.text.includes("<system-reminder>"))).toBe(true);
 	});
 });
 
@@ -516,58 +520,62 @@ describe("protectedIds, measureTail, and ctx_reduce", () => {
 			bigResult("old"),
 			{ role: "toolResult", toolCallId: "r1", toolName: "ctx_reduce", content: [{ type: "text", text: "x".repeat(4000) }] },
 			{ role: "toolResult", toolCallId: "t1", toolName: "todowrite", content: [{ type: "text", text: "x".repeat(4000) }] },
+			bigResult("extra"),
 			{ role: "user", content: "n" },
 		];
-		const tail = measureTail(messages, new Set());
+		const tail = measureTail(messages, new Set(), undefined, ZERO_WINDOW);
 		expect(tail.hints.map((h) => h.id)).toEqual(["old"]);
-		// 4000 chars x2 protected results excluded from U but present in T.
-		expect(tail.reclaimableTokens).toBe(estimateTokens(5000));
+		expect(tail.reclaimableTokens).toBe(estimateTokens("x".repeat(5000)));
 		expect(tail.tailTokens).toBeGreaterThan(tail.reclaimableTokens);
 
-		// Even if explicitly requested, protected results are kept whole.
-		expect(pruneMessages(messages, { pruned: new Set(), requested: new Set(["t1", "r1"]), allowNew: true }).pruned).toBe(0);
+		expect(pruneMessages(messages, { pruned: new Set(), requested: new Set(["t1", "r1"]), allowNew: true, usableWindow: 200_000 }).pruned).toBe(0);
 		expect(firstTextLength(messages[1])).toBe(4000);
 		expect(firstTextLength(messages[2])).toBe(4000);
 	});
 
-	it("offers one batch of the 15 largest candidates, not the oldest small outputs", () => {
+	it("offers the oldest reclaimable outputs first, one batch of 15", () => {
 		const messages = [
 			...Array.from({ length: 20 }, (_, i) => bigResult(`id-${i + 1}`, 4000 + i)),
 			{ role: "user", content: "n" },
 		];
-		const tail = measureTail(messages, new Set(), new Set(["id-20"]));
-		expect(tail.hints.map((h) => h.id)).toEqual(Array.from({ length: 15 }, (_, i) => `id-${19 - i}`));
-		expect(tail.reclaimableCount).toBe(19);
+		const tail = measureTail(messages, new Set(), new Set(["id-20"]), ZERO_WINDOW);
+		expect(tail.hints.map((h) => h.id)).toEqual(Array.from({ length: 15 }, (_, i) => `id-${i + 1}`));
+		expect(tail.reclaimableCount).toBe(17);
 
 		const reminder = buildNudgeReminder(
 			{ fire: true, sticky: false, level: "urgent", reason: "band-crossing" },
 			tail.hints,
 			{ count: tail.reclaimableCount, tokens: tail.reclaimableTokens },
 		);
-		expect(reminder).toContain("Largest reclaimable: bash id-19");
+		expect(reminder).toContain("Oldest reclaimable: bash id-1");
 		expect(reminder).toContain("one ctx_reduce call");
 	});
 
-	it("does not offer small tool results for manual reduction", async () => {
-		const { handlers, tools, ctx } = harness();
-		handlers["context"]?.({ messages: [bigResult("small", 2029), { role: "assistant", content: "working" }] }, ctx);
-		const listed = await tools["ctx_reduce"]?.execute("list", {}, undefined, undefined, ctx);
-		expect(listed?.content[0]?.text).toBe("No tool results available to drop.");
-
-		const explicit = await tools["ctx_reduce"]?.execute("drop", { ids: ["small"] }, undefined, undefined, ctx);
-		expect(explicit?.content[0]?.text).toContain("Queued 1 result(s)");
+	it("counts small results in the reclaimable mass and offers them as hints", () => {
+		const messages = [bigResult("small", 2029), bigResult("a"), bigResult("b"), bigResult("c")];
+		const tail = measureTail(messages, new Set(), undefined, ZERO_WINDOW);
+		expect(tail.reclaimable.map((h) => h.id)).toContain("small");
+		expect(tail.hints.map((h) => h.id)).toEqual(["small"]);
 	});
 
-	it("counts thinking and tool arguments when measuring the tail", () => {
+	it("counts UTF-8 bytes, so CJK is not undercounted", () => {
+		expect(estimateTokens("中文")).toBe(2);
+		expect(estimateTokens("x".repeat(8))).toBe(2);
+		expect(protectionFloor(872_000)).toBe(43_600);
+		expect(protectionFloor(200_000)).toBe(16_000);
+	});
+
+	it("counts tool arguments but not thinking when measuring the tail", () => {
+		const args = { content: "x".repeat(5000) };
 		const messages = [{
 			role: "assistant",
 			content: [
 				{ type: "thinking", thinking: "t".repeat(3000) },
-				{ type: "toolCall", id: "call", name: "write", arguments: { content: "x".repeat(5000) } },
+				{ type: "toolCall", id: "call", name: "write", arguments: args },
 			],
 		}];
-		const tail = measureTail(messages, new Set());
-		expect(tail.tailTokens).toBeGreaterThanOrEqual(estimateTokens(8000));
+		const tail = measureTail(messages, new Set(), undefined, ZERO_WINDOW);
+		expect(tail.tailTokens).toBe(estimateTokens(JSON.stringify(args)));
 		expect(tail.reclaimableTokens).toBe(0);
 	});
 
@@ -576,7 +584,7 @@ describe("protectedIds, measureTail, and ctx_reduce", () => {
 			{ role: "toolResult", toolCallId: "r1", toolName: "ctx_reduce", content: [{ type: "text", text: "x".repeat(9000) }] },
 			...Array.from({ length: 60 }, () => ({ role: "user", content: "n" })),
 		];
-		expect(pruneMessages(messages, { pruned: new Set() }).pruned).toBe(0);
+		expect(pruneMessages(messages, { pruned: new Set(), usableWindow: 100_000 }).pruned).toBe(0);
 	});
 
 	it("ctx_reduce lists only active context results with exact char counts, ignoring pre-compaction entries", async () => {
@@ -584,9 +592,19 @@ describe("protectedIds, measureTail, and ctx_reduce", () => {
 			{ type: "message", id: "pre", message: bigResult("pre-compaction", 50_000) },
 			{ type: "message", id: "post", message: bigResult("in-context", 6_000) },
 		];
-		const { handlers, tools, ctx } = harness({ entries });
-		// Active context after compaction only has "in-context".
-		handlers["context"]?.({ messages: [bigResult("in-context", 6_000), { role: "user", content: "hi" }] }, ctx);
+		const { handlers, tools, ctx } = harness({ entries, model: { contextWindow: 4000, maxTokens: 0 } });
+		handlers["context"]?.(
+			{
+				messages: [
+					bigResult("in-context", 6_000),
+					bigResult("a", 1000),
+					bigResult("b", 1000),
+					bigResult("c", 1000),
+					{ role: "user", content: "hi" },
+				],
+			},
+			ctx,
+		);
 
 		const listRes = await tools["ctx_reduce"]?.execute("c1", {}, undefined, undefined, ctx);
 		const text = listRes?.content[0]?.text ?? "";
