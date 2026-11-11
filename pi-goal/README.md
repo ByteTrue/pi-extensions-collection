@@ -4,16 +4,18 @@ One durable objective per session. The agent keeps working on it turn after turn
 until it declares completion with evidence — no more typing「继续」every three
 minutes.
 
-A small extension: a single TypeScript file, no npm package. It is the minimal
+One extension in this repo. It is the minimal
 version of Codex's `/goal`: an objective, an automatic continuation at Pi's
 settle boundary, and one tool that stops the loop. There is no task tree, no
 dashboard, no token budget, no auditor agent.
 
 ## Install
 
-Run the repo's installer and tick `pi-goal` in the menu — the command is in
-[Install](../#install). It copies `pi-goal.ts` into
-`~/.pi/agent/extensions/`.
+Part of this repo's git package:
+
+```bash
+pi install git:github.com/ByteTrue/pi-extensions-collection
+```
 
 Restart or reload Pi. Nothing to configure.
 
@@ -94,11 +96,8 @@ one-off edit or a question, a normal prompt is still the right tool.
 
 ## Uninstall
 
-Delete the file — it is the whole extension:
-
-```bash
-rm ~/.pi/agent/extensions/pi-goal.ts
-```
+Disable `pi-goal` in `pi config`, or remove the whole package with
+`pi remove git:github.com/ByteTrue/pi-extensions-collection`.
 
 Nothing else to clean up: it writes no config, and the session entries it left
 behind are inert without the extension.

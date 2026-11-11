@@ -92,13 +92,17 @@ and do-not-ask rules.
 
 If asking still drifts under `codemode.mode: "only"`, the remaining lever is a
 `before_agent_start` handler appending one bullet to `sections.rules`
-(precedent: the since-removed `pi-codemode-only` small extension). Considered
+(precedent: the since-removed `pi-codemode-only` extension). Considered
 and deliberately not taken — revisit only with evidence that the wording alone
 is not enough.
 
 ## Install
 
-Same channel as the other small extensions — run the repo's installer and tick `pi-ask-user` in the menu; the command is in [Install](../#install).
+Part of this repo's git package:
+
+```bash
+pi install git:github.com/ByteTrue/pi-extensions-collection
+```
 
 Restart or reload Pi afterwards.
 

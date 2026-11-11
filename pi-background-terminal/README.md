@@ -3,7 +3,7 @@
 <p align="center">Pure background execution: <code>background_run</code> starts a command, returns a task id immediately, and notifies you when it exits.</p>
 
 > [!IMPORTANT]
-> The optional 300s foreground shell cap is **not part of this extension** — it is the separate [`pi-bash-timeout`](../pi-bash-timeout) drop-in. Installing only this one leaves the built-in `bash`/`powershell` tools exactly as Pi ships them (no timeout by default). Tick both in the installer's menu if you want the cap as well.
+> The optional 300s foreground shell cap is **not part of this extension** — Pi ships with no foreground timeout, and this extension does not add one. The cap lives in the separate [`pi-bash-timeout`](../pi-bash-timeout) extension, installed by the same package; disable that entry in `pi config` if you don't want it.
 
 Pi's built-in `bash` is the foreground executor — and this extension never touches it. It adds one standalone tool for the other half of the decision:
 
@@ -18,10 +18,11 @@ Pi's built-in `bash` is the foreground executor — and this extension never tou
 
 ## Install
 
-Run the repo's installer and tick `pi-background-terminal` in the menu — the command
-is in [Install](../#install). It copies `pi-background-terminal.ts` into
-`~/.pi/agent/extensions/`. There is no npm package and no install step: the file is
-the whole extension.
+Part of this repo's git package:
+
+```bash
+pi install git:github.com/ByteTrue/pi-extensions-collection
+```
 
 Restart or reload Pi, then ask naturally:
 
@@ -41,7 +42,7 @@ No built-in tool is overridden, shadowed, or registered under a built-in name.
 
 ## Staying out of the built-ins' way
 
-- `bash` (and `powershell`) keep their exact built-in behavior — no default timeout, no clamping, no steering on timeout errors. The optional 300s inject-and-clamp hook (plus the timeout-error steering block) lives in the [`pi-bash-timeout`](../pi-bash-timeout) small extension; install it alongside this package if you want that safety net.
+- `bash` (and `powershell`) keep their exact built-in behavior — no default timeout, no clamping, no steering on timeout errors. The optional 300s inject-and-clamp hook (plus the timeout-error steering block) lives in the [`pi-bash-timeout`](../pi-bash-timeout) extension in this repo.
 - The `background_run` path applies your `shellPath` / `shellCommandPrefix` settings (read through Pi's own `SettingsManager`, honoring project trust) and the same session environment the built-in tools set (`PI_*` variables plus the agent bin dir on `PATH`).
 - Uninstalling removes exactly the three tools above; the built-ins were never touched.
 
@@ -63,7 +64,7 @@ Output is stored under `$TMPDIR/pi-background-terminal/` and removed at real ses
 ## Deliberate limits
 
 - Pure background: no foreground wait, no inline output (that is `bash`'s job)
-- No override of any built-in tool, and no foreground shell timeout hook (see the [`pi-bash-timeout`](../pi-bash-timeout) small extension for the optional 300s cap)
+- No override of any built-in tool, and no foreground shell timeout hook (see the [`pi-bash-timeout`](../pi-bash-timeout) extension in this repo for the optional 300s cap)
 - No PTY or interactive stdin
 - No custom `cwd` or environment input
 - No configurable defaults (600s task lifetime / 50 MiB output cap are fixed)

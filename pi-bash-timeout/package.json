@@ -2,7 +2,7 @@
   "name": "pi-bash-timeout",
   "version": "0.0.0",
   "private": true,
-  "description": "Small extension (never published to npm): optional 300s default-and-cap for Pi's built-in bash/powershell tools. Installed from source by install.mjs; kept as a workspace only so CI typecheck/test cover it.",
+  "description": "Pi extension (never published to npm): optional 300s default-and-cap for Pi's built-in bash/powershell tools. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
   "type": "module",
   "files": [
     "pi-bash-timeout.ts",

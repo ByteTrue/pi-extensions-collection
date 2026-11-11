@@ -1,19 +1,16 @@
-// pi-context-guard
+// pi-context-prune
 //
-// Three context rules for Pi:
+// Two context rules for Pi:
 //
-// 1. A model whose context window is larger than 400k tokens compacts once the
-//    context passes 400k, instead of Pi's default "window - reserveTokens".
-//    Models with a smaller window are not touched; Pi's default applies there.
-//
-// 2. The system prompt names the session file, which keeps every message even
+// 1. The system prompt names the session file, which keeps every message even
 //    after compaction replaces them in the model's view. So a detail a summary
 //    dropped stays reachable, instead of having to be re-derived or guessed.
 //
-// 3. Deterministic pruning: tool results that are far behind are replaced by a
+// 2. Deterministic pruning: tool results that are far behind are replaced by a
 //    fixed placeholder; ctx_expand returns the original, ctx_search finds it again.
 //    Nothing is summarised, generated, embedded, or sent anywhere. Compaction
 //    stays Pi's own synchronous, main-model job — pruning only makes it rarer.
+//    400k compaction for large-window models lives in pi-auto-compact.
 //
 // Why the system prompt and not the compaction instructions: a summary is only
 // as good as whatever produced it. Pi uses another extension's summary verbatim
@@ -28,10 +25,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { TSchema } from "typebox";
 import { readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
-
-/** Compact once the context passes this many tokens — but only for models whose
- * window is larger, so small-window models keep Pi's own compaction policy. */
-export const COMPACT_AT_TOKENS = 400_000;
 
 /** Magic Context's age distance: an output is far behind once this many user
  * turns, or this fraction of the usable window of content, follow it. */
@@ -57,7 +50,7 @@ export const REDUCE_HINT_TEXT = "Oldest reclaimable";
  * continue — otherwise expanding one huge output undoes the prune. */
 export const EXPAND_CHAR_BUDGET = 60_000;
 /** Set to "1" to only report what would be pruned, changing no message bytes. */
-export const DRY_RUN_ENV = "PI_CONTEXT_GUARD_DRY_RUN";
+export const DRY_RUN_ENV = "PI_CONTEXT_PRUNE_DRY_RUN";
 
 /** Tokens per UTF-8 byte. Magic Context measures local token mass this way; for
  * non-ASCII text the byte count matters, so characters would undercount CJK
@@ -189,15 +182,6 @@ export function buildNudgeReminder(
  * cache prefix on every turn — the same failure Magic Context documents. */
 export function placeholder(toolCallId: string): string {
 	return `[pruned ${toolCallId}]`;
-}
-
-/** The compaction decision: compact only when the model can hold more than the
- * threshold AND the current usage has passed it. `tokens` may be null (right
- * after a compaction, before the next response) — that counts as "don't know". */
-export function shouldCompact(usage: { tokens: number | null; contextWindow: number }): boolean {
-	if (usage.contextWindow <= COMPACT_AT_TOKENS) return false;
-	if (usage.tokens === null) return false;
-	return usage.tokens > COMPACT_AT_TOKENS;
 }
 
 /** The system-prompt pointer to the session file. Constant for the whole session,
@@ -717,7 +701,7 @@ function sessionKey(ctx: { sessionManager?: { getSessionId?: () => string | unde
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
 const err = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined, isError: true });
 
-export function registerContextGuard(pi: ExtensionAPI): void {
+export function registerContextPrune(pi: ExtensionAPI): void {
 	/** Per-session state, keyed by session id (or file path when no id is
 	 * exposed). Concurrent sessions in one process — subagents, /fork, /switch —
 	 * never share pruned sets, queued drops, or nudge grace. */
@@ -733,21 +717,8 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		return s;
 	};
 
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("agent_settled", (_event, ctx) => {
 		stateFor(ctx).agentSettled = true;
-		const usage = ctx.getContextUsage();
-		if (!usage || !shouldCompact(usage)) return;
-		// ctx.compact() is fire-and-forget inside Pi; awaiting its callbacks keeps
-		// non-interactive runs (--print, RPC) alive until the summary is written.
-		await new Promise<void>((resolve) => {
-			ctx.compact({
-				onComplete: () => resolve(),
-				onError: (error) => {
-					console.error(`compaction failed: ${error.message}`);
-					resolve();
-				},
-			});
-		});
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
@@ -921,8 +892,8 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.registerCommand("context-guard", {
-		description: "Show what context pruning did (or would do, with PI_CONTEXT_GUARD_DRY_RUN=1)",
+	pi.registerCommand("context-prune", {
+		description: "Show what context pruning did (or would do, with PI_CONTEXT_PRUNE_DRY_RUN=1)",
 		handler: async (_args, ctx) => {
 			const s = stateFor(ctx);
 			const r = s.lastReport;
@@ -1082,5 +1053,5 @@ export function registerContextGuard(pi: ExtensionAPI): void {
 }
 
 export default function (pi: ExtensionAPI): void {
-	registerContextGuard(pi);
+	registerContextPrune(pi);
 }

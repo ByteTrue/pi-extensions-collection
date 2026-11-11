@@ -1,58 +1,44 @@
 # pi-extensions-collection
 
-Drop-in extensions for [Pi coding agent](https://pi.dev): **copy a file into
-`~/.pi/agent/extensions/` and it works.** No npm publishing, no `npm install`, no
-build step, no `node_modules` next to the extension.
+Extensions for [Pi coding agent](https://pi.dev), installed and updated as one git
+package. Pi clones the repo, installs whatever dependencies the extensions declare,
+and loads every entry in the root `pi` manifest.
 
-That constraint is the whole point of this repo, and it decides what may live here:
+```bash
+pi install git:github.com/ByteTrue/pi-extensions-collection
+```
 
-- **Allowed**: `node:*` built-ins, Pi host modules (`@earendil-works/*`, `typebox` —
-  Pi maps them to its own copies).
-- **Not allowed**: third-party npm dependencies, a bundler or build step, or anything
-  that needs `npm install` in `~/.pi/agent/extensions/`. Anything that grows that far
-  does not belong in this repo.
+`pi update --extensions` updates them, then `/reload` or restart. Pi owns that
+checkout: an update resets it to the fetched commit and removes untracked files, so
+work in a separate checkout and load the file you are changing with `pi -e`.
 
-Each subdirectory is one extension: a single TypeScript file loaded by Pi via jiti,
-its tests, its README, and a **private** `package.json` that exists only so CI can
-typecheck and test it — it is never published.
+Each `pi-*` subdirectory is one extension: its entry file, tests, README, and a
+private `package.json` that holds its runtime dependencies and the dev dependencies
+CI uses. Nothing is published to npm.
 
 ## Install
 
-One Node script (Node 18+) downloads the selected files from this repo's `main`
-branch (GitHub raw) into `~/.pi/agent/extensions/`, overwriting whatever was there.
-It opens with an arrow-key checklist — `↑`/`↓` move, `space` toggles, `a` toggles
-all, `enter` installs — so a machine keeps only the extensions it wants. `--all`
-skips the menu and installs everything (for scripts, where there is no terminal).
-
-Every extension starts ticked, so plain `<enter>` installs all of them and `space`
-is how you drop the ones a machine does not want.
-
-One extension is skipped automatically: `pi-context-guard` registers
-`ctx_reduce` / `ctx_search` / `ctx_expand`, the same tool names
-[`@cortexkit/pi-magic-context`](https://github.com/ByteTrue) provides. Pi refuses to
-start when two extensions register one tool name, so the installer detects that
-package in your settings and leaves `pi-context-guard` out. Remove one of the two if
-you want the other.
-
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/ByteTrue/pi-extensions-collection/main/install.mjs -o /tmp/install.mjs
-node /tmp/install.mjs
+pi install git:github.com/ByteTrue/pi-extensions-collection
 ```
 
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/ByteTrue/pi-extensions-collection/main/install.mjs -OutFile "$env:TEMP\install.mjs"
-node "$env:TEMP\install.mjs"
-```
+Pin a tag or commit by appending it:
+`pi install git:github.com/ByteTrue/pi-extensions-collection@v1`.
 
-Re-running the script is the update path — there is no versioning and no pinning.
-Picking a subset never deletes anything: extensions you leave unticked stay as they
-are. Restart or reload Pi afterwards; files in that directory load automatically.
+Installation clones the repo into Pi's package directory and runs `npm install`
+there, so any package an extension imports resolves normally. Updating is
+`pi update --extensions`: Pi fetches, resets the checkout, and reinstalls
+dependencies.
 
-You can also skip the script entirely: copy a `pi-*` directory into
-`~/.pi/agent/extensions/<name>/` by hand. Every extension is a single file, so that is
-the whole copy.
+`pi config` turns individual extensions off. The setting is a filter on the package
+entry in `~/.pi/agent/settings.json`, for example
+`-pi-context-prune/pi-context-prune.ts`; nothing is deleted.
+
+`pi-context-prune` registers `ctx_reduce` / `ctx_search` / `ctx_expand`, the same
+tool names [`@cortexkit/pi-magic-context`](https://github.com/ByteTrue) provides. Pi
+refuses to start when two extensions register one tool name. Run `pi config` before
+the first start and turn `pi-context-prune` off; it resolves packages without loading
+extension code. `pi-auto-compact` registers no tools and can stay loaded.
 
 ## What is here
 
@@ -62,7 +48,8 @@ the whole copy.
 | [`pi-bash-timeout`](./pi-bash-timeout/) | Optional 300s default-and-cap for the built-in `bash`/`powershell` tools (two event hooks; registers no tools) |
 | [`pi-ask-user`](./pi-ask-user/) | Minimal `ask_user` tool: 1–4 single- or multi-select decision questions per call with back-navigation, answered via Pi's built-in dialogs |
 | [`pi-goal`](./pi-goal/) | Minimal `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until the model calls `goal_done` with evidence. The model can draft the objective itself via `goal_start` |
-| [`pi-context-guard`](./pi-context-guard/) | Large-window models (>400k) compact at 400k; the system prompt names the session file; stale/duplicate oversized tool results are deterministically pruned with `ctx_reduce` / `ctx_search` / `ctx_expand` and `/context-guard` |
+| [`pi-context-prune`](./pi-context-prune/) | `ctx_reduce` / `ctx_search` / `ctx_expand` plus `/context-prune`: deterministic pruning of stale tool results, reminders that make the tools get used, and the session file named in the system prompt |
+| [`pi-auto-compact`](./pi-auto-compact/) | Large-window models compact at 400k tokens; registers no tools and no commands |
 | [`pi-vendor`](./pi-vendor/) | Pi-specific `/vendor` TUI: add a custom provider or model to Pi's `models.json` with catalog lookup, upstream discovery and atomic writes. The agent-facing half of this work moved to the `provider-model-config` skill, which also covers opencode |
 
 ## Development
@@ -81,17 +68,17 @@ Try an extension straight from the checkout, without installing it:
 pi -e ./pi-goal/pi-goal.ts
 ```
 
-`node scripts/check-installer.mjs` fails when a `pi-*/` directory is missing from
-`install.mjs`'s `EXTENSIONS` list, or when the installer lists a file that does not
-exist. CI runs it before installing anything, because a missing entry is silent: the
-extension simply can never be installed by the documented command.
+Run `npm install` first if you added a runtime dependency; Pi resolves it from the
+checkout's `node_modules`.
 
-Editing an installed copy in `~/.pi/agent/extensions/` works too, but re-running
-`install.mjs` overwrites it.
+`node scripts/check-manifest.mjs` fails when a `pi-*/` directory has no entry in the
+root `pi` manifest, or when the manifest lists a file that does not exist. CI runs it
+first, because a missing entry is silent: the extension never loads.
 
 ## Design notes
 
-The constraints this repo lives by — why drop-in means no npm dependencies, why tool
-names must be globally unique, what has already been ruled out — are in
-[`byissue/`](./byissue): `spec/index.md` for the current truth, `decisions/` for the
-calls that were made, and the epic that split this repo out of its predecessor.
+The rules this repo lives by — one git package, no npm publishing, no build step,
+dependencies installed by Pi, tool names globally unique, what has already been ruled
+out — are in [`byissue/`](./byissue): `spec/index.md` for the current truth,
+`decisions/` for the calls that were made, and the epic that split this repo out of
+its predecessor.

@@ -1,6 +1,7 @@
 # pi-bash-timeout
 
-Optional 300s default-and-cap for Pi's built-in `bash` and `powershell` tools — as a small extension: a single TypeScript file, no npm package.
+Optional 300s default-and-cap for Pi's built-in `bash` and `powershell` tools — one
+extension in this repo.
 
 Pi's built-in `bash` runs with no timeout unless the model passes one, so a single runaway foreground command (`find /`) can wedge the agent for hours. This extension adds two event hooks and nothing else:
 
@@ -12,26 +13,27 @@ No tool is registered, overridden, or executed here — only a missing parameter
 
 ## Install
 
-Run the repo's installer and tick `pi-bash-timeout` in the menu — the command is in [Install](../#install). It copies `pi-bash-timeout.ts` into `~/.pi/agent/extensions/`.
+Part of this repo's git package:
+
+```bash
+pi install git:github.com/ByteTrue/pi-extensions-collection
+```
 
 Restart or reload Pi. There is nothing to configure and nothing to invoke — the cap is simply there.
 
 > [!TIP]
-> **Don't want the cap? Don't install this.** It is standalone by design (split out of `@bytetrue/pi-background-terminal` in its 0.12.0): that package no longer contains any foreground-timeout hook source, and this extension contains no background tools. Architectures whose setup checks statically scan installed source and reject foreground-timeout hooks can install `pi-background-terminal` alone.
+> **Don't want the cap? Turn this entry off in `pi config`.** It is standalone by design (split out of `@bytetrue/pi-background-terminal` in its 0.12.0): that package no longer contains any foreground-timeout hook source, and this extension contains no background tools. Architectures whose setup checks statically scan installed source and reject foreground-timeout hooks can disable this entry and keep `pi-background-terminal`.
 
 ## Uninstall
 
-Delete the file — it is the whole extension:
-
-```bash
-rm ~/.pi/agent/extensions/pi-bash-timeout.ts
-```
+Disable `pi-bash-timeout` in `pi config`, or remove the whole package with
+`pi remove git:github.com/ByteTrue/pi-extensions-collection`.
 
 The built-in `bash`/`powershell` tools return to their exact built-in behavior — no default timeout, no cap, no steering. The extension registers no tools and no commands, so there is nothing else to clean up.
 
 ## How it works
 
-`pi-bash-timeout.ts` is the entire runtime — one file, zero imports (the type-only import disappears at load; the runtime guards compare `event.toolName` directly). Pi loads `~/.pi/agent/extensions/*.ts` via jiti, so the installed artifact is exactly the file you see here, tests aside:
+`pi-bash-timeout.ts` is the entire runtime — one file, zero imports (the type-only import disappears at load; the runtime guards compare `event.toolName` directly). Pi loads the entry file listed in the root manifest via jiti, so the runtime artifact is exactly the file you see here, tests aside:
 
 ```text
 pi-bash-timeout.ts   hook implementation + default-export entry (registerBashTimeout)

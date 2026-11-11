@@ -1,4 +1,4 @@
-# pi-vendor (small extension)
+# pi-vendor
 
 Pi-specific `/vendor` interactive wizard for adding a custom provider or model to
 `~/.pi/agent/models.json`.
@@ -11,14 +11,11 @@ opencode's `opencode.jsonc` with the same workflows.
 
 ## Install
 
-Use the repository's small-extension installer and select `pi-vendor`, or install all
-small extensions:
+Part of this repo's git package:
 
 ```bash
-node /tmp/install-small-extension.mjs --all
+pi install git:github.com/ByteTrue/pi-extensions-collection
 ```
-
-The installer places `pi-vendor.ts` in `~/.pi/agent/extensions/`.
 
 Restart or `/reload` Pi, then `/vendor` opens the interactive wizard. Choose **Add
 provider** or **Add model**. The wizard supports official-catalog metadata, upstream
@@ -43,8 +40,7 @@ package: static runtime imports use only `node:*` built-ins, while Pi host modul
 (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`) are resolved dynamically
 from the running Pi installation.
 
-It is a small extension (never published to npm) that drops straight into
-`~/.pi/agent/extensions/` and works without `npm install`.
+It is not published to npm: it ships inside this repo's git package.
 
 ## Development
 

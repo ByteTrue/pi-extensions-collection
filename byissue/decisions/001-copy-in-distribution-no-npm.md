@@ -2,7 +2,7 @@
 kind: decision
 title: "分发形态收敛为「复制即用」，全面停发 npm"
 created: 2026-11-04
-superseded-by: ""
+superseded-by: "2026-11-11-clone-and-pull-distribution.md"
 ---
 
 # 分发形态收敛为「复制即用」，全面停发 npm

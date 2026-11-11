@@ -1,20 +1,19 @@
-# pi-context-guard
+# pi-context-prune
 
 Context rules for Pi. No configuration, no second model, no database, no background
 work: six event hooks, three context tools (`ctx_reduce`, `ctx_search`, `ctx_expand`),
-and `/context-guard`.
+and `/context-prune`.
 
-1. **Compact at 400k, not at "window − reserve".** A model whose context window
-   is larger than 400k tokens compacts once the context passes 400k. Models with
-   a smaller window are not touched — Pi's default compaction policy applies there.
-   Compaction itself stays Pi's own: synchronous, on the current model.
-2. **The system prompt names the session file.** The session file keeps every
+1. **The system prompt names the session file.** The session file keeps every
    message even after compaction replaces them in the model's view, so a detail
    a summary dropped stays reachable by searching the JSONL instead of being
    re-derived or guessed.
-3. **Deterministic pruning of far-behind tool results.** Old outputs are replaced
+2. **Deterministic pruning of far-behind tool results.** Old outputs are replaced
    by a short placeholder once enough newer work follows them. The original never leaves the session
    file, and recovery tools get it back.
+
+The 400k compaction rule for large-window models is a separate extension,
+[`pi-auto-compact`](../pi-auto-compact/); load that too or not.
 
 The pointer lives in the system prompt rather than the compaction instructions:
 a summary is only as good as whatever produced it. Pi uses another extension's
@@ -117,10 +116,10 @@ seeing its own plan and its own receipts.
 ## Dry run
 
 ```sh
-PI_CONTEXT_GUARD_DRY_RUN=1 pi
+PI_CONTEXT_PRUNE_DRY_RUN=1 pi
 ```
 
-Counts what would be pruned and changes no message bytes. `/context-guard` shows
+Counts what would be pruned and changes no message bytes. `/context-prune` shows
 the last pass: how many results were pruned, how many placeholders replayed,
 roughly how many characters were reclaimed, and how many more are eligible at
 the next user turn.
@@ -132,7 +131,9 @@ concurrent sessions in one process — subagents, `/fork`, `/switch` — never b
 state into one another.
 
 Only one extension should rewrite the conversation or register `ctx_reduce` /
-`ctx_expand` / `ctx_search`. Do not load `pi-context-guard` alongside Magic Context.
+`ctx_expand` / `ctx_search`. Do not load `pi-context-prune` alongside Magic Context.
+The 400k compaction rule is unaffected by that choice: `pi-auto-compact` registers
+no tools.
 If `context` sees structural markers from Magic Context (`§N§`, `[dropped §`,
 `<session-history>`), pi-lcm, or pi-condense already on the transcript, this
 extension steps aside for that session instead of undoing or re-rewriting their
@@ -141,9 +142,17 @@ hook `session_before_compact`.
 
 ## Install
 
-Run the repo's installer and tick `pi-context-guard` in the menu — the command is in
-[Install](../#install). It registers `ctx_reduce` / `ctx_search` / `ctx_expand`, so
-the installer skips it when `@cortexkit/pi-magic-context` is installed: Pi refuses to
-start when two extensions register one tool name. Remove one of the two first.
+Part of [pi-extensions-collection](../#install):
+
+```bash
+pi install git:github.com/ByteTrue/pi-extensions-collection
+```
+
+Pi reads the root manifest and loads it.
+
+This extension registers `ctx_reduce` / `ctx_search` / `ctx_expand`, the same tool
+names `@cortexkit/pi-magic-context` provides. Pi refuses to start when two extensions
+register one tool name, so load only one of them: run `pi config` and toggle
+`pi-context-prune` off. `pi-auto-compact` is unaffected.
 
 Restart or reload Pi afterwards.

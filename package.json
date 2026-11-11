@@ -2,11 +2,22 @@
   "name": "pi-extensions-collection",
   "version": "0.0.0",
   "private": true,
-  "description": "Drop-in Pi extensions: copy a directory into ~/.pi/agent/extensions/ and it works. No npm publishing, no install step, no third-party dependencies.",
+  "description": "Extensions for Pi coding agent, installed as one git package. No npm publishing, no build step; dependencies are installed by Pi.",
   "type": "module",
   "workspaces": [
     "pi-*"
   ],
+  "pi": {
+    "extensions": [
+      "./pi-ask-user/pi-ask-user.ts",
+      "./pi-auto-compact/pi-auto-compact.ts",
+      "./pi-background-terminal/pi-background-terminal.ts",
+      "./pi-bash-timeout/pi-bash-timeout.ts",
+      "./pi-context-prune/pi-context-prune.ts",
+      "./pi-goal/pi-goal.ts",
+      "./pi-vendor/pi-vendor.ts"
+    ]
+  },
   "scripts": {
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"

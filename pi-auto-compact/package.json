@@ -1,0 +1,23 @@
+{
+  "name": "pi-auto-compact",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pi extension (never published to npm): a model whose context window is larger than 400k tokens compacts once the context passes 400k, instead of Pi's default window-minus-reserve policy. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
+  "type": "module",
+  "files": [
+    "pi-auto-compact.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.11"
+  }
+}

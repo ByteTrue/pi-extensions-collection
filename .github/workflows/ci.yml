@@ -22,8 +22,8 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Install-channel gate: every pi-*/ directory is listed in install.mjs.
-      - run: node scripts/check-installer.mjs
+      # Distribution gate: every pi-*/ directory is listed in the root pi manifest.
+      - run: node scripts/check-manifest.mjs
       - run: npm ci
       # Type-check any workspace that defines a `typecheck` script.
       - run: npm run typecheck --workspaces --if-present
