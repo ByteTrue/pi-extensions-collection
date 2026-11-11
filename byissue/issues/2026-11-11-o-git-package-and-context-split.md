@@ -33,7 +33,8 @@ created: 2026-11-11
 - 拆分：`pi-context-prune.ts` 移除 `COMPACT_AT_TOKENS`、`shouldCompact` 和 `agent_settled` 里的压缩分支，保留修剪全套；新建 `pi-auto-compact/`，自带源码、测试、README、`package.json`、`tsconfig.json`。两边各监听 `agent_settled`，互不依赖。
 - 测试：原 46 条里 6 条压缩用例迁到新扩展，另加 1 条新扩展的 module-surface 断言；现在 prune 40 条、auto-compact 7 条。
 - 分发：根清单列出 7 个入口；`install.mjs` 与旧检查脚本删除；`check-manifest.mjs` 校验目录与清单一一对应。
-- 方向调整：先按 clone 进 `extensions/` 落地并迁移了本机；用户随后决定改走 `pi install git:` 并放弃可编辑 checkout 与零依赖约束。clone 决策标记为被取代，README / spec / 各扩展 README / package.json 描述同步改回 git 包装。本机的 clone 暂时保留可用，等提交 push 后再换成官方安装。
+- 方向调整：先按 clone 进 `extensions/` 落地并迁移了本机；用户随后决定改走 `pi install git:` 并放弃可编辑 checkout 与零依赖约束。clone 决策标记为被取代，README / spec / 各扩展 README / package.json 描述同步改回 git 包装。
+- 本机切换：提交 `bb197cd` 并 push 后，把 `extensions/pi-extensions-collection` 移到备份目录，执行 `pi install git:github.com/ByteTrue/pi-extensions-collection`；Pi clone 到 `~/.pi/agent/git/github.com/ByteTrue/pi-extensions-collection`，执行 npm install，`pi list` 可见。
 
 ## 验证
 
@@ -45,12 +46,12 @@ created: 2026-11-11
 - 官方安装：`pi install git:github.com/ByteTrue/pi-extensions-collection` 在临时 agent 目录跑通——clone 到 `~/.pi/agent/git/github.com/ByteTrue/pi-extensions-collection`，执行 `npm install`（added 6 packages），settings 记下 `git:…`，`pi list` 可见。当前 GitHub 的 `main` 还没有这次清单提交，所以装下来是 0 个扩展，符合预期。
 - 官方更新（用本地 `git daemon` 快照模拟远端新提交）：把该包的 origin 指向快照后跑 `pi update --extensions`，输出 `f29332d -> 13db6f4`，Pi 做了 fetch、`reset --hard`、清掉 `node_modules/`、重装依赖；随后 full resource loader 从包路径解析出 7 个扩展，工具与命令符合预期。
 - 两条方法教训：`pi --help` 在冲突时仍退出 0，退出码不能当证据，冲突文本才是；`discoverAndLoadExtensions` 是原始发现，不应用 settings 的 `-` 条目，禁用证据要用完整 resource loader 或冲突探针。
+- 真机官方安装后（提交 `bb197cd`），真实 agent 目录的完整 resource loader 列出 11 个扩展：本仓 7 个 + `pi-subagent` + `ponytail` + 两份个人扩展，0 错误；工具与命令齐全（`ctx_*` / `/context-prune` / `background_*` / `/background` / `ask_user` / `goal_*` / `/goal` / `/vendor`）。checkout 停在 `bb197cd`，`node_modules` 已由 npm 装好。
 
 ## 未验证 / 接续点
 
 - 真实交互会话里 `/context-prune`、`/background`、`ask_user` 是否都在，需要重启 Pi 看一眼；本轮只验证到加载层。
-- 本机现在是临时状态：`~/.pi/agent/extensions/pi-extensions-collection` 是从 GitHub clone 后被工作区覆盖的 dirty checkout，旧副本在 `~/.pi/agent/extensions-backup-2026-11-11/`。push 之后要删掉这个目录，再 `pi install git:github.com/ByteTrue/pi-extensions-collection`，然后重启验证 7 个扩展。
-- 迁移完成后 `extensions-backup-2026-11-11/` 可以删除；`settings.json` 的 `extensions` 为空，不需要改。
+- 本机已切到官方安装：`~/.pi/agent/extensions/` 只剩个人扩展，旧副本与临时 clone 在 `~/.pi/agent/extensions-backup-2026-11-11/`，重启确认新命令可用后可以删掉整个备份目录。
 - `pi update --extensions` 在 checkout 里会留下被 npm 改写的 `package-lock.json`（工作区变 dirty），不影响加载；下一次更新会先 `reset --hard` 再 `clean -fdx` 清掉。
 
 ## 关闭时要回写
