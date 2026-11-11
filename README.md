@@ -51,7 +51,6 @@ extension code. `auto-compact` registers no tools and can stay loaded.
 | [`subagent`](./subagent/) | `subagent` / `subagent_status` / `subagent_stop` plus the `/subagent` menu: isolated child sessions whose result arrives as a new message, live progress, budget guards, and one built-in `reviewer` role |
 | [`context-prune`](./context-prune/) | `ctx_reduce` / `ctx_search` / `ctx_expand` plus `/context-prune`: deterministic pruning of stale tool results, reminders that make the tools get used, and the session file named in the system prompt |
 | [`auto-compact`](./auto-compact/) | Large-window models compact at 400k tokens; registers no tools and no commands |
-| [`vendor`](./vendor/) | Pi-specific `/vendor` TUI: add a custom provider or model to Pi's `models.json` with catalog lookup, upstream discovery and atomic writes. The agent-facing half of this work moved to the `provider-model-config` skill, which also covers opencode |
 
 ## Development
 

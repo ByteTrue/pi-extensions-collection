@@ -26,11 +26,11 @@ Spawns focused child agents in isolated sessions for delegating tasks, code revi
 Part of [`pi-extensions-collection`](https://github.com/ByteTrue/pi-extensions-collection):
 
 ```bash
-pi install git:github.com/ByteTrue/pi-extensions-collection@v1.1.0
+pi install git:github.com/ByteTrue/pi-extensions-collection@v2.0.0
 ```
 
 Add `--local` (`-l`) to scope it to the current project instead of your personal
-configuration. Drop the `@v1.1.0` ref to track `main`. Nothing is published to npm.
+configuration. Drop the `@v2.0.0` ref to track `main`. Nothing is published to npm.
 
 Or run the extension directly from a checkout:
 

@@ -2,7 +2,7 @@
 
 ## 这个项目是什么
 
-一个 git 分发的 Pi 包，包含 8 个扩展。`pi install git:github.com/ByteTrue/pi-extensions-collection` 安装：Pi clone 仓库、跑 `npm install`、按根 `pi.extensions` 清单加载。`pi update --extensions` 更新。每个带 `package.json` 的顶层目录就是一个扩展，放入口文件、测试和私有 `package.json`。
+一个 git 分发的 Pi 包，包含 7 个扩展。`pi install git:github.com/ByteTrue/pi-extensions-collection` 安装：Pi clone 仓库、跑 `npm install`、按根 `pi.extensions` 清单加载。`pi update --extensions` 更新。每个带 `package.json` 的顶层目录就是一个扩展，放入口文件、测试和私有 `package.json`。
 
 它来自 `ByteTrue/pi-package-mono`（已归档、只读）的分裂：5 个原 small-extension 加 1 个原 npm 包（background terminal）合到这里；subagent 曾另立 `ByteTrue/pi-subagent` 按 git 分发，2026-11-11 收回本仓。原来的 context-guard 后来拆成 `context-prune` 与 `auto-compact`。分发形态先改成复制安装，2026-11-11 当天又改成 git 包。
 
@@ -11,7 +11,7 @@
 - **包与扩展**：整个仓库是 Pi 的一个包；根 `pi.extensions` 清单里的每一项是一个扩展。不再有「小扩展 / drop-in」这类按分发方式划分的概念。
 - **分发清单**：根 `package.json` 的 `pi.extensions`。它是安装、加载与逐项开关的真源，`scripts/check-manifest.mjs` 守住它与扩展目录一一对应。
 - **官方安装**：`pi install git:…`，更新 `pi update --extensions`。checkout 归 Pi：更新时 reset 到远端提交并清掉未跟踪文件，不能就地改。
-- **版本**：整个包一条版本轴，发布与钉版本用 git tag（首个 `v1.0.0`，当前 `v1.1.0`）。旧的 `ByteTrue/pi-subagent` 仓库已归档，它的 `@v0.18.0` 安装命令不再有效。
+- **版本**：整个包一条版本轴，发布与钉版本用 git tag（首个 `v1.0.0`，当前 `v2.0.0`）。旧的 `ByteTrue/pi-subagent` 仓库已归档，它的 `@v0.18.0` 安装命令不再有效。
 - **两个上下文扩展**：`context-prune` 管修剪、历史检索与提醒；`auto-compact` 管 400k 自动压缩。两者可以只留一个。
 
 ## 不可破的约束
@@ -25,7 +25,7 @@
 
 **做**
 
-- 一个 git 包维护 8 个扩展。
+- 一个 git 包维护 7 个扩展。
 - 需要依赖就写进对应扩展的 `package.json`，由 Pi 安装。
 - 保持无构建：Pi 用 jiti 直接加载 TS 入口，依赖来自 `node_modules`。
 - 文档随行为改：用户可见的行为变化同时改该目录 `README.md` 与本文件。

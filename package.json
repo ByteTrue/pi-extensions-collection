@@ -11,8 +11,7 @@
     "bash-timeout",
     "context-prune",
     "goal",
-    "subagent",
-    "vendor"
+    "subagent"
   ],
   "pi": {
     "extensions": [
@@ -22,8 +21,7 @@
       "./bash-timeout/bash-timeout.ts",
       "./context-prune/context-prune.ts",
       "./goal/goal.ts",
-      "./subagent/subagent.ts",
-      "./vendor/vendor.ts"
+      "./subagent/subagent.ts"
     ]
   },
   "scripts": {
