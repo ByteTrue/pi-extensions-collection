@@ -57,3 +57,11 @@ created: 2026-11-11
 ## 关闭时要回写
 
 `spec/index.md` 已在本次更新；关闭时复核「依赖写进扩展 package.json」「工具名唯一」「分发清单」三条是否仍成立。机器切到官方安装后补一条实测：真实会话里 7 个扩展的加载结果。
+
+## 关闭结论
+
+2026-11-11 关闭。分发已收敛为一个 git 包：根清单 8 条、`check-manifest.mjs` 守门、安装器删除；`pi install git:…` 与 `pi update --extensions` 在真机跑通。reload 后 `/context-prune`、`/background`、`ask_user` 都在，用户确认无缺失。
+
+质量证据：拆分完成时 `npm test` 336 passed，合入 subagent 后当前 428 passed；8 个工作区 typecheck 全过；真机完整 loader 0 错误；官方安装与官方更新各跑一次。结论已毕业到 `spec/index.md`（分发形态、依赖规则、工具名唯一、两个上下文扩展）与三条 decision；方法教训在 `notes/2026-11-11-pi-extension-loading-probes.md`。
+
+遗留：Pi 管的 checkout 在 `pi update` 后 `package-lock.json` 会显示 dirty，已知，不影响加载。

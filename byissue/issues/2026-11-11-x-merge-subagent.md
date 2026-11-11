@@ -48,3 +48,11 @@ created: 2026-11-11
 ## 关闭时要回写
 
 `spec/index.md` 已更新；关闭时复核 subagent 的入口路径与 `agents/` 位置说明，以及「一个包一条版本轴」的代价是否仍被接受。
+
+## 关闭结论
+
+2026-11-11 关闭。subagent 的源码、测试与 `agents/` 已并入 `pi-subagent/`，根清单 8 条，`v1.0.0` 已发布，旧仓加归档横幅并 archive。本机卸载旧包、`pi update --extensions` 后 reload，`/subagent` 可用；完整 loader 列出 11 个扩展、0 错误，subagent 的工具来自 collection 路径。
+
+质量证据：subagent 92 条测试并入 CI（当前总计 428 passed），8 个工作区 typecheck 全过，manifest 8/8，真机安装与更新各一次。
+
+遗留：8 个扩展共用一条版本轴，旧 `@v0.18.0` 安装命令失效，外部引用改用 collection 的 tag。

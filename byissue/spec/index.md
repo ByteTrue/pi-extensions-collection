@@ -11,6 +11,7 @@
 - **包与扩展**：整个仓库是 Pi 的一个包；根 `pi.extensions` 清单里的每一项是一个扩展。不再有「小扩展 / drop-in」这类按分发方式划分的概念。
 - **分发清单**：根 `package.json` 的 `pi.extensions`。它是安装、加载与逐项开关的真源，`scripts/check-manifest.mjs` 守住它与 `pi-*` 目录一一对应。
 - **官方安装**：`pi install git:…`，更新 `pi update --extensions`。checkout 归 Pi：更新时 reset 到远端提交并清掉未跟踪文件，不能就地改。
+- **版本**：整个包一条版本轴，发布与钉版本用 git tag（首个 `v1.0.0`）。旧的 `pi-subagent` 仓库已归档，它的 `@v0.18.0` 安装命令不再有效。
 - **两个上下文扩展**：`pi-context-prune` 管修剪、历史检索与提醒；`pi-auto-compact` 管 400k 自动压缩。两者可以只留一个。
 
 ## 不可破的约束
