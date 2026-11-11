@@ -2,9 +2,9 @@
 
 ## 这个项目是什么
 
-一个 git 分发的 Pi 包，包含 7 个扩展。`pi install git:github.com/ByteTrue/pi-extensions-collection` 安装：Pi clone 仓库、跑 `npm install`、按根 `pi.extensions` 清单加载。`pi update --extensions` 更新。每个 `pi-*` 子目录是一个扩展的入口文件、测试和私有 `package.json`。
+一个 git 分发的 Pi 包，包含 8 个扩展。`pi install git:github.com/ByteTrue/pi-extensions-collection` 安装：Pi clone 仓库、跑 `npm install`、按根 `pi.extensions` 清单加载。`pi update --extensions` 更新。每个 `pi-*` 子目录是一个扩展的入口文件、测试和私有 `package.json`。
 
-它来自 `ByteTrue/pi-package-mono`（已归档、只读）的分裂：5 个原 small-extension 加 1 个原 npm 包（background terminal）合到这里；subagent 另立 `ByteTrue/pi-subagent`，按 git 分发。原来的 context-guard 后来拆成 `pi-context-prune` 与 `pi-auto-compact`。分发形态先改成复制安装，2026-11-11 当天又改成 git 包。
+它来自 `ByteTrue/pi-package-mono`（已归档、只读）的分裂：5 个原 small-extension 加 1 个原 npm 包（background terminal）合到这里；subagent 曾另立 `ByteTrue/pi-subagent` 按 git 分发，2026-11-11 收回本仓。原来的 context-guard 后来拆成 `pi-context-prune` 与 `pi-auto-compact`。分发形态先改成复制安装，2026-11-11 当天又改成 git 包。
 
 ## 统一语言
 
@@ -24,7 +24,7 @@
 
 **做**
 
-- 一个 git 包维护 7 个扩展。
+- 一个 git 包维护 8 个扩展。
 - 需要依赖就写进对应扩展的 `package.json`，由 Pi 安装。
 - 保持无构建：Pi 用 jiti 直接加载 TS 入口，依赖来自 `node_modules`。
 - 文档随行为改：用户可见的行为变化同时改该目录 `README.md` 与本文件。
@@ -46,6 +46,7 @@
 
 - 每个扩展的行为与安装方式 → 各目录 `README.md`
 - 当前分发形态的拍板 → `decisions/2026-11-11-git-package-install.md`
+- 收回 subagent 的拍板 → `decisions/2026-11-11-merge-subagent.md`
 - 被取代的中间形态（clone + pull） → `decisions/2026-11-11-clone-and-pull-distribution.md`
 - 更早的停发 npm → `decisions/001-copy-in-distribution-no-npm.md`
 - 分裂的来源与验证证据 → `byissue/epics/2026-11-04-x-仓库分裂与分发形态收敛/spec.md`

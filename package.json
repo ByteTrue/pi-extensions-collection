@@ -15,6 +15,7 @@
       "./pi-bash-timeout/pi-bash-timeout.ts",
       "./pi-context-prune/pi-context-prune.ts",
       "./pi-goal/pi-goal.ts",
+      "./pi-subagent/src/index.ts",
       "./pi-vendor/pi-vendor.ts"
     ]
   },

@@ -48,6 +48,7 @@ extension code. `pi-auto-compact` registers no tools and can stay loaded.
 | [`pi-bash-timeout`](./pi-bash-timeout/) | Optional 300s default-and-cap for the built-in `bash`/`powershell` tools (two event hooks; registers no tools) |
 | [`pi-ask-user`](./pi-ask-user/) | Minimal `ask_user` tool: 1–4 single- or multi-select decision questions per call with back-navigation, answered via Pi's built-in dialogs |
 | [`pi-goal`](./pi-goal/) | Minimal `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until the model calls `goal_done` with evidence. The model can draft the objective itself via `goal_start` |
+| [`pi-subagent`](./pi-subagent/) | `subagent` / `subagent_status` / `subagent_stop` plus the `/subagent` menu: isolated child sessions whose result arrives as a new message, live progress, budget guards, and one built-in `reviewer` role |
 | [`pi-context-prune`](./pi-context-prune/) | `ctx_reduce` / `ctx_search` / `ctx_expand` plus `/context-prune`: deterministic pruning of stale tool results, reminders that make the tools get used, and the session file named in the system prompt |
 | [`pi-auto-compact`](./pi-auto-compact/) | Large-window models compact at 400k tokens; registers no tools and no commands |
 | [`pi-vendor`](./pi-vendor/) | Pi-specific `/vendor` TUI: add a custom provider or model to Pi's `models.json` with catalog lookup, upstream discovery and atomic writes. The agent-facing half of this work moved to the `provider-model-config` skill, which also covers opencode |
