@@ -37,11 +37,13 @@ created: 2026-11-11
 - `npm run typecheck --workspaces --if-present` 8 个工作区全过。
 - `npm test` 428 passed（原 336 + subagent 92），无失败。
 - 临时 agent 目录软链整仓后加载：8 个扩展全部加载，`subagent` / `subagent_status` / `subagent_stop` 与 `/subagent` 都在，`errors=0`。
+- 已提交 `b49f183` 并 push，打 `v1.0.0` 并推 tag；旧仓 README 加了归档横幅，`gh repo archive` 后 `isArchived=true`。
+- 本机先 `pi remove git:github.com/ByteTrue/pi-subagent@v0.18.0`，再 `pi update --extensions`（`2825cd8 -> b49f183`，重装 8 个包）；完整 loader 列出 11 个扩展，subagent 的工具来自 collection 路径，`errors=0`；旧 checkout 目录已被 remove 清掉。
 
 ## 接续点
 
-- 提交并 push，打 `v1.0.0` 并 push tag；旧仓加归档横幅后 archive。
-- 本机 `pi remove git:github.com/ByteTrue/pi-subagent@v0.18.0`，再 `pi update --extensions`，重启确认 `/subagent` 来自 collection。注意顺序：先卸旧包再更新，否则两处都会注册 subagent 工具，Pi 会拒绝启动。
+- 重启 Pi 后在真实会话里确认 `/subagent` 菜单与一次 subagent 调用；本轮只验证到加载层。
+- 确认后可以关闭这条 issue；旧仓已归档，`v0.18.0` 的安装命令不再可用，外部引用需要改成 collection 的 tag。
 
 ## 关闭时要回写
 
