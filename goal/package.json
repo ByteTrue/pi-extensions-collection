@@ -1,0 +1,23 @@
+{
+  "name": "goal",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pi extension (never published to npm): a minimal /goal — one durable objective per session, continued automatically at settle until the model calls goal_done with evidence. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
+  "type": "module",
+  "files": [
+    "goal.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.11"
+  }
+}

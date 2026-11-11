@@ -1,0 +1,24 @@
+{
+  "name": "background-terminal",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pi extension (never published to npm): background_run/background_status/background_kill plus the /background menu. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
+  "type": "module",
+  "files": [
+    "background-terminal.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.1.0",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.11"
+  }
+}

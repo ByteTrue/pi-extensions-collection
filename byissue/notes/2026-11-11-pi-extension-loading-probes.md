@@ -21,7 +21,7 @@ created: 2026-11-11
 
 ## 开关与冲突
 
-- `pi config` 给顶层扩展写的是相对 agentDir 的条目，例如 `-extensions/pi-extensions-collection/pi-context-prune/pi-context-prune.ts`。加上 `-` 后该扩展不加载。
+- `pi config` 给顶层扩展写的是相对 agentDir 的条目，例如 `-extensions/pi-extensions-collection/context-prune/context-prune.ts`。加上 `-` 后该扩展不加载。
 - 工具名冲突在加载期判定，报错点名冲突扩展的路径。
 - `pi --help` 在冲突时仍退出 0，退出码不能当证据，冲突文本才是。
 

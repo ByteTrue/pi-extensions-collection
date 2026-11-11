@@ -1,0 +1,23 @@
+{
+  "name": "context-prune",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pi extension (never published to npm): two context rules — the system prompt names the session file so details a compaction summary dropped stay searchable, and stale oversized tool results are pruned deterministically with ctx_reduce/ctx_expand/ctx_search to manage and recover them. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
+  "type": "module",
+  "files": [
+    "context-prune.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.11"
+  }
+}

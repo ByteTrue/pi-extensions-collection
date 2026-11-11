@@ -5,18 +5,25 @@
   "description": "Extensions for Pi coding agent, installed as one git package. No npm publishing, no build step; dependencies are installed by Pi.",
   "type": "module",
   "workspaces": [
-    "pi-*"
+    "ask-user",
+    "auto-compact",
+    "background-terminal",
+    "bash-timeout",
+    "context-prune",
+    "goal",
+    "subagent",
+    "vendor"
   ],
   "pi": {
     "extensions": [
-      "./pi-ask-user/pi-ask-user.ts",
-      "./pi-auto-compact/pi-auto-compact.ts",
-      "./pi-background-terminal/pi-background-terminal.ts",
-      "./pi-bash-timeout/pi-bash-timeout.ts",
-      "./pi-context-prune/pi-context-prune.ts",
-      "./pi-goal/pi-goal.ts",
-      "./pi-subagent/src/index.ts",
-      "./pi-vendor/pi-vendor.ts"
+      "./ask-user/ask-user.ts",
+      "./auto-compact/auto-compact.ts",
+      "./background-terminal/background-terminal.ts",
+      "./bash-timeout/bash-timeout.ts",
+      "./context-prune/context-prune.ts",
+      "./goal/goal.ts",
+      "./subagent/subagent.ts",
+      "./vendor/vendor.ts"
     ]
   },
   "scripts": {
