@@ -3,16 +3,16 @@
 <p align="center">Pure background execution: <code>background_run</code> starts a command, returns a task id immediately, and notifies you when it exits.</p>
 
 > [!IMPORTANT]
-> The optional 300s foreground shell cap is **not part of this extension** — Pi ships with no foreground timeout, and this extension does not add one. The cap lives in the separate [`bash-timeout`](../bash-timeout) extension, installed by the same package; disable that entry in `pi config` if you don't want it.
+> The optional 120s foreground shell default is **not part of this extension** — Pi ships with no foreground timeout, and this extension does not add one. The default lives in the separate [`bash-timeout`](../bash-timeout) extension, installed by the same package; disable that entry in `pi config` if you don't want it.
 
 Pi's built-in `bash` is the foreground executor — and this extension never touches it. It adds one standalone tool for the other half of the decision:
 
 - **Need the command's output to continue?** Use `bash` — it blocks and returns the result.
-- **Should it run hands-off (builds, test suites, dev servers, watch mode)?** Use `background_run` — it returns a task id immediately, and the Agent keeps working or ends its turn, and the command's exit arrives as a new message (exit code + last output line) that starts the next turn. That notification is how the Agent waits.
+- **Should it run hands-off (builds, test suites, dev servers, watch mode)?** Use `background_run` — it returns a task id immediately, and the Agent keeps working or ends its turn, and the command's exit arrives as a new message (exit code + bounded output tail) that starts the next turn. That notification is how the Agent waits.
 
 `background_run(command, timeout?)`:
 
-- **`timeout` defaults to 600 seconds, hard cap 28800 (8 hours)** — a hard lifetime cap so nothing lingers forever; larger explicit values are clamped. Long-running services renew: when the timeout notification arrives, restart them with background_run.
+- **No lifetime by default** (opencode's background shell): the task runs until it exits or the Pi session ends. Pass `timeout` in seconds to set a bound; `0` also means no timeout, and an explicit positive value is honored without a second cap (only Pi's own 2,147,483-second platform maximum applies). When a bound fires, the task is killed and the notice says so; restart it with `background_run` to renew a service.
 - Full stdout/stderr stream live to an output file (path in the result); the Agent reads it with Pi's built-in `read` only when needed.
 - In TUI/RPC sessions the exit notification fires normally. In `pi -p` the process exits with the turn, so a task started there dies before its exit can be reported — hands-off backgrounding belongs in interactive sessions (subagent children are killed by their own `session_shutdown`).
 
@@ -34,7 +34,7 @@ The Agent calls `background_run`, keeps working or waits, and reports the outcom
 
 | Tool | Required input | Result |
 | --- | --- | --- |
-| `background_run` | `command` | Task id + output file path, immediately; exit reported via follow-up; optional `timeout` (default 600s) |
+| `background_run` | `command` | Task id, `status: running`, output file path, immediately; exit reported via follow-up; optional `timeout` (omit or `0` = no timeout) |
 | `background_status` | `id` | Status, exit code, line count, output path, and recent output |
 | `background_kill` | `id` | Stops a running task |
 
@@ -42,7 +42,7 @@ No built-in tool is overridden, shadowed, or registered under a built-in name.
 
 ## Staying out of the built-ins' way
 
-- `bash` (and `powershell`) keep their exact built-in behavior — no default timeout, no clamping, no steering on timeout errors. The optional 300s inject-and-clamp hook (plus the timeout-error steering block) lives in the [`bash-timeout`](../bash-timeout) extension in this repo.
+- `bash` (and `powershell`) keep their exact built-in behavior. The optional 120s default (and the timeout-error steering block) lives in the [`bash-timeout`](../bash-timeout) extension in this repo.
 - The `background_run` path applies your `shellPath` / `shellCommandPrefix` settings (read through Pi's own `SettingsManager`, honoring project trust) and the same session environment the built-in tools set (`PI_*` variables plus the agent bin dir on `PATH`).
 - Uninstalling removes exactly the three tools above; the built-ins were never touched.
 
@@ -53,21 +53,23 @@ Requires `@earendil-works/pi-coding-agent >=1.1.0`.
 A task ends when:
 
 - the command exits (the agent is woken with the outcome);
-- `background_kill` stops it (silent);
-- its hard `timeout` expires (status `timed_out`, the agent is woken); or
-- the owning Pi session shuts down — or the Pi process dies by any path (signal, crash): tasks spawn through Pi's own shell backend and are killed with it (verified against SIGTERM; only a command that daemonizes itself escapes, same as built-in bash).
+- `background_kill` stops it (reported as `killed`);
+- its explicit `timeout` expires (status `timed_out`, the agent is woken); or
+- the owning Pi session shuts down, or Pi receives SIGTERM/SIGHUP: tasks spawn through Pi's own shell backend and are killed with it. **SIGKILL and hard crashes cannot run cleanup.** Each task writes a journal (owner Pi pid, task pid, start time); the next extension load calls `reapOrphans`, kills tasks whose owner is gone, and removes their journal and log. Until that next load the task can keep running; no portable OS primitive kills it at the moment of SIGKILL. A command that daemonizes itself still escapes, same as built-in bash.
 
-Manual stops and session cleanup are silent. Tasks survive `/reload` inside the same session, but they do not survive Pi exiting.
+Manual stops and `background_kill` report a `killed` notice. Session cleanup is silent because the session is ending. Tasks survive `/reload` inside the same session, but they do not survive Pi exiting.
 
-Output is stored under `$TMPDIR/background-terminal/` and removed at real session shutdown. Output files cap at 50 MiB: beyond that the file stops growing and a marker records what was dropped (the task itself keeps running). Tasks are isolated by session id. If Pi itself crashes, stale logs older than 24 hours are swept the next time the extension loads.
+Completion notices are wrapped in a `<shell id state command>` tag; the body carries a bounded output tail (last 50 lines or 4,000 characters, with ANSI/control sequences stripped), the exit code or error, and the full output file path. `state` is pi's task state (`completed`, `failed`, `timed_out`, `killed`), a superset of opencode's `completed`/`error`/`cancelled`. The same provider registry is exposed to `goal` (wait while shells run) and `subagent` (list still-running work in its completion notice). A notice is delivered at the next turn boundary, not only when the whole goal loop stops.
+
+Output is stored under `$TMPDIR/background-terminal/` and removed at real session shutdown. Each task also writes `bg_*.journal.json` / `.pid` / `.start` beside its log for the next-start reaper; those files are removed when the task settles, is killed, or is reaped. Output files cap at 50 MiB: beyond that the file stops growing and a marker records what was dropped (the task itself keeps running). Tasks are isolated by session id. If Pi crashes, stale logs older than 7 days are swept the next time the extension loads; the threshold is deliberately well above any plausible live task so a silent task in another Pi window is not mistaken for an orphan.
 
 ## Deliberate limits
 
 - Pure background: no foreground wait, no inline output (that is `bash`'s job)
-- No override of any built-in tool, and no foreground shell timeout hook (see the [`bash-timeout`](../bash-timeout) extension in this repo for the optional 300s cap)
+- No override of any built-in tool, and no foreground shell timeout hook (see the [`bash-timeout`](../bash-timeout) extension for the optional 120s default)
 - No PTY or interactive stdin
 - No custom `cwd` or environment input
-- No configurable defaults (600s task lifetime / 50 MiB output cap are fixed)
+- No configurable defaults (no task lifetime by default / 50 MiB output cap)
 - No daemon, tmux dependency, Web UI, or cross-session persistence
 - No output pagination in tool results—`read` handles large output
 

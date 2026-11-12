@@ -712,7 +712,9 @@ export function registerContextPrune(pi: ExtensionAPI): void {
 		if (!s) {
 			s = newSessionState();
 			sessions.set(key, s);
-			if (sessions.size > 16) sessions.delete(sessions.keys().next().value as string);
+			// 128 concurrent sessions is well above normal use; 16 was low enough
+			// that subagents/forks could evict a live session's state.
+			if (sessions.size > 128) sessions.delete(sessions.keys().next().value as string);
 		}
 		return s;
 	};

@@ -500,7 +500,19 @@ async function viewSingleTaskMenu(
         return;
       }
     } else if (action === "💡 How to Resume") {
-      const resumeCode = `subagent({ resume: "${task.id}", task: "Continue the remaining work" })`;
+      // D8: agent and description are required, and the task record id is not
+      // the child session id — resume needs the child session's sub_ id.
+      const childId =
+        task.sessionId ?? task.progress?.runs[0]?.sessionId ?? task.id;
+      const agent = task.agent ?? task.progress?.runs[0]?.agent;
+      const resumeCode = [
+        "subagent({",
+        `  agent: ${JSON.stringify(agent ?? "<role>")},`,
+        `  description: ${JSON.stringify(task.description)},`,
+        `  resume: ${JSON.stringify(childId)},`,
+        '  task: "Continue the remaining work"',
+        "})",
+      ].join("\n");
       ctx.ui.notify(`To resume this session in chat, run:\n${resumeCode}`, "info");
     }
   }

@@ -75,7 +75,6 @@ interface NormalizedQuestion {
 
 interface QuestionState {
   answers: string[];
-  wasFreeform: boolean;
   pickedLabels: Set<string>;
   customText?: string;
   customChecked: boolean;
@@ -96,22 +95,22 @@ const askUserParameters = {
         properties: {
           question: {
             type: "string",
-            description: "The question text shown to the user.",
+            description: "The complete question text shown to the user.",
           },
           options: {
             type: "array",
             description:
-              "2-4 concrete answer choices, each {label, description?}. Omit for an open question (the user types a free-form answer).",
+              "2-4 concrete answer choices, each {label, description?}. Labels are 1-5 words; description is one line explaining the consequence. Omit for an open question (the user types a free-form answer).",
             items: {
               type: "object",
               properties: {
                 label: {
                   type: "string",
-                  description: "Short answer text, e.g. 'Use vitest (Recommended)'",
+                  description: "Short answer text (1-5 words), e.g. 'Use vitest (Recommended)'",
                 },
                 description: {
                   type: "string",
-                  description: "One-line consequence or detail of this option",
+                  description: "One-line explanation of this choice.",
                 },
               },
               required: ["label"],
@@ -140,10 +139,6 @@ const DISMISSED =
 
 function dismissedResult(): AskUserToolResult {
   return { content: [{ type: "text", text: DISMISSED }] };
-}
-
-function answered(prefix: string, text: string): AskUserToolResult {
-  return { content: [{ type: "text", text: `${prefix}${text}` }] };
 }
 
 function normalizeOptions(raw?: AskUserOption[]): AskUserOption[] {
@@ -240,7 +235,9 @@ function selectDialog(
   return withoutWorkingSpinner(ctx, () => ctx.ui.select(title, rows));
 }
 
-/** Collect a freeform answer: multiline editor in TUI, input dialog elsewhere. */
+/** Collect a freeform answer: multiline editor in TUI, input dialog elsewhere.
+ * `undefined` means the user cancelled (Esc); `""` means they submitted an empty
+ * field, which is recorded as Unanswered rather than treated as a cancel. */
 async function collectFreeform(
   question: string,
   ctx: ExtensionContext,
@@ -253,8 +250,225 @@ async function collectFreeform(
         : ctx.ui.editor(question)
       : ctx.ui.input(question, "Type your answer"),
   );
-  const trimmed = text?.trim();
-  return trimmed ? trimmed : undefined;
+  return text === undefined ? undefined : text.trim();
+}
+
+// ── Multi-select ──────────────────────────────────────────────────────
+// opencode's form toggles multiselect values inside one dialog and submits the
+// whole set at once. Pi has no built-in multiselect dialog, so TUI uses a small
+// custom component (space toggles, enter submits) and RPC keeps the
+// select-and-return loop, which is the closest the RPC dialog surface offers.
+type MultiOutcome =
+  | { kind: "submit"; values: string[] }
+  | { kind: "other" }
+  | { kind: "back" };
+
+interface MultiRow {
+  kind: "option" | "other" | "back";
+  label: string;
+  description?: string;
+  value?: string;
+}
+
+function multiSelectRows(
+  options: AskUserOption[],
+  customText: string | undefined,
+  allowBack: boolean,
+): MultiRow[] {
+  const rows: MultiRow[] = options.map((option) => ({
+    kind: "option",
+    label: option.label,
+    ...(option.description ? { description: option.description } : {}),
+    value: option.label,
+  }));
+  rows.push({
+    kind: "other",
+    label: customText ? `Other: ${customText}` : OTHER_LABEL,
+  });
+  if (allowBack) rows.push({ kind: "back", label: BACK_LABEL });
+  return rows;
+}
+
+function multiSelectValues(
+  options: AskUserOption[],
+  picked: Set<string>,
+  customText: string | undefined,
+  customChecked: boolean,
+): string[] {
+  const values = options.map((option) => option.label).filter((label) => picked.has(label));
+  if (customChecked && customText) values.push(customText);
+  return values;
+}
+
+async function multiSelectCustom(
+  ctx: ExtensionContext,
+  title: string,
+  options: AskUserOption[],
+  picked: Set<string>,
+  customText: string | undefined,
+  customChecked: boolean,
+  allowBack: boolean,
+): Promise<MultiOutcome | undefined> {
+  return withoutWorkingSpinner(ctx, () =>
+    ctx.ui.custom<MultiOutcome | undefined>((tui, theme, keybindings, done) => {
+      const rows = multiSelectRows(options, customText, allowBack);
+      const selected = new Set(picked);
+      let custom = customText;
+      let customOn = customChecked && Boolean(customText);
+      let cursor = 0;
+      let finished = false;
+      const finish = (value: MultiOutcome | undefined) => {
+        if (finished) return;
+        finished = true;
+        done(value);
+      };
+      const move = (delta: number) => {
+        cursor = (cursor + delta + rows.length) % rows.length;
+        tui.requestRender();
+      };
+      const toggle = () => {
+        const row = rows[cursor];
+        if (!row) return;
+        if (row.kind === "option" && row.value !== undefined) {
+          if (selected.has(row.value)) selected.delete(row.value);
+          else selected.add(row.value);
+        } else if (row.kind === "other") {
+          if (!custom) {
+            finish({ kind: "other" });
+            return;
+          }
+          customOn = !customOn;
+        }
+        tui.requestRender();
+      };
+      return {
+        render() {
+          const lines = [theme.fg("accent", theme.bold(title))];
+          rows.forEach((row, index) => {
+            const checked =
+              row.kind === "option" && row.value !== undefined
+                ? selected.has(row.value)
+                : row.kind === "other"
+                  ? customOn
+                  : undefined;
+            const mark = checked === undefined ? "" : checked ? "[✓] " : "[ ] ";
+            const pointer = index === cursor ? "> " : "  ";
+            const detail = row.description ? ` — ${row.description}` : "";
+            const text = `${pointer}${mark}${row.label}${detail}`;
+            lines.push(index === cursor ? theme.fg("accent", text) : text);
+          });
+          lines.push(theme.fg("dim", "  ↑↓ move · Space toggle · Enter submit · Esc cancel"));
+          return lines;
+        },
+        handleInput(data: string) {
+          if (keybindings.matches(data, "tui.select.up")) return move(-1);
+          if (keybindings.matches(data, "tui.select.down")) return move(1);
+          if (keybindings.matches(data, "tui.select.cancel")) return finish(undefined);
+          if (data === " ") return toggle();
+          if (!keybindings.matches(data, "tui.select.confirm")) return;
+          const row = rows[cursor];
+          if (!row) return;
+          if (row.kind === "back") return finish({ kind: "back" });
+          // With no custom text, Enter opens the editor. With text that is not
+          // selected, Enter also reopens the editor so it can be changed; a
+          // selected Other submits with the rest.
+          if (row.kind === "other" && (!custom || !customOn)) return finish({ kind: "other" });
+          finish({ kind: "submit", values: multiSelectValues(options, selected, custom, customOn) });
+        },
+        invalidate() {},
+      };
+    }),
+  );
+}
+
+async function multiSelectFallback(
+  ctx: ExtensionContext,
+  title: string,
+  options: AskUserOption[],
+  picked: Set<string>,
+  customText: string | undefined,
+  customChecked: boolean,
+  allowBack: boolean,
+): Promise<MultiOutcome | undefined> {
+  const selected = new Set(picked);
+  let custom = customText;
+  let customOn = customChecked && Boolean(customText);
+
+  while (true) {
+    const optionRows = options.map((option) =>
+      option.description ? `${option.label} — ${option.description}` : option.label,
+    );
+    const checkedRows = options.map((option, index) => {
+      const checked = selected.has(option.label);
+      return `${checked ? "[✓]" : "[ ]"} ${optionRows[index]}`;
+    });
+    const otherRow = custom
+      ? `${customOn ? "[✓]" : "[ ]"} Other: ${custom}`
+      : `[ ] ${OTHER_LABEL}`;
+    const count = selected.size + (customOn ? 1 : 0);
+    // Always offer Done, including 0 selected: "Unanswered" is a valid answer
+    // (the TUI component already submits an empty set with Enter).
+    const doneRow = `✓ Done (${count} selected)`;
+    const rows = [
+      ...checkedRows,
+      otherRow,
+      ...(doneRow ? [doneRow] : []),
+      ...(allowBack ? [BACK_LABEL] : []),
+    ];
+
+    const selectedRow = await selectDialog(ctx, title, rows);
+    if (selectedRow === undefined) return undefined;
+    if (allowBack && selectedRow === BACK_LABEL) return { kind: "back" };
+    if (doneRow && selectedRow === doneRow) {
+      return { kind: "submit", values: multiSelectValues(options, selected, custom, customOn) };
+    }
+    if (selectedRow === otherRow || selectedRow === `[ ] ${OTHER_LABEL}`) {
+      if (custom && customOn) {
+        customOn = false;
+        continue;
+      }
+      const text = await collectFreeform(title, ctx, custom);
+      if (text === undefined) return undefined;
+      custom = text || undefined;
+      customOn = Boolean(text);
+      continue;
+    }
+    const matched = options.find(
+      (option, index) => checkedRows[index] === selectedRow || optionRows[index] === selectedRow || option.label === selectedRow,
+    );
+    if (!matched) return undefined;
+    if (selected.has(matched.label)) selected.delete(matched.label);
+    else selected.add(matched.label);
+  }
+}
+
+function multiSelectDialog(
+  ctx: ExtensionContext,
+  title: string,
+  options: AskUserOption[],
+  picked: Set<string>,
+  customText: string | undefined,
+  customChecked: boolean,
+  allowBack: boolean,
+): Promise<MultiOutcome | undefined> {
+  // `custom` only exists on the interactive TUI surface; RPC mode keeps the
+  // built-in dialog loop so BySpace and headless callers still work. Tests and
+  // older hosts without the custom API also take the fallback.
+  const custom = (ctx.ui as unknown as { custom?: unknown }).custom;
+  if (ctx.mode === "tui" && typeof custom === "function") {
+    return multiSelectCustom(ctx, title, options, picked, customText, customChecked, allowBack);
+  }
+  return multiSelectFallback(ctx, title, options, picked, customText, customChecked, allowBack);
+}
+
+function formatAnswers(questions: NormalizedQuestion[], states: QuestionState[]): string {
+  const formatted = questions
+    .map((question, index) => {
+      const answers = states[index]?.answers ?? [];
+      return `"${question.question}"="${answers.length ? answers.join(", ") : "Unanswered"}"`;
+    })
+    .join(", ");
+  return `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`;
 }
 
 function formatQuestionTitle(
@@ -293,7 +507,6 @@ export async function askUserExecute(
   const { questions } = normalized;
   const states: QuestionState[] = questions.map(() => ({
     answers: [],
-    wasFreeform: false,
     pickedLabels: new Set<string>(),
     customText: undefined,
     customChecked: false,
@@ -309,20 +522,15 @@ export async function askUserExecute(
     if (q.options.length === 0) {
       if (index === 0) {
         const text = await collectFreeform(title, ctx, state.customText);
-        if (!text) return dismissedResult();
-        state.customText = text;
-        state.answers = [text];
-        state.wasFreeform = true;
+        if (text === undefined) return dismissedResult();
+        state.customText = text || undefined;
+        state.answers = text ? [text] : [];
         index += 1;
         continue;
       }
 
       const keepRow = state.customText ? `✓ Keep answer: ${state.customText}` : undefined;
-      const openRows = [
-        ...(keepRow ? [keepRow] : []),
-        OTHER_LABEL,
-        BACK_LABEL,
-      ];
+      const openRows = [...(keepRow ? [keepRow] : []), OTHER_LABEL, BACK_LABEL];
       const selected = await selectDialog(ctx, title, openRows);
       if (selected === undefined) return dismissedResult();
       if (selected === BACK_LABEL) {
@@ -331,100 +539,49 @@ export async function askUserExecute(
       }
       if (keepRow && selected === keepRow && state.customText) {
         state.answers = [state.customText];
-        state.wasFreeform = true;
-        index += 1;
+          index += 1;
         continue;
       }
       const text = await collectFreeform(title, ctx, state.customText);
-      if (!text) return dismissedResult();
-      state.customText = text;
-      state.answers = [text];
-      state.wasFreeform = true;
+      if (text === undefined) return dismissedResult();
+      state.customText = text || undefined;
+      state.answers = text ? [text] : [];
       index += 1;
       continue;
     }
 
-    // 2. Multi-select question
+    // 2. Multi-select question: toggle the whole set, then submit once.
     if (q.multiple) {
-      let stepped = false;
-      while (!stepped) {
-        const rawOptionRows = q.options.map((option) =>
-          option.description ? `${option.label} — ${option.description}` : option.label,
-        );
-        const optionRows = q.options.map((option, optIdx) => {
-          const checked = state.pickedLabels.has(option.label);
-          return `${checked ? "[✓]" : "[ ]"} ${rawOptionRows[optIdx]}`;
-        });
-        const hasActiveCustom = Boolean(state.customChecked && state.customText);
-        const otherRow = hasActiveCustom
-          ? `[✓] Other: ${state.customText}`
-          : `[ ] ${OTHER_LABEL}`;
-        const selectedCount = state.pickedLabels.size + (hasActiveCustom ? 1 : 0);
-        const doneRow =
-          selectedCount > 0 ? `✓ Done (${selectedCount} selected)` : undefined;
-
-        const rows = [
-          ...optionRows,
-          otherRow,
-          ...(doneRow ? [doneRow] : []),
-          ...(index > 0 ? [BACK_LABEL] : []),
-        ];
-
-        const selected = await selectDialog(ctx, title, rows);
-        if (selected === undefined) {
-          return dismissedResult();
-        }
-        if (index > 0 && selected === BACK_LABEL) {
-          index -= 1;
-          stepped = true;
-          break;
-        }
-        if (doneRow && (selected === doneRow || selected === "✓ Done")) {
-          const ordered = q.options
-            .filter((option) => state.pickedLabels.has(option.label))
-            .map((option) => option.label);
-          if (state.customChecked && state.customText) {
-            ordered.push(state.customText);
-          }
-          state.answers = ordered;
-          state.wasFreeform = false;
-          index += 1;
-          stepped = true;
-          break;
-        }
-        if (
-          selected === otherRow ||
-          selected === OTHER_LABEL ||
-          selected === `[ ] ${OTHER_LABEL}`
-        ) {
-          if (hasActiveCustom) {
-            state.customChecked = false;
-          } else {
-            const text = await collectFreeform(title, ctx, state.customText);
-            if (text) {
-              state.customText = text;
-              state.customChecked = true;
-            }
-          }
-          continue;
-        }
-
-        const optIndex = optionRows.findIndex(
-          (row, idx) =>
-            row === selected ||
-            rawOptionRows[idx] === selected ||
-            q.options[idx]?.label === selected,
-        );
-        const matchedLabel = optIndex >= 0 ? q.options[optIndex]?.label : undefined;
-        if (!matchedLabel) {
-          return dismissedResult();
-        }
-        if (state.pickedLabels.has(matchedLabel)) {
-          state.pickedLabels.delete(matchedLabel);
-        } else {
-          state.pickedLabels.add(matchedLabel);
-        }
+      const outcome = await multiSelectDialog(
+        ctx,
+        title,
+        q.options,
+        state.pickedLabels,
+        state.customText,
+        state.customChecked,
+        index > 0,
+      );
+      if (!outcome) return dismissedResult();
+      if (outcome.kind === "back") {
+        index -= 1;
+        continue;
       }
+      if (outcome.kind === "other") {
+        const text = await collectFreeform(title, ctx, state.customText);
+        if (text === undefined) return dismissedResult();
+        state.customText = text || undefined;
+        state.customChecked = Boolean(text);
+        continue;
+      }
+      const labels = new Set(q.options.map((option) => option.label));
+      const custom = state.customText && outcome.values.includes(state.customText) ? state.customText : undefined;
+      // A custom answer that happens to equal an option label is the option, not
+      // a second answer; otherwise a back-then-resubmit would duplicate it.
+      const customIsOption = custom !== undefined && labels.has(custom);
+      state.pickedLabels = new Set(outcome.values.filter((value) => labels.has(value)));
+      state.customChecked = Boolean(custom && !customIsOption);
+      state.answers = [...new Set(outcome.values)];
+      index += 1;
       continue;
     }
 
@@ -432,11 +589,7 @@ export async function askUserExecute(
     const optionRows = q.options.map((option) =>
       option.description ? `${option.label} — ${option.description}` : option.label,
     );
-    const rows = [
-      ...optionRows,
-      OTHER_LABEL,
-      ...(index > 0 ? [BACK_LABEL] : []),
-    ];
+    const rows = [...optionRows, OTHER_LABEL, ...(index > 0 ? [BACK_LABEL] : [])];
 
     const selected = await selectDialog(ctx, title, rows);
     if (selected === undefined) {
@@ -448,10 +601,9 @@ export async function askUserExecute(
     }
     if (selected === OTHER_LABEL) {
       const text = await collectFreeform(title, ctx, state.customText);
-      if (!text) return dismissedResult();
-      state.customText = text;
-      state.answers = [text];
-      state.wasFreeform = true;
+      if (text === undefined) return dismissedResult();
+      state.customText = text || undefined;
+      state.answers = text ? [text] : [];
       index += 1;
       continue;
     }
@@ -461,28 +613,11 @@ export async function askUserExecute(
     );
     const label = (optIndex >= 0 ? q.options[optIndex]?.label : undefined) ?? selected;
     state.answers = [label];
-    state.wasFreeform = false;
     index += 1;
   }
 
-  if (questions.length === 1) {
-    const first = states[0]!;
-    if (first.wasFreeform) {
-      return answered("User answered: ", first.answers[0] ?? "");
-    }
-    return answered("User selected: ", first.answers.join(", "));
-  }
-
-  const lines = questions.map(
-    (q, idx) => `${idx + 1}. ${q.question} → ${(states[idx]?.answers ?? []).join(", ")}`,
-  );
   return {
-    content: [
-      {
-        type: "text",
-        text: `User answered ${questions.length} questions:\n${lines.join("\n")}`,
-      },
-    ],
+    content: [{ type: "text", text: formatAnswers(questions, states) }],
   };
 }
 
@@ -491,13 +626,14 @@ export default function askUserExtension(pi: ExtensionAPI): void {
     name: "ask_user",
     label: "Ask user",
     description:
-      "When the next step depends on a decision only the user can make, ask it here instead of ending your turn with a prose question — the user answers by picking options and can go back to revise earlier answers in a multi-question flow. Pass 1-4 items in questions: batch independent decisions into one call, and ask a single question first only when later questions depend on its answer. For each question, pass 2-4 options when choices can be enumerated, set multiple: true when several options can be chosen together, or omit options for a genuinely open question. An 'Other (type your answer)' row is always appended; a dismissed dialog means no answer — fall back to plain prose once and do not re-ask.",
+      "When the next step depends on a decision only the user can make, ask it here instead of ending your turn with a prose question — the user answers by picking options and can go back to revise earlier answers in a multi-question flow. Pass 1-4 items in questions: batch independent decisions into one call, and ask a single question first only when later questions depend on its answer. For each question, pass 2-4 options when choices can be enumerated, set multiple: true when several options can be chosen together, or omit options for a genuinely open question.\n\nUsage notes:\n- An \"Other (type your answer)\" row is always appended; do not include a separate free-form option.\n- Multi-select questions toggle several options in one dialog and submit them together.\n- Batches end with a review page: the user can revise any question before submitting all answers.\n- A dismissed dialog means no answer — fall back to plain prose once and do not re-ask.",
     promptSnippet:
       "Ask the user 1-4 single- or multi-select decision questions — they pick options instead of typing.",
     promptGuidelines: [
       "Prefer ask_user over a prose question whenever your turn would otherwise end with a question only the user can answer",
       "Batch 2-4 independent questions into one ask_user call; ask a single question first only when the next question depends on its answer",
       "Set multiple: true when the user can pick more than one option; put your recommended option first and append '(Recommended)' to its label",
+      "Do not add a free-form option: an 'Other (type your answer)' row is appended automatically",
       "Never ask what the context, the repo, or this session already answered — ask in prose only when you have no options to offer",
     ],
     parameters: askUserParameters as unknown as TSchema,
@@ -517,7 +653,6 @@ export default function askUserExtension(pi: ExtensionAPI): void {
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
       const result = await askUserExecute(params as AskUserParams, ctx);
-      // AgentToolResult requires a details field; this tool has none.
       return { ...result, details: undefined };
     },
   });

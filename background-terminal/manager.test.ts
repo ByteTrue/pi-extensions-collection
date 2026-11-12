@@ -81,7 +81,7 @@ describe("BackgroundManager", () => {
     expect(manager.list(SESSION_A).map((task) => task.id)).toEqual([started.id]);
     expect(manager.kill(started.id, SESSION_B)).toBe(false);
   });
-  it("kill() stops a running task and marks it killed without notifying, and is a no-op afterwards", async () => {
+  it("kill() stops a running task, marks it killed, notifies once, and is a no-op afterwards", async () => {
     const manager = createManager();
     const exits: BackgroundTask[] = [];
     manager.init((task) => exits.push(task));
@@ -89,10 +89,28 @@ describe("BackgroundManager", () => {
 
     expect(manager.kill(started.id, SESSION_A)).toBe(true);
     await vi.waitFor(() => expect(manager.get(started.id, SESSION_A)?.status).toBe("killed"), { timeout: 8000 });
-    expect(exits).toEqual([]);
+    await vi.waitFor(() => expect(exits.map((task) => task.status)).toEqual(["killed"]), { timeout: 8000 });
     expect(manager.kill(started.id, SESSION_A)).toBe(false);
   });
 
+
+  it("writes a task journal and removes it when the task settles", async () => {
+    const manager = createManager();
+    manager.init(() => {});
+    const task = manager.start('node -e ""', process.cwd(), SESSION_A);
+    const dir = join(tmpdir(), "background-terminal");
+    const journal = join(dir, `${task.id}.journal.json`);
+    const pid = join(dir, `${task.id}.pid`);
+    const start = join(dir, `${task.id}.start`);
+
+    await vi.waitFor(() => expect(existsSync(journal)).toBe(true), { timeout: 8000 });
+    await vi.waitFor(() => expect(manager.get(task.id, SESSION_A)?.status).toBe("exited"), { timeout: 8000 });
+    await vi.waitFor(() => expect(existsSync(journal)).toBe(false), { timeout: 8000 });
+    expect(existsSync(pid)).toBe(false);
+    expect(existsSync(start)).toBe(false);
+
+    await manager.clearSession(SESSION_A);
+  });
   it("clearSession aborts and removes only that session's tasks, and deletes their output files", async () => {
     const manager = createManager();
     const exits: BackgroundTask[] = [];

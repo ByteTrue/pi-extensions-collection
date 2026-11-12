@@ -42,7 +42,7 @@ describe("stop vs close race (BYTE-6 #17)", () => {
 
       const { runSubagent } = await import("./index.js");
       const controller = new AbortController();
-      const run = runSubagent(dir, { task: "long work" } as SubagentInput, controller.signal);
+      const run = runSubagent(dir, { task: "long work", agent: "reviewer", description: "long work" }, controller.signal);
       // Give the child time to start, then stop it.
       await new Promise((resolve) => setTimeout(resolve, 900));
       controller.abort();
@@ -133,21 +133,27 @@ describe("session_shutdown reload keeps notifications (BYTE-6 #17)", () => {
 
 describe("resume/id validation (BYTE-6 #18)", () => {
   it("rejects resume values that are not session-id shaped", () => {
-    expect(() => normalizeTask({ task: "x", resume: "bad id with spaces" } as SubagentInput)).toThrow(/resume/i);
-    expect(() => normalizeTask({ task: "x", resume: "a".repeat(200) } as SubagentInput)).toThrow(/resume/i);
-    expect(() => normalizeTask({ task: "x", resume: "../../etc/passwd" } as SubagentInput)).toThrow(/resume/i);
+    expect(() => normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "bad id with spaces" })).toThrow(/resume/i);
+    expect(() => normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "a".repeat(200) })).toThrow(/resume/i);
+    expect(() => normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "../../etc/passwd" })).toThrow(/resume/i);
   });
 
   it("rejects id values that are not session-id shaped", () => {
-    expect(() => normalizeTask({ task: "x", id: "bad id" } as SubagentInput)).toThrow(/\bid\b/i);
-    expect(() => normalizeTask({ task: "x", id: "x".repeat(200) } as SubagentInput)).toThrow(/\bid\b/i);
+    expect(() => normalizeTask({ task: "x", agent: "reviewer", description: "x", id: "bad id" })).toThrow(/\bid\b/i);
+    expect(() => normalizeTask({ task: "x", agent: "reviewer", description: "x", id: "x".repeat(200) })).toThrow(/\bid\b/i);
   });
 
   it("keeps accepting well-formed ids and resumes", () => {
     expect(
-      normalizeTask({ task: "x", id: "abc12345-6789-4abc-9def-0123456789ab" } as SubagentInput).id,
+      normalizeTask({ task: "x", agent: "reviewer", description: "x", id: "abc12345-6789-4abc-9def-0123456789ab" }).id,
     ).toBe("abc12345-6789-4abc-9def-0123456789ab");
-    expect(normalizeTask({ task: "x", resume: "abc12345" } as SubagentInput).resume).toBe("abc12345");
+    expect(normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "sub_abc12345" }).resume).toBe(
+      "sub_abc12345",
+    );
+    // D11: only sessions this extension created may be resumed.
+    expect(() =>
+      normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "abc12345" }),
+    ).toThrow(/only subagent sessions/);
   });
 
   it("never forwards a malformed resume into pi argv", () => {

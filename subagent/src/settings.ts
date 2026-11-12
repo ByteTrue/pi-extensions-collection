@@ -336,7 +336,7 @@ export function updateSubagentSettings(
   return targetPath;
 }
 
-export function listDiscoveredAgentNames(cwd: string): string[] {
+export function listDiscoveredAgentNames(cwd: string, projectTrusted = true): string[] {
   const names = new Set<string>();
 
   const scanDir = (dirPath: string) => {
@@ -352,7 +352,7 @@ export function listDiscoveredAgentNames(cwd: string): string[] {
     } catch {}
   };
 
-  scanDir(join(cwd, ".pi", "agents"));
+  if (projectTrusted) scanDir(join(cwd, ".pi", "agents"));
   const home = homedir();
   scanDir(join(agentDir(), "agents"));
   scanDir(join(home, ".pi", "agents"));
@@ -363,7 +363,7 @@ export function listDiscoveredAgentNames(cwd: string): string[] {
   }
 
   // Also include any agent roles explicitly configured in settings
-  const settings = loadSubagentSettings(cwd, true);
+  const settings = loadSubagentSettings(cwd, projectTrusted);
   if (settings.agents) {
     for (const key of Object.keys(settings.agents)) {
       names.add(key);

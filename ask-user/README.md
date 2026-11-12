@@ -15,14 +15,18 @@ Registers one tool:
 - **`ask_user(questions)`** — 1–4 decision or clarification questions per call.
   - `questions`: array of `{question, options?, multiple?}` items (a single
     question is simply a 1-item array; legacy top-level `{question, options?,
-    multiple?}` is also accepted at runtime).
+    multiple?}` is also accepted at runtime). Option labels are meant to be
+    1-5 words with a one-line description.
   - **Single-select (`options` without `multiple: true`)**: rendered through
     Pi's built-in `ctx.ui.select` dialog with an always-appended
     **"Other (type your answer)"** row.
-  - **Multi-select (`multiple: true`)**: rendered through a `ctx.ui.select`
-    checklist loop where picking an option toggles `[✓]` / `[ ]`, picking
-    **"Other (type your answer)"** merges custom text into the checklist as
-    `[✓] Other: …`, and **"✓ Done (N selected)"** confirms the question.
+  - **Multi-select (`multiple: true`)**: in the TUI a small custom dialog
+    toggles `[✓]` / `[ ]` with Space and submits the whole set with Enter —
+    opencode's multiselect semantics, not one submit per pick. Picking
+    **"Other (type your answer)"** merges custom text into the selection as
+    `[✓] Other: …`. RPC mode keeps the built-in select loop with an always
+    present **"✓ Done (N selected)"** row (0 selected submits `Unanswered`),
+    because the RPC dialog surface has no custom component.
   - **Back-navigation (`questions.length > 1`)**: questions 2..N include a
     **"← Back to previous question"** row so you can return to an earlier
     question and revise its answer (previous selections are preserved).
@@ -33,8 +37,9 @@ Registers one tool:
   - **No dialog-capable UI (print/JSON mode)**: explicit error — the tool never
     guesses an answer.
 
-Built-in dialogs only: no custom TUI components, no overlay, no runtime
-imports, no timeout, no config.
+No runtime imports and no config. The TUI multiselect dialog is a plain
+component object passed to `ctx.ui.custom` (no pi-tui import); every other
+dialog uses Pi's built-ins. No overlay, no timeout.
 
 ### Every dialog runs with the working spinner hidden
 
@@ -118,9 +123,10 @@ imports.
 ## Tests
 
 `npm --workspace ask-user test` covers registration, single-select option
-composition, multi-select toggling and custom `Other` merging, multi-question
-batching with back-navigation, the freeform path, dismiss semantics, mode
-guards, schema shape (plain JSON Schema, no TypeBox runtime symbols, still
-convertible to the strict subset so `strict: "prefer"` can engage), and spinner
-suppression (hide/restore on every path, one symmetric pair per dialog, fully
-skipped outside TUI mode, restored even when the dialog throws).
+composition, the custom TUI multiselect (toggle several, submit once), custom
+`Other` merging, multi-question batching with back-navigation, the freeform
+path (empty = `Unanswered`), dismiss semantics, mode guards,
+schema shape (plain JSON Schema, no TypeBox runtime symbols, still convertible
+to the strict subset so `strict: "prefer"` can engage), and spinner suppression
+(hide/restore on every path, one symmetric pair per dialog, fully skipped
+outside TUI mode, restored even when the dialog throws).

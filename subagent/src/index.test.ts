@@ -302,17 +302,41 @@ describe("subagent unit tests", () => {
     expect(findAgentDefinition(process.cwd(), "general-purpose").found).toBe(false);
   });
 
+
+  it("clamps timeoutMs to the Node timer maximum", () => {
+    const reviewer = resolveAgentRole(process.cwd(), "reviewer", {});
+    const huge = resolveRunCfg({ timeoutMs: 1e15 }, reviewer, undefined, undefined, {});
+    expect(huge.timeoutMs).toBe(2_147_483_647);
+    const normal = resolveRunCfg({ timeoutMs: 1234 }, reviewer, undefined, undefined, {});
+    expect(normal.timeoutMs).toBe(1234);
+  });
+  it("names only new child sessions, not resumed ones", () => {
+    const reviewer = resolveAgentRole(process.cwd(), "reviewer", {});
+    const fresh = resolveRunCfg(
+      { agent: "reviewer", description: "fresh child" },
+      reviewer,
+      undefined,
+      undefined,
+      {},
+    );
+    expect(fresh.name).toBe("fresh child");
+    const resumed = resolveRunCfg(
+      { agent: "reviewer", description: "resumed child", resume: "sub_123" },
+      reviewer,
+      undefined,
+      undefined,
+      {},
+    );
+    expect(resumed.name).toBeUndefined();
+  });
+
   it("keeps the issue 110 dispatch contract: role in, argv and prompt out", () => {
     // Mirrors the tool's own wiring (resolveAgentRole → resolveRunCfg →
     // buildPiArgs / buildSubagentPrompt) so the accepted surface stays fixed.
     const cwd = process.cwd();
 
-    // 1. Omitted agent: verbatim task, no tool narrowing, inherited model.
-    const plain = resolveAgentRole(cwd, undefined, {});
-    const plainRun = resolveRunCfg({}, plain, "high", "vendor/model", {});
-    expect(buildSubagentPrompt("do the thing", plain)).toBe("do the thing");
-    expect(buildPiArgs(plainRun)).not.toContain("--tools");
-    expect(plainRun.model).toBe("vendor/model:high");
+    // 1. Omitting the role is rejected: there is no anonymous child.
+    expect(() => resolveAgentRole(cwd, undefined, {})).toThrow(/required/);
 
     // 2. reviewer: read+bash only, thinking pinned to the top level.
     const reviewer = resolveAgentRole(cwd, "reviewer", {});
@@ -325,24 +349,13 @@ describe("subagent unit tests", () => {
     expect(() => resolveAgentRole(cwd, "explore", {})).toThrow(/reviewer/);
   });
 
-  it("injects no role prompt when the agent is omitted (issue 110)", () => {
-    // Omitting the role is not "a default role": it resolves to an empty config,
-    // so the child gets pi's own prompt plus the task and nothing of ours.
-    const omitted = resolveAgentRole(process.cwd(), undefined, {});
-    expect(omitted).toEqual({});
-    expect(omitted.systemPrompt).toBeUndefined();
-    expect(omitted.tools).toBeUndefined();
-    expect(omitted.model).toBeUndefined();
-    expect(omitted.thinking).toBeUndefined();
-    // Blank/whitespace names take the same path rather than erroring.
-    expect(resolveAgentRole(process.cwd(), "   ", {})).toEqual({});
+  it("requires an agent role: no plain child (D8)", () => {
+    expect(() => resolveAgentRole(process.cwd(), undefined, {})).toThrow(/'agent' is required/);
+    expect(() => resolveAgentRole(process.cwd(), "   ", {})).toThrow(/'agent' is required/);
   });
 
-  it("passes the task through verbatim when no role is named (issue 110)", () => {
-    // The omitted-agent path must hand the child exactly the task text: this is
-    // the acceptance criterion, kept as the guard that no prompt creeps back in.
+  it("passes the task through verbatim when a role carries no prompt", () => {
     const task = "Review the uncommitted diff in packages/subagent";
-    expect(buildSubagentPrompt(task, resolveAgentRole(process.cwd(), undefined, {}))).toBe(task);
     expect(buildSubagentPrompt(task, {})).toBe(task);
     // A named role still frames the task as assigned work.
     const withRole = buildSubagentPrompt(task, resolveAgentRole(process.cwd(), "reviewer", {}));
@@ -360,8 +373,8 @@ describe("subagent unit tests", () => {
     expect(roster).not.toContain("- plan");
     expect(roster).not.toContain("- general-purpose");
 
-    // A custom .pi/agents document with a description joins the roster with its
-    // trigger sentence; one without falls back to the bare name.
+    // Project-only roles are listed by name but their document is not read at
+    // load, so an untrusted project description cannot enter the tool prompt.
     const dir = join(tmpdir(), `subagent-roster-${Date.now()}`);
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(
@@ -374,7 +387,10 @@ describe("subagent unit tests", () => {
     );
     try {
       const custom = buildAgentRosterText(dir);
-      expect(custom).toContain("- db-sleuth: Database migration auditor. Use it to inspect schema drift.");
+      expect(custom).toContain(
+        "- db-sleuth: This subagent should only be called when explicitly requested.",
+      );
+      expect(custom).not.toContain("Database migration auditor");
       expect(custom).toContain("- bare-role");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -728,7 +744,7 @@ describe("subagent unit tests", () => {
     }
 
     // A tool call cannot disable the ceiling either (normalizeTask's > 0 gate).
-    const zeroed = normalizeTask({ task: "x", timeoutMs: 0, maxTurns: -3 });
+    const zeroed = normalizeTask({ task: "x", agent: "reviewer", description: "x", timeoutMs: 0, maxTurns: -3 });
     expect(zeroed.timeoutMs).toBeUndefined();
     expect(zeroed.maxTurns).toBeUndefined();
 
@@ -878,16 +894,14 @@ You are an expert researcher. Read references carefully.
   });
 
   it("resolves a known role and rejects an unknown one with the available list (issue 097)", () => {
-    // Omitting `agent` injects no role prompt at all (issue 110).
-    const defaultCfg = resolveAgentRole(process.cwd(), undefined);
-    expect(defaultCfg).toEqual({});
-    expect(resolveAgentRole(process.cwd(), "   ")).toEqual({});
+    expect(() => resolveAgentRole(process.cwd(), undefined)).toThrow(/'agent' is required/);
+    expect(() => resolveAgentRole(process.cwd(), "   ")).toThrow(/'agent' is required/);
     expect(resolveAgentRole(process.cwd(), "reviewer").tools).toEqual(["read", "bash"]);
     expect(() => resolveAgentRole(process.cwd(), "definitely-not-a-role")).toThrow(
       /Unknown agent role "definitely-not-a-role"/,
     );
     expect(() => resolveAgentRole(process.cwd(), "definitely-not-a-role")).toThrow(
-      /Omit 'agent' for a plain child/,
+      /Use one of the roles above/,
     );
     // A removed built-in is now an unknown role the model gets told about.
     expect(() => resolveAgentRole(process.cwd(), "explore")).toThrow(
@@ -914,7 +928,7 @@ You are an expert researcher. Read references carefully.
       ctx: { sessionManager: { getSessionId: () => string } },
     ) => Promise<unknown>;
     await expect(
-      execute("call_1", { task: "x", agent: "no-such-role" }, undefined, undefined, {
+      execute("call_1", { task: "x", agent: "no-such-role", description: "x" }, undefined, undefined, {
         sessionManager: { getSessionId: () => "sess-err" },
       }),
     ).rejects.toThrow(/Unknown agent role "no-such-role"/);
@@ -930,6 +944,19 @@ You are an expert researcher. Read references carefully.
     writeFileSync(
       join(projectSettingsDir, "settings.json"),
       JSON.stringify({ agents: { secretops: { model: "vendor/project-only" } } }),
+    );
+    // A project agent document supplies the child prompt/tools/model; an
+    // untrusted project must not load it.
+    mkdirSync(join(projectDir, ".pi", "agents"), { recursive: true });
+    writeFileSync(
+      join(projectDir, ".pi", "agents", "projectrole.md"),
+      "---\ndescription: Project-only role\n---\nProject role prompt\n",
+    );
+    expect(resolveAgentRole(projectDir, "projectrole", undefined, true).systemPrompt).toContain(
+      "Project role prompt",
+    );
+    expect(() => resolveAgentRole(projectDir, "projectrole", undefined, false)).toThrow(
+      /Unknown agent role "projectrole"/,
     );
     const ctxBase = { sessionManager: { getSessionId: () => "sess-trust" } };
     try {
@@ -955,7 +982,7 @@ You are an expert researcher. Read references carefully.
     process.chdir(projectDir);
     try {
       await expect(
-        execute("call_t1", { task: "x", agent: "secretops" }, undefined, undefined, {
+        execute("call_t1", { task: "x", agent: "secretops", description: "x" }, undefined, undefined, {
           ...ctxBase,
           isProjectTrusted: () => false,
         }),
@@ -1012,7 +1039,7 @@ You are an expert researcher. Read references carefully.
       writeFileSync(fake, makeFake(trustedLog));
       const trusted = await runSubagent(
         projectDir,
-        { task: "x", id: "trust-t" },
+        { task: "x", agent: "reviewer", description: "trusted", id: "trust-t" },
         undefined,
         undefined,
         undefined,
@@ -1026,7 +1053,7 @@ You are an expert researcher. Read references carefully.
       writeFileSync(fake, makeFake(untrustedLog));
       const untrusted = await runSubagent(
         projectDir,
-        { task: "x", id: "trust-f" },
+        { task: "x", agent: "reviewer", description: "untrusted", id: "trust-f" },
         undefined,
         undefined,
         undefined,
@@ -1050,18 +1077,23 @@ You are an expert researcher. Read references carefully.
   });
 
   it("normalizes a single task input, dropping unknown fields (issue 095)", () => {
-    const item = normalizeTask({ task: "  test task  " });
-    expect(item).toEqual({ task: "test task" });
+    const item = normalizeTask({ task: "  test task  ", agent: " reviewer ", description: "  label  " });
+    expect(item).toEqual({ task: "test task", agent: "reviewer", description: "label" });
 
     // model/thinking never pass through (082 invariant) — not in SubagentInput, but models send junk
     const junk = normalizeTask({
       task: "x",
+      agent: "reviewer",
+      description: "x",
       model: "gpt-5",
       thinking: "off",
     } as unknown as SubagentInput);
-    expect(junk).toEqual({ task: "x" });
+    expect(junk).not.toHaveProperty("model");
+    expect(junk).not.toHaveProperty("thinking");
 
-    expect(() => normalizeTask({ task: "   " })).toThrow(/No task specified/);
+    expect(() => normalizeTask({ task: "   ", agent: "reviewer", description: "x" })).toThrow(/No task specified/);
+    expect(() => normalizeTask({ task: "x", description: "x" })).toThrow(/'agent' is required/);
+    expect(() => normalizeTask({ task: "x", agent: "reviewer" })).toThrow(/'description' is required/);
   });
 
   it("manages subagent tasks lifecycle including running count and stop", async () => {
@@ -1238,7 +1270,7 @@ You are an expert researcher. Read references carefully.
     // Flat single-task surface: task required; batch/chain gone (issue 095).
     expect(props).toHaveProperty("task");
     expect(props).toHaveProperty("agent");
-    expect(parameters.required).toEqual(["task"]);
+    expect(parameters.required).toEqual(["task", "agent", "description"]);
     expect(props).not.toHaveProperty("tasks");
     expect(props).not.toHaveProperty("chain");
     expect(props).not.toHaveProperty("mode");
@@ -1249,18 +1281,18 @@ You are an expert researcher. Read references carefully.
     expect(props).not.toHaveProperty("async");
     expect(registered).not.toHaveProperty("renderResult");
 
-    // The omit-agent default path must stay visible on every model-facing surface,
-    // or models only ever fill `agent` with a role (issue 096). Nothing may gate
-    // custom roles behind the built-in ones, and the model must see the actual
-    // role choices with their trigger descriptions (issues 105, 102).
-    expect(String(main.description)).toContain("Omit 'agent' for a plain child");
-    expect(String(main.promptSnippet)).toContain("plain child by default");
+    // The agent requirement must stay visible on every model-facing surface,
+    // and the model must see the actual role choices with their trigger
+    // descriptions (issues 105, 102; D8 removed the plain-child path).
+    expect(String(main.description)).toContain("'agent' is required");
+    expect(String(main.description)).not.toContain("Omit 'agent' for a plain child");
     const guidelines = (main.promptGuidelines as string[]).join("\n");
     expect(guidelines).toContain("Delegate any self-contained job");
-    expect(guidelines).toContain("Omit 'agent' for a plain child");
-    expect(guidelines).not.toContain("pass 'agent' only when");
+    expect(guidelines).not.toContain("Omit 'agent' for a plain child");
+    expect(guidelines).toContain("Pass 'description'");
     const agentParam = props.agent as JsonObject;
-    expect(String(agentParam.description)).toContain("Omit it for a plain child");
+    expect(String(agentParam.description)).toContain("Required agent role");
+    expect(String(agentParam.description)).not.toContain("Omit it for a plain child");
     // Issue 102 + 110: the roster with trigger descriptions is embedded in the
     // tool description; the single built-in role is the reviewer.
     expect(String(main.description)).toContain("- reviewer: Independent adversarial reviewer");
@@ -1382,9 +1414,14 @@ You are an expert researcher. Read references carefully.
     }
   });
 
-  it("describes a task as plain text with role prefix (no ANSI)", () => {
-    expect(describeTask({ task: "  Review\n  the diff  ", agent: "reviewer" })).toBe("reviewer: Review the diff");
-    expect(describeTask({ task: "Just a task" })).toBe("Just a task");
+  it("describes a task with the short label (no ANSI)", () => {
+    expect(
+      describeTask({ task: "  Review\n  the diff  ", description: "Review the diff", agent: "reviewer" }),
+    ).toBe("Review the diff");
+    // Older/partial callers without a label still get a one-line task.
+    expect(describeTask({ task: "Just a task", description: "", agent: "reviewer" })).toBe(
+      "Just a task",
+    );
   });
 
   it("formats subagent_status output per state and hides output text (issue 095)", () => {
@@ -1635,7 +1672,15 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
       ) => Promise<{ details?: Record<string, unknown> }>;
       const result = await execute(
         "call_ptr",
-        { task: "pointer check", cwd: dir },
+        {
+          task: "pointer check",
+          agent: "reviewer",
+          description: "pointer check",
+          cwd: dir,
+          // Not a tool field: a model/injection must not be able to turn this
+          // into --session-id <parent session>.
+          id: "11111111-2222-4333-8444-555555555555",
+        },
         undefined,
         undefined,
         { sessionManager: { getSessionId: () => "sess-ptr" } },
@@ -1648,6 +1693,7 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
       expect(typeof details.sessionId).toBe("string");
       expect(details.sessionId).not.toBe(details.id);
       expect(details.sessionId).toMatch(/^sub_[0-9a-f]{12}$/);
+      expect(details.sessionId).not.toBe("11111111-2222-4333-8444-555555555555");
       expect(details.cwd).toBe(resolve(dir));
       expect(() => structuredClone(details)).not.toThrow();
       expect(details).not.toHaveProperty("sessionFile");
@@ -1660,6 +1706,9 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
       const sidIndex = argv.indexOf("--session-id");
       expect(sidIndex).toBeGreaterThan(-1);
       expect(argv[sidIndex + 1]).toBe(details.sessionId);
+      const nameIndex = argv.indexOf("--name");
+      expect(nameIndex).toBeGreaterThan(-1);
+      expect(argv[nameIndex + 1]).toBe("pointer check");
     } finally {
       if (prev === undefined) delete process.env.PI_CLI_JS;
       else process.env.PI_CLI_JS = prev;
@@ -1695,13 +1744,13 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
       ) => Promise<{ details?: Record<string, unknown> }>;
       const result = await execute(
         "call_ptr2",
-        { task: "resume check", resume: "resume_sess_1" },
+        { task: "resume check", agent: "reviewer", description: "resume check", resume: "sub_resume_1" },
         undefined,
         undefined,
         { sessionManager: { getSessionId: () => "sess-ptr" } },
       );
       // resume wins: no injected id, and the advertised sessionId IS the resume value.
-      expect(result.details?.sessionId).toBe("resume_sess_1");
+      expect(result.details?.sessionId).toBe("sub_resume_1");
     } finally {
       if (prev === undefined) delete process.env.PI_CLI_JS;
       else process.env.PI_CLI_JS = prev;
@@ -1740,6 +1789,8 @@ describe("runPi kill semantics (fake pi cli)", () => {
       // Real turn count in the message, not the configured limit.
       expect(r.output).toContain("reached maximum limit of 2 turns (turns: 2)");
       expect(r.output).toContain('resume: "' + state.sessionId + '"');
+      expect(r.output).toContain('agent: "tester"');
+      expect(r.output).toContain('description: "Continue remaining work"');
       // Exactly one paused notification, no duplicate from close.
       expect(r.output.split("paused:").length - 1).toBe(1);
 
@@ -1941,11 +1992,114 @@ it("sessionLogPath picks the newest file when several share a session id (issue 
   }
 });
 
+
+describe("shared manager callbacks (reload)", () => {
+  it("routes a completion from an older load to the latest callbacks", () => {
+    const tasks = new Map<string, import("./index.js").SubagentTaskRecord>();
+    const oldLoad = new SubagentTaskManager(tasks, true);
+    const newLoad = new SubagentTaskManager(tasks, true);
+    let seen = "";
+    oldLoad.init((task) => {
+      seen = `old:${task.id}`;
+    });
+    newLoad.init((task) => {
+      seen = `new:${task.id}`;
+    });
+    oldLoad.register({
+      id: "sub_shared",
+      parentSessionId: "s",
+      description: "shared",
+      status: "running",
+      output: "",
+      startedAt: 0,
+      controller: new AbortController(),
+      notifyOnExit: true,
+    });
+    oldLoad.complete("sub_shared", "done", false);
+    expect(seen).toBe("new:sub_shared");
+    oldLoad.init(() => {}, () => {});
+  });
+});
+
+describe("completion notice shape (D3/D10/D13)", () => {
+  it("wraps the result in a subagent tag, falls back on empty output, and lists parent background work", async () => {
+    const mod = await import("./index.js");
+    const record = {
+      id: "sub_task",
+      parentSessionId: "parent-session",
+      description: "Review the diff",
+      status: "succeeded",
+      output: "   ",
+      startedAt: 0,
+      controller: new AbortController(),
+      notifyOnExit: false,
+      progress: {
+        kind: "subagent-progress",
+        agent: "reviewer",
+        startedAt: 0,
+        updatedAt: 0,
+        final: true,
+        runs: [
+          {
+            id: "run-1",
+            agent: "reviewer",
+            prompt: "review",
+            sessionId: "sub_child",
+            cwd: "/tmp",
+            status: "succeeded",
+            finalText: "",
+            textTail: "",
+            thinkingTail: "",
+            stderrTail: "",
+            tools: [],
+            usage: { input: 0, output: 0, cost: 0, totalTokens: 0 },
+          },
+        ],
+      },
+    } as unknown as import("./index.js").SubagentTaskRecord;
+
+    const key = Symbol.for("pi-extensions.background-work");
+    const providers = (globalThis as unknown as Record<symbol, Map<string, unknown>>)[key]!;
+    providers.set("test-provider", {
+      id: "test-provider",
+      running: () => [{ kind: "shell", id: "bg_1", label: "npm test" }],
+    });
+    mod.subagentManager.register({
+      id: "sub_task_running",
+      sessionId: "sub_child_2",
+      parentSessionId: "parent-session",
+      description: "Helper review",
+      agent: "reviewer",
+      status: "running",
+      output: "",
+      startedAt: 0,
+      controller: new AbortController(),
+      notifyOnExit: false,
+    });
+    try {
+      const text = mod.formatSubagentExitMessage(record);
+      expect(text).toContain('<subagent sessionID="sub_child" state="completed" description="Review the diff">');
+      expect(text).toContain("Subagent completed without a text response.");
+      expect(text).toContain("Background work still running:");
+      expect(text).toContain("npm test");
+      expect(text).toContain("- subagent (sub_child_2): reviewer: Helper review");
+      expect(text).toContain("</subagent>");
+    } finally {
+      providers.delete("test-provider");
+      await mod.subagentManager.clearSession("parent-session");
+    }
+  });
+});
+
 it("normalizeTask rejects resume + id together (issue 115 follow-up)", () => {
-  expect(() => normalizeTask({ task: "x", resume: "resume_1", id: "sub_2" })).toThrow(
-    /either 'resume' or 'id', not both/,
-  );
+  expect(() =>
+    normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "sub_1", id: "sub_2" }),
+  ).toThrow(/either 'resume' or 'id', not both/);
   // Each alone stays fine.
-  expect(normalizeTask({ task: "x", resume: "resume_1" }).resume).toBe("resume_1");
-  expect(normalizeTask({ task: "x", id: "sub_2" }).id).toBe("sub_2");
+  expect(
+    normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "sub_1" }).resume,
+  ).toBe("sub_1");
+  expect(
+    normalizeTask({ task: "x", agent: "reviewer", description: "x", id: "sub_2" }).id,
+  ).toBe("sub_2");
 });

@@ -44,11 +44,11 @@ extension code. `auto-compact` registers no tools and can stay loaded.
 
 | Extension | What it does |
 | --- | --- |
-| [`background-terminal`](./background-terminal/) | `background_run` / `background_status` / `background_kill` tools plus the `/background` menu: pure-background execution whose exit wakes the agent with a new message. Built-in `bash`/`powershell` stay untouched |
-| [`bash-timeout`](./bash-timeout/) | Optional 300s default-and-cap for the built-in `bash`/`powershell` tools (two event hooks; registers no tools) |
-| [`ask-user`](./ask-user/) | Minimal `ask_user` tool: 1–4 single- or multi-select decision questions per call with back-navigation, answered via Pi's built-in dialogs |
-| [`goal`](./goal/) | Minimal `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until the model calls `goal_done` with evidence. The model can draft the objective itself via `goal_start` |
-| [`subagent`](./subagent/) | `subagent` / `subagent_status` / `subagent_stop` plus the `/subagent` menu: isolated child sessions whose result arrives as a new message, live progress, budget guards, and one built-in `reviewer` role |
+| [`background-terminal`](./background-terminal/) | `background_run` / `background_status` / `background_kill` tools plus the `/background` menu: pure-background execution whose exit wakes the agent with a `<shell>` notice; no lifetime by default, killed at session exit. Built-in `bash`/`powershell` stay untouched |
+| [`bash-timeout`](./bash-timeout/) | Optional 120s default timeout for the built-in `bash`/`powershell` tools; explicit `timeout: 0` disables it and larger values are honored (two event hooks; registers no tools) |
+| [`ask-user`](./ask-user/) | `ask_user` tool: 1–4 single- or multi-select decision questions per call, with true toggle-then-submit multiselect and back-navigation |
+| [`goal`](./goal/) | `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until `goal_done` with evidence; untrusted-objective wrapper, 50-round and 3-stall guards, background-work wait, restart pause |
+| [`subagent`](./subagent/) | `subagent` / `subagent_status` / `subagent_stop` plus the `/subagent` menu: isolated child sessions whose `<subagent>` result arrives as a new message; `agent` and `description` required, live progress, budget guards, one built-in `reviewer` role |
 | [`context-prune`](./context-prune/) | `ctx_reduce` / `ctx_search` / `ctx_expand` plus `/context-prune`: deterministic pruning of stale tool results, reminders that make the tools get used, and the session file named in the system prompt |
 | [`auto-compact`](./auto-compact/) | Large-window models compact at 400k tokens; registers no tools and no commands |
 

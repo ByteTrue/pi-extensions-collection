@@ -21,6 +21,19 @@ describe("background_kill tool", () => {
     await vi.waitFor(() => expect(manager.get(started.id, SESSION_ID)?.status).toBe("killed"), { timeout: 8000 });
   });
 
+
+  it("sends a completion notice when a task is stopped", async () => {
+    const exits: string[] = [];
+    manager.init((task) => exits.push(task.id));
+    const started = manager.start('node -e "setInterval(() => {}, 1000)"', process.cwd(), SESSION_ID);
+
+    const result = await call(registerOne(registerBackgroundKillTool), { id: started.id }, SESSION_ID);
+    expect(result.content[0]?.text).toContain("Stopped");
+
+    await vi.waitFor(() => expect(exits).toEqual([started.id]), { timeout: 8000 });
+    expect(manager.get(started.id, SESSION_ID)?.status).toBe("killed");
+    manager.init(() => {});
+  });
   it("reports an already-finished task without erroring", async () => {
     manager.init(() => {});
     const started = manager.start('node -e ""', process.cwd(), SESSION_ID);

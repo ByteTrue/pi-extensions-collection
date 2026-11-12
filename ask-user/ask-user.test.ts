@@ -62,6 +62,74 @@ function ctxWithRecorder(
   return { ctx, calls, working };
 }
 
+/**
+ * Fake custom-component surface: captures the component so the test can drive
+ * raw keys, and answers the next editor/input dialog from `freeform`.
+ */
+function ctxWithCustom(
+  freeform?: string,
+): {
+  ctx: ExtensionContext;
+  send: (data: string) => void;
+  render: () => string[];
+  editorCalls: number;
+} {
+  let component:
+    | { render?: (width: number) => string[]; handleInput?: (data: string) => void }
+    | undefined;
+  let editorCalls = 0;
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      custom: async (
+        factory: (
+          tui: { requestRender: () => void },
+          theme: { fg: (color: string, text: string) => string; bold: (text: string) => string },
+          keybindings: { matches: (data: string, key: string) => boolean },
+          done: (value: unknown) => void,
+        ) => { render: (width: number) => string[]; handleInput: (data: string) => void },
+      ) =>
+        new Promise((resolve) => {
+          component = factory(
+            { requestRender: () => {} },
+            { fg: (_color, text) => text, bold: (text) => text },
+            {
+              matches: (data, key) =>
+                (key === "tui.select.up" && data === "up") ||
+                (key === "tui.select.down" && data === "down") ||
+                (key === "tui.select.confirm" && data === "enter") ||
+                (key === "tui.select.cancel" && data === "esc"),
+            },
+            resolve,
+          );
+        }),
+      async select() {
+        throw new Error("select should not be used when custom is available");
+      },
+      async input() {
+        editorCalls += 1;
+        return freeform;
+      },
+      async editor() {
+        editorCalls += 1;
+        return freeform;
+      },
+      setWorkingVisible() {},
+    },
+  } as unknown as ExtensionContext;
+  return {
+    ctx,
+    send: (data) => component?.handleInput?.(data),
+    render: () => component?.render?.(80) ?? [],
+    get editorCalls() {
+      return editorCalls;
+    },
+  };
+}
+
+const flushTicks = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 function harness() {
   let tool:
     | (ToolDefinition & {
@@ -82,6 +150,14 @@ function harness() {
   askUserExtension(pi);
   if (!tool) throw new Error("ask_user tool was not registered");
   return tool;
+}
+
+
+function answeredText(...pairs: [string, string[]][]): string {
+  const formatted = pairs
+    .map(([question, answers]) => `"${question}"="${answers.length ? answers.join(", ") : "Unanswered"}"`)
+    .join(", ");
+  return `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`;
 }
 
 describe("registration", () => {
@@ -171,7 +247,7 @@ describe("askUserExecute — single-select option questions", () => {
     const [title, options] = calls[0]!.args as [string, string[]];
     expect(title).toBe("Which test runner?");
     expect(options).toEqual(["vitest — repo default", "jest", "Other (type your answer)"]);
-    expect(result.content[0]!.text).toBe("User selected: vitest");
+    expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["vitest"]]));
   });
 
   it("accepts legacy top-level { question, options } parameters", async () => {
@@ -183,7 +259,7 @@ describe("askUserExecute — single-select option questions", () => {
       },
       ctx,
     )) as { content: { text: string }[] };
-    expect(result.content[0]!.text).toBe("User selected: jest");
+    expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["jest"]]));
   });
 
   it("routes the Other row to the freeform path", async () => {
@@ -193,7 +269,7 @@ describe("askUserExecute — single-select option questions", () => {
     });
     const result = (await askUserExecute(params, ctx)) as { content: { text: string }[] };
     expect(calls.map((c) => c.method)).toEqual(["select", "editor"]);
-    expect(result.content[0]!.text).toBe("User answered: mocha");
+    expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["mocha"]]));
   });
 
   it("returns the fixed dismiss text when the dialog is cancelled", async () => {
@@ -222,7 +298,7 @@ describe("askUserExecute — multi-select questions (multiple: true)", () => {
     ],
   };
 
-  it("toggles multiple options, shows Done only after selection, and returns ordered labels", async () => {
+  it("toggles multiple options, always offers Done, and returns ordered labels", async () => {
     const { ctx, calls } = ctxWithRecorder({
       select: [
         "[ ] Browser",
@@ -235,7 +311,7 @@ describe("askUserExecute — multi-select questions (multiple: true)", () => {
     const result = (await askUserExecute(multiParams, ctx)) as { content: { text: string }[] };
     expect(calls).toHaveLength(5);
 
-    // Initial render has no Done row because 0 items are selected
+    // Initial render already offers Done: 0 selected means Unanswered.
     const [firstTitle, firstRows] = calls[0]!.args as [string, string[]];
     expect(firstTitle).toBe("Which targets? (select all that apply)");
     expect(firstRows).toEqual([
@@ -243,6 +319,7 @@ describe("askUserExecute — multi-select questions (multiple: true)", () => {
       "[ ] CJS — legacy Node",
       "[ ] Browser",
       "[ ] Other (type your answer)",
+      "✓ Done (0 selected)",
     ]);
 
     // After selecting Browser, Done (1 selected) appears
@@ -256,7 +333,7 @@ describe("askUserExecute — multi-select questions (multiple: true)", () => {
     ]);
 
     // Preserves option definition order (ESM, CJS)
-    expect(result.content[0]!.text).toBe("User selected: ESM, CJS");
+    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", ["ESM", "CJS"]]));
   });
 
   it("merges custom Other text into the multi-select checklist and allows unchecking it", async () => {
@@ -271,11 +348,81 @@ describe("askUserExecute — multi-select questions (multiple: true)", () => {
       editor: ["Deno", "Bun"],
     });
     const result = (await askUserExecute(multiParams, ctx)) as { content: { text: string }[] };
-    expect(result.content[0]!.text).toBe("User selected: ESM, Bun");
+    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", ["ESM", "Bun"]]));
     // Second editor call receives "Deno" as prefill
     const editorCalls = calls.filter((c) => c.method === "editor");
     expect(editorCalls[0]!.args).toEqual(["Which targets? (select all that apply)"]);
     expect(editorCalls[1]!.args).toEqual(["Which targets? (select all that apply)", "Deno"]);
+  });
+
+
+
+  it("does not duplicate a custom answer that equals an option label after going back", async () => {
+    const { ctx } = ctxWithRecorder({
+      select: [
+        "[ ] Other (type your answer)",
+        "✓ Done (1 selected)",
+        "← Back to previous question",
+        "✓ Done (1 selected)",
+        "Yes",
+      ],
+      editor: "ESM",
+    });
+    const result = (await askUserExecute(
+      {
+        questions: [
+          { question: "Which targets?", multiple: true, options: [{ label: "ESM" }, { label: "CJS" }] },
+          { question: "Publish?", options: [{ label: "Yes" }, { label: "No" }] },
+        ],
+      },
+      ctx,
+    )) as { content: { text: string }[] };
+    expect(result.content[0]!.text).toBe(
+      answeredText(["Which targets?", ["ESM"]], ["Publish?", ["Yes"]]),
+    );
+  });
+  it("lets RPC submit an empty multi-select as Unanswered", async () => {
+    const { ctx } = ctxWithRecorder({ select: "✓ Done (0 selected)" }, { mode: "rpc" });
+    const result = (await askUserExecute(multiParams, ctx)) as { content: { text: string }[] };
+    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", []]));
+  });
+  it("uses the custom TUI component to toggle several options and submit once", async () => {
+    const { ctx, send, render } = ctxWithCustom();
+    const pending = askUserExecute(multiParams, ctx);
+    await flushTicks();
+    expect(render().some((line) => line.includes("Which targets?"))).toBe(true);
+
+    send(" "); // toggle ESM
+    send("down");
+    send(" "); // toggle CJS
+    send("enter"); // submit both together
+
+    const result = (await pending) as { content: { text: string }[] };
+    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", ["ESM", "CJS"]]));
+  });
+
+  it("opens the freeform editor from the custom Other row and merges the text", async () => {
+    const { ctx, send } = ctxWithCustom("Deno");
+    const pending = askUserExecute(multiParams, ctx);
+    await flushTicks();
+    send("down");
+    send("down");
+    send("down"); // Other row
+    send("enter");
+    await flushTicks();
+    send("enter"); // submit the merged custom answer
+
+    const result = (await pending) as { content: { text: string }[] };
+    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", ["Deno"]]));
+  });
+
+  it("dismisses when the custom dialog is cancelled", async () => {
+    const { ctx, send } = ctxWithCustom();
+    const pending = askUserExecute(multiParams, ctx);
+    await flushTicks();
+    send("esc");
+    const result = (await pending) as { content: { text: string }[] };
+    expect(result.content[0]!.text).toContain("dismissed");
   });
 });
 
@@ -343,12 +490,11 @@ describe("askUserExecute — batch questions and back-navigation", () => {
     ]);
 
     expect(result.content[0]!.text).toBe(
-      [
-        "User answered 3 questions:",
-        "1. Which runtime? → Node",
-        "2. Which formats? → ESM, CJS",
-        "3. Publish to npm? → Yes",
-      ].join("\n"),
+      answeredText(
+        ["Which runtime?", ["Node"]],
+        ["Which formats?", ["ESM", "CJS"]],
+        ["Publish to npm?", ["Yes"]],
+      ),
     );
   });
 
@@ -374,9 +520,7 @@ describe("askUserExecute — batch questions and back-navigation", () => {
     )) as { content: { text: string }[] };
 
     expect(result.content[0]!.text).toBe(
-      ["User answered 2 questions:", "1. Runtime? → Bun", "2. Package name? → custom-pkg"].join(
-        "\n",
-      ),
+      answeredText(["Runtime?", ["Bun"]], ["Package name?", ["custom-pkg"]]),
     );
   });
 });
@@ -389,7 +533,7 @@ describe("askUserExecute — open questions", () => {
       ctx,
     )) as { content: { text: string }[] };
     expect(calls.map((c) => c.method)).toEqual(["editor"]);
-    expect(result.content[0]!.text).toBe("User answered: do both, see notes");
+    expect(result.content[0]!.text).toBe(answeredText(["Anything to add?", ["do both, see notes"]]));
   });
 
   it("uses the input dialog in RPC mode", async () => {
@@ -398,15 +542,15 @@ describe("askUserExecute — open questions", () => {
       content: { text: string }[];
     };
     expect(calls.map((c) => c.method)).toEqual(["input"]);
-    expect(result.content[0]!.text).toBe("User answered: rpc answer");
+    expect(result.content[0]!.text).toBe(answeredText(["Q?", ["rpc answer"]]));
   });
 
-  it("treats an empty freeform answer as dismissed", async () => {
+  it("records an empty freeform answer as Unanswered", async () => {
     const { ctx } = ctxWithRecorder({ editor: "   " });
     const result = (await askUserExecute({ questions: [{ question: "Q?" }] }, ctx)) as {
       content: { text: string }[];
     };
-    expect(result.content[0]!.text).toContain("dismissed");
+    expect(result.content[0]!.text).toBe(answeredText(["Q?", []]));
   });
 });
 
@@ -439,7 +583,7 @@ describe("askUserExecute — guard rails", () => {
       ctx,
     )) as { content: { text: string }[] };
     expect(calls.map((c) => c.method)).toEqual(["editor"]);
-    expect(result.content[0]!.text).toBe("User answered: freeform");
+    expect(result.content[0]!.text).toBe(answeredText(["Q?", ["freeform"]]));
   });
 });
 
@@ -461,7 +605,7 @@ describe("askUserExecute — working spinner suppression", () => {
   it("hides the spinner for a normal pick and restores it afterwards", async () => {
     const { ctx, working } = ctxWithRecorder({ select: "vitest" });
     const result = (await askUserExecute(optionParams, ctx)) as { content: { text: string }[] };
-    expect(result.content[0]!.text).toBe("User selected: vitest");
+    expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["vitest"]]));
     expect(working).toEqual([false, true]);
   });
 
@@ -470,7 +614,7 @@ describe("askUserExecute — working spinner suppression", () => {
     const result = (await askUserExecute({ questions: [{ question: "Notes?" }] }, ctx)) as {
       content: { text: string }[];
     };
-    expect(result.content[0]!.text).toBe("User answered: both");
+    expect(result.content[0]!.text).toBe(answeredText(["Notes?", ["both"]]));
     expect(working).toEqual([false, true]);
   });
 
@@ -490,7 +634,7 @@ describe("askUserExecute — working spinner suppression", () => {
     });
     const result = (await askUserExecute(optionParams, ctx)) as { content: { text: string }[] };
     expect(calls.map((c) => c.method)).toEqual(["select", "editor"]);
-    expect(result.content[0]!.text).toBe("User answered: mocha");
+    expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["mocha"]]));
     expect(working).toEqual([false, true, false, true]);
     expect(working.filter((v) => v === false)).toHaveLength(2);
     expect(working.filter((v) => v === true)).toHaveLength(2);

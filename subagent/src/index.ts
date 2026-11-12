@@ -1,10 +1,11 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { StringDecoder } from "node:string_decoder";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   loadSubagentSettings,
   listDiscoveredAgentNames,
@@ -49,8 +50,12 @@ export interface PiExtensionContext {
   isProjectTrusted?: () => boolean;
 }
 
-export interface SubagentTaskItem {
+/** Raw tool input. `agent` and `description` are required by the schema and
+ * enforced in normalizeTask; they stay optional here so internal callers and
+ * older test fixtures can pass partial input and get a clear runtime error. */
+export interface SubagentInput {
   task: string;
+  description?: string;
   agent?: string;
   tools?: string[];
   cwd?: string;
@@ -60,14 +65,26 @@ export interface SubagentTaskItem {
   maxTurns?: number;
 }
 
-/** One call = one subagent (issue 095); parallelism = multiple tool calls in one message. */
-export type SubagentInput = SubagentTaskItem;
+/** Normalized task: agent and description are guaranteed by normalizeTask. */
+export interface SubagentTaskItem {
+  task: string;
+  description: string;
+  agent: string;
+  tools?: string[];
+  cwd?: string;
+  resume?: string;
+  id?: string;
+  timeoutMs?: number;
+  maxTurns?: number;
+}
 
 export interface PiRunConfig {
   model?: string;
   thinking?: string;
   tools?: string[];
   cwd?: string;
+  /** Session display name, derived from the call's description. */
+  name?: string;
   sessionId?: string;
   resumeSession?: string;
   timeoutMs?: number;
@@ -794,6 +811,7 @@ export function parseAgentFile(filePath: string): AgentConfig {
 export function findAgentDefinition(
   cwd: string,
   agentName?: string,
+  projectTrusted = true,
 ): { config: AgentConfig; found: boolean } {
   if (!agentName) return { config: {}, found: false };
   const sanitized = agentName
@@ -806,7 +824,7 @@ export function findAgentDefinition(
   const agentHome =
     process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
   const candidates = [
-    join(cwd, ".pi", "agents", baseName),
+    ...(projectTrusted ? [join(cwd, ".pi", "agents", baseName)] : []),
     join(agentHome, "agents", baseName),
     join(homedir(), ".pi", "agents", baseName),
     join(BUILTIN_AGENTS_DIR, baseName),
@@ -837,8 +855,11 @@ export function resolveAgentRole(
   projectTrusted: boolean = true,
 ): AgentConfig {
   const name = typeof agentName === "string" ? agentName.trim() : "";
-  if (!name) return {};
-  const { config, found } = findAgentDefinition(cwd, name);
+  if (!name)
+    throw new Error(
+      "'agent' is required: pass the name of a role from the roster in the tool description.",
+    );
+  const { config, found } = findAgentDefinition(cwd, name, projectTrusted);
   if (found) return config;
   // A role explicitly configured in settings is still real even without a
   // document: it carries the role's model/thinking overrides.
@@ -848,10 +869,10 @@ export function resolveAgentRole(
     Object.prototype.hasOwnProperty.call(settings.agents, name)
   )
     return {};
-  const known = listDiscoveredAgentNames(cwd);
+  const known = listDiscoveredAgentNames(cwd, projectTrusted);
   throw new Error(
     `Unknown agent role "${name}". Available roles: ${known.join(", ") || "(none)"}. ` +
-      `Omit 'agent' for a plain child, or use one of the roles above.`,
+      "Use one of the roles above.",
   );
 }
 
@@ -867,8 +888,13 @@ export function resolveAgentRole(
 export function buildAgentRosterText(cwd: string): string {
   return listDiscoveredAgentNames(cwd)
     .map((name) => {
-      const description = findAgentDefinition(cwd, name).config.description?.trim();
-      return description ? `- ${name}: ${description}` : `- ${name}`;
+      // Do not read a project agent document at load: its description would be
+      // injected into the tool description before project trust is resolved.
+      // Project-only roles are still listed by name (with the default trigger);
+      // their document is read only when the project is trusted and the role is
+      // actually called.
+      const description = findAgentDefinition(cwd, name, false).config.description?.trim();
+      return `- ${name}: ${description ?? "This subagent should only be called when explicitly requested."}`;
     })
     .join("\n");
 }
@@ -968,11 +994,12 @@ export function resolveRunCfg(
     parsePositiveInt(roleSettings?.maxTurns) ??
     parsePositiveInt(agentCfg.maxTurns) ??
     parsePositiveInt(subagentSettings?.defaultMaxTurns);
-  const timeoutMs =
+  const rawTimeoutMs =
     parsePositiveInt(item.timeoutMs) ??
     parsePositiveInt(roleSettings?.timeoutMs) ??
     parsePositiveInt(agentCfg.timeoutMs) ??
     parsePositiveInt(subagentSettings?.defaultTimeoutMs);
+  const timeoutMs = rawTimeoutMs === undefined ? undefined : Math.min(rawTimeoutMs, MAX_TIMER_MS);
 
   // Bake the level into the model string whenever a model exists, "off" included:
   // buildPiArgs cannot append through a model id that itself contains a colon.
@@ -982,6 +1009,7 @@ export function resolveRunCfg(
       thinking,
       tools,
       cwd,
+      name: item.resume ? undefined : item.description,
       sessionId: sessionId || undefined,
       resumeSession: resumeSession || undefined,
       timeoutMs,
@@ -994,6 +1022,7 @@ export function resolveRunCfg(
     thinking,
     tools,
     cwd,
+    name: item.resume ? undefined : item.description,
     sessionId: sessionId || undefined,
     resumeSession: resumeSession || undefined,
     timeoutMs,
@@ -1004,6 +1033,7 @@ export function resolveRunCfg(
 
 export function buildPiArgs(cfg: PiRunConfig): string[] {
   const args = ["--mode", "json", "-p"];
+  if (cfg.name) args.push("--name", cfg.name);
   // Defense in depth for the argv boundary (audit BYTE-4 #18): normalizeTask
   // already gates the tool input; this guards any other caller.
   if (cfg.resumeSession) {
@@ -1222,6 +1252,151 @@ export function buildChildEnv(cfg: PiRunConfig): NodeJS.ProcessEnv {
   };
 }
 
+// ── Orphan reaper (SIGKILL/crash) ─────────────────────────────────────
+// The child pi process is detached. session_shutdown kills it on a normal
+// exit, but a SIGKILLed/crashed parent leaves no chance to run cleanup. Each
+// child writes a journal; the next extension load kills children whose owner
+// is gone. Same contract as background-terminal's reaper.
+export const SUBAGENT_ORPHAN_DIR = join(tmpdir(), "pi-subagent");
+const SHUTDOWN_WAIT_MS = 5_000;
+/** Node timers fire immediately above this; clamp budgets from calls/settings/docs. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+interface SubagentJournal {
+  sessionId: string;
+  ownerPid: number;
+  childPid: number;
+  journalPath: string;
+  startPath: string;
+  startedAt: number;
+}
+
+function subagentAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function subagentProcessStart(pid: number): string {
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function subagentCommandMatches(sessionId: string, pid: number): boolean {
+  try {
+    const command = execFileSync("ps", ["-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return command.includes(sessionId);
+  } catch {
+    return false;
+  }
+}
+
+function killSubagentTree(pid: number): void {
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {}
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+}
+
+function writeSubagentJournal(sessionId: string, childPid: number): SubagentJournal | undefined {
+  try {
+    mkdirSync(SUBAGENT_ORPHAN_DIR, { recursive: true });
+    const id = `sub_${randomBytes(6).toString("hex")}`;
+    const journalPath = join(SUBAGENT_ORPHAN_DIR, `${id}.journal.json`);
+    const startPath = join(SUBAGENT_ORPHAN_DIR, `${id}.start`);
+    const startedAt = Date.now();
+    writeFileSync(startPath, subagentProcessStart(childPid));
+    writeFileSync(
+      journalPath,
+      JSON.stringify({ sessionId, ownerPid: process.pid, childPid, startPath, startedAt }),
+    );
+    return { sessionId, ownerPid: process.pid, childPid, journalPath, startPath, startedAt };
+  } catch {
+    return undefined;
+  }
+}
+
+function cleanupSubagentJournal(journal: Pick<SubagentJournal, "journalPath" | "startPath">): void {
+  rmSync(journal.journalPath, { force: true });
+  rmSync(journal.startPath, { force: true });
+}
+
+/** Kill children left by a Pi process that was SIGKILLed or crashed. */
+export function reapSubagentOrphans(): void {
+  let names: string[];
+  try {
+    names = readdirSync(SUBAGENT_ORPHAN_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith("sub_") || !name.endsWith(".journal.json")) continue;
+    const journalPath = join(SUBAGENT_ORPHAN_DIR, name);
+    try {
+      const parsed = JSON.parse(readFileSync(journalPath, "utf8")) as Partial<SubagentJournal>;
+      const startPath =
+        typeof parsed.startPath === "string"
+          ? parsed.startPath
+          : join(SUBAGENT_ORPHAN_DIR, `${name.slice(0, -".journal.json".length)}.start`);
+      const journal: SubagentJournal = {
+        sessionId: typeof parsed.sessionId === "string" ? parsed.sessionId : "",
+        ownerPid: typeof parsed.ownerPid === "number" ? parsed.ownerPid : -1,
+        childPid: typeof parsed.childPid === "number" ? parsed.childPid : -1,
+        journalPath,
+        startPath,
+        startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : 0,
+      };
+      if (journal.ownerPid > 0 && subagentAlive(journal.ownerPid)) continue;
+      if (journal.childPid <= 0 || !subagentAlive(journal.childPid)) {
+        cleanupSubagentJournal(journal);
+        continue;
+      }
+      const recordedStart = (() => {
+        try {
+          return readFileSync(journal.startPath, "utf8").trim();
+        } catch {
+          return "";
+        }
+      })();
+      const currentStart = subagentProcessStart(journal.childPid);
+      const verified =
+        (recordedStart !== "" && currentStart !== "" && recordedStart === currentStart) ||
+        subagentCommandMatches(journal.sessionId, journal.childPid);
+      if (!verified) {
+        if (journal.startedAt > 0 && Date.now() - journal.startedAt > 7 * 24 * 60 * 60 * 1000) {
+          cleanupSubagentJournal(journal);
+        }
+        continue;
+      }
+      killSubagentTree(journal.childPid);
+      cleanupSubagentJournal(journal);
+    } catch {
+      // Corrupt journal or a filesystem race: leave it for the next load.
+    }
+  }
+}
+
 // ── Subprocess runner ─────────────────────────────────────────────────
 export function runPi(
   cwd: string,
@@ -1255,6 +1430,12 @@ export function runPi(
       // through taskkill /T /F instead (see killTree).
       detached: !isWin,
     });
+    const journal = cli.pid === undefined ? undefined : writeSubagentJournal(state.sessionId, cli.pid);
+    const cleanupJournal = () => {
+      if (journal) cleanupSubagentJournal(journal);
+    };
+    cli.on("close", cleanupJournal);
+    cli.on("error", cleanupJournal);
     const stdout = new BBC(MAX_STDOUT);
     const stderr = new BBC(MAX_STDERR);
     const stdoutDecoder = new StringDecoder("utf-8");
@@ -1371,7 +1552,7 @@ export function runPi(
           ? `timed out after ${fmtDur(elapsedMs)} (limit: ${fmtDur(timeoutMs)}, turns: ${state.usage.turns})`
           : `reached maximum limit of ${maxTurns} turns (turns: ${state.usage.turns})`;
       const partialResult = finalize(state, formatPiOutput(out, err));
-      const notice = `\n\n---\n⚠️ [Subagent session ${state.sessionId} paused: ${reasonText}]\n💡 To resume this session from where it left off, call: subagent({ resume: "${state.sessionId}", task: "Continue the remaining work" })`;
+      const notice = `\n\n---\n⚠️ [Subagent session ${state.sessionId} paused: ${reasonText}]\n💡 To resume this session from where it left off, call: subagent({ agent: ${JSON.stringify(state.agent)}, description: "Continue remaining work", resume: ${JSON.stringify(state.sessionId)}, task: "Continue the remaining work" })`;
       return {
         output: partialResult ? `${partialResult}${notice}` : notice.trim(),
         failed: false,
@@ -1560,8 +1741,27 @@ export function normalizeTask(input: SubagentInput): SubagentTaskItem {
     throw new Error(
       "No task specified. Provide 'task' with the prompt to execute.",
     );
+  const agent = (str(input.agent) ?? "").trim();
+  if (!agent)
+    throw new Error(
+      "'agent' is required: pass the name of a role from the roster in the tool description.",
+    );
+  const description = (str(input.description) ?? "").trim();
+  if (!description)
+    throw new Error(
+      "'description' is required: pass a short 3-5 word label for the task.",
+    );
   const resume = input.resume !== undefined ? (str(input.resume) ?? "") : "";
-  if (resume) assertSessionIdShape(resume, "resume");
+  if (resume) {
+    assertSessionIdShape(resume, "resume");
+    // Only sessions this extension created may be resumed: `pi --session` accepts
+    // any session id, so without this a model could resume the parent session as a
+    // child (or an unrelated session) by passing its id.
+    if (!resume.startsWith("sub_"))
+      throw new Error(
+        'Invalid "resume": only subagent sessions created by this extension (id starting with "sub_") can be resumed.',
+      );
+  }
   const id = input.id !== undefined ? (str(input.id) ?? "") : "";
   if (id) assertSessionIdShape(id, "id");
   // Both name the child session; with different values the resolved session would
@@ -1571,7 +1771,8 @@ export function normalizeTask(input: SubagentInput): SubagentTaskItem {
   }
   return {
     task,
-    agent: input.agent,
+    description: oneLine(description, 80),
+    agent,
     tools: input.tools,
     cwd: input.cwd,
     resume: resume || undefined,
@@ -1589,13 +1790,14 @@ export function normalizeTask(input: SubagentInput): SubagentTaskItem {
 
 /** Plain-text one-liner for the record description, status bar and exit messages (no ANSI). */
 export function describeTask(item: SubagentTaskItem): string {
-  const head = oneLine(item.task, 60);
-  return item.agent ? `${item.agent}: ${head}` : head;
+  return item.description || oneLine(item.task, 60);
 }
 
 // ── Task Manager ──────────────────────────────────────────────────
 export interface SubagentTaskRecord {
   id: string;
+  /** Child session id (sub_…); child transcript id. */
+  sessionId?: string;
   parentSessionId: string;
   description: string;
   agent?: string;
@@ -1709,19 +1911,48 @@ export function formatSubagentTaskStatus(
   return lines.join("\n");
 }
 
+interface ManagerCallbacks {
+  onExit?: (task: SubagentTaskRecord) => void;
+  onChange?: (task?: SubagentTaskRecord) => void;
+}
+
+const CALLBACKS_KEY = Symbol.for("@bytetrue/pi-subagent.callbacks");
+const callbacksGlobal = globalThis as unknown as Record<
+  symbol,
+  ManagerCallbacks | undefined
+>;
+const sharedCallbacks: ManagerCallbacks = (callbacksGlobal[CALLBACKS_KEY] ??= {});
+
 export class SubagentTaskManager {
   constructor(
     private readonly tasks: Map<string, SubagentTaskRecord> = new Map(),
+    // The extension singleton shares callbacks through a process global so a
+    // task started before /reload notifies the current pi, not the invalidated
+    // old extension runtime. Test managers keep instance-local callbacks.
+    private readonly sharedCallbacksEnabled = false,
   ) {}
-  private onExit?: (task: SubagentTaskRecord) => void;
-  private onChange?: (task?: SubagentTaskRecord) => void;
+  private localOnExit?: (task: SubagentTaskRecord) => void;
+  private localOnChange?: (task?: SubagentTaskRecord) => void;
 
   init(
     onExit: (task: SubagentTaskRecord) => void,
     onChange?: (task?: SubagentTaskRecord) => void,
   ): void {
-    this.onExit = onExit;
-    this.onChange = onChange;
+    if (this.sharedCallbacksEnabled) {
+      sharedCallbacks.onExit = onExit;
+      sharedCallbacks.onChange = onChange;
+    } else {
+      this.localOnExit = onExit;
+      this.localOnChange = onChange;
+    }
+  }
+
+  private get exitHandler() {
+    return this.sharedCallbacksEnabled ? sharedCallbacks.onExit : this.localOnExit;
+  }
+
+  private get changeHandler() {
+    return this.sharedCallbacksEnabled ? sharedCallbacks.onChange : this.localOnChange;
   }
 
   register(task: SubagentTaskRecord): void {
@@ -1771,7 +2002,7 @@ export class SubagentTaskManager {
     this.emitChange(t);
     if (t.notifyOnExit) {
       try {
-        this.onExit?.(t);
+        this.exitHandler?.(t);
       } catch {}
     }
   }
@@ -1799,13 +2030,22 @@ export class SubagentTaskManager {
       if (t.status === "running") t.controller.abort();
       this.tasks.delete(t.id);
     }
-    await Promise.all(sessionTasks.map((t) => t.done?.catch(() => {})));
+    // Do not hang Pi on a child that refuses to die; its journal stays for the
+    // next-start reaper.
+    await Promise.all(
+      sessionTasks.map((t) =>
+        Promise.race([
+          t.done?.catch(() => {}) ?? Promise.resolve(),
+          new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_WAIT_MS)),
+        ]),
+      ),
+    );
     this.emitChange();
   }
 
   private emitChange(task?: SubagentTaskRecord): void {
     try {
-      this.onChange?.(task);
+      this.changeHandler?.(task);
     } catch {}
   }
 }
@@ -1824,7 +2064,53 @@ const globalStore = globalThis as unknown as Record<
 >;
 export const subagentManager: SubagentTaskManager = new SubagentTaskManager(
   (globalStore[SUBAGENT_TASKS_KEY] ??= new Map()),
+  true,
 );
+
+// ── Background work registry (optional, shared with goal/background-terminal) ──
+// Same process-global contract as background-terminal: providers are keyed by a
+// stable extension id so a /reload replaces instead of stacking. goal reads this
+// to avoid injecting a continuation while a subagent is still working.
+export interface BackgroundWorkItem {
+  kind: "shell" | "subagent";
+  id: string;
+  label: string;
+}
+
+interface BackgroundWorkProvider {
+  running(sessionId: string): BackgroundWorkItem[];
+}
+
+const WORK_REGISTRY_KEY = Symbol.for("pi-extensions.background-work");
+const workGlobal = globalThis as unknown as Record<
+  symbol,
+  Map<string, BackgroundWorkProvider> | undefined
+>;
+const workProviders = (workGlobal[WORK_REGISTRY_KEY] ??= new Map<string, BackgroundWorkProvider>());
+
+workProviders.set("subagent", {
+  running: (sessionId) =>
+    subagentManager
+      .list(sessionId)
+      .filter((task) => task.status === "running")
+      .map((task) => ({
+        kind: "subagent",
+        id: task.sessionId ?? task.progress?.runs[0]?.sessionId ?? task.id,
+        label: task.agent ? `${task.agent}: ${task.description}` : task.description,
+      })),
+});
+
+export function runningBackgroundWork(sessionId: string): BackgroundWorkItem[] {
+  const items: BackgroundWorkItem[] = [];
+  for (const provider of workProviders.values()) {
+    try {
+      items.push(...provider.running(sessionId));
+    } catch {
+      // A broken provider must not take the completion notice down.
+    }
+  }
+  return items;
+}
 
 // ── Orchestrator ──────────────────────────────────────────────────────
 export async function runSubagent(
@@ -1889,7 +2175,7 @@ export async function runSubagent(
   };
 
   try {
-    const role = item.agent || "subagent";
+    const role = item.agent ?? "subagent";
     const sessionId =
       item.resume || item.id || `sub_${randomBytes(6).toString("hex")}`;
     const agentCfg = resolveAgentRole(cwd, item.agent, subagentSettings);
@@ -1906,14 +2192,12 @@ export async function runSubagent(
     details.runs.push(run);
     emit(true);
 
-    const result = await runPi(
-      cwd,
-      buildSubagentPrompt(item.task, agentCfg),
-      runCfg,
-      run,
-      emit,
-      signal,
-    );
+    // opencode marks a fresh child as spawned by another session; a resumed
+    // session already knows the relationship from its own history.
+    const prompt = item.resume
+      ? buildSubagentPrompt(item.task, agentCfg)
+      : ["You are a subagent spawned by another session.", buildSubagentPrompt(item.task, agentCfg)].join("\n\n");
+    const result = await runPi(cwd, prompt, runCfg, run, emit, signal);
     return finish(result.output, result.failed, Boolean(result.paused));
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
@@ -1960,6 +2244,7 @@ export default function subagentExtension(pi: {
   getThinkingLevel?: () => string;
 }): void {
   if (process.env.PI_SUBAGENT_CHILD === "1") return;
+  reapSubagentOrphans();
 
   let currentSessionId: string | null = null;
   let updateStatus: (() => void) | undefined;
@@ -2067,14 +2352,15 @@ export default function subagentExtension(pi: {
   pi.registerTool?.({
     name: "subagent",
     label: "Subagent",
-    description: `Delegate ONE self-contained task to an isolated child agent session. Omit 'agent' for a plain child: it inherits your model, thinking level, and pi's default tools (read, bash, edit, write), and no role prompt is added — any self-contained job you would otherwise do inline fits. Pass 'agent' when a role's trigger description below matches the job; roles from .pi/agents/ (project or user) are picked up automatically:\n\n${roster}\n\nThe call returns at once with a task id; the full result arrives later as a new message that starts your next turn — until then, continue with other work or end your turn. To run several tasks at once, make multiple subagent calls in the same message; use subagent_status to check one and subagent_stop to stop one. Supports session resumption.`,
+    description: `Delegate ONE self-contained task to an isolated child agent session. 'agent' is required: pass the name of a role from the roster below, matching its trigger description to the job; roles from .pi/agents/ (project or user) are picked up automatically; project documents load only when the project is trusted. 'description' is a short 3-5 word label shown to the user.\n\n${roster}\n\nThe call returns at once with a task id and child sessionID; the full result arrives later as a new message that starts your next turn — until then, continue with other work or end your turn. Do not sleep, poll, or ask the child for status, and work on tasks that do not overlap with the child's files. To run several tasks at once, make multiple subagent calls in the same message; use subagent_status to check one and subagent_stop to stop one. Resume a previous child with its sub_ session id.`,
     promptSnippet:
-      "Delegate a self-contained job to a child agent — a plain child by default, or a roster role from the tool description when its trigger matches; the call returns at once and the result arrives later as a new message.",
+      "Delegate a self-contained job to a roster role in an isolated child session; the call returns at once and the result arrives later as a new message.",
     // Positive-first wording (decision 001): state the wait model instead of only forbidding polling.
     promptGuidelines: [
       "Delegate any self-contained job to subagent so you stay free to keep working or hand control back to the user",
-      "Omit 'agent' for a plain child (inherits your model, thinking level, and default tools); pass 'agent' when a roster role's trigger description matches the job — e.g. 'reviewer' for an independent adversarial review",
-      "After a subagent starts, continue with other work or end your turn; its complete output arrives as a new message that starts your next turn",
+      "Pass 'agent' with a roster role whose trigger description matches the job — e.g. 'reviewer' for an independent adversarial review; there is no anonymous child",
+      "Pass 'description' as a short 3-5 word label: it titles the child session and the completion notice",
+      "After a subagent starts, continue with non-overlapping work or end your turn; its complete output arrives as a new message that starts your next turn. Do not poll or sleep on it",
     ],
     parameters: {
       type: "object",
@@ -2086,7 +2372,12 @@ export default function subagentExtension(pi: {
         agent: {
           type: "string",
           description:
-            "Optional agent role. Omit it for a plain child that inherits your model, thinking level, and default tools. Pass the name of a role from the roster in the tool description — the built-in 'reviewer' (independent adversarial review of code, diffs, plans, or current state), or any custom .pi/agents/<name>.md. A name that matches no document is rejected with the list of available roles.",
+            "Required agent role. Pass the name of a role from the roster in the tool description — the built-in 'reviewer' (independent adversarial review of code, diffs, plans, or current state), or any custom .pi/agents/<name>.md. A name that matches no document is rejected with the list of available roles.",
+        },
+        description: {
+          type: "string",
+          description:
+            "Required short 3-5 word label for the task, displayed to the user and used as the child session title.",
         },
         tools: {
           type: "array",
@@ -2101,20 +2392,20 @@ export default function subagentExtension(pi: {
         resume: {
           type: "string",
           description:
-            "Optional session ID or partial UUID to resume a previous subagent session.",
+            "Optional subagent session id (starts with 'sub_') to resume a previous child. Sessions not created by this extension are rejected.",
         },
         timeoutMs: {
           type: "number",
           description:
-            `Optional timeout in milliseconds. Default: ${budgetDefaults.timeoutMs} (${fmtDur(budgetDefaults.timeoutMs)}) — the configured global default. A role document's own timeoutMs applies to that role, and this parameter applies to one task. 0 is rejected.`,
+            `Optional timeout in milliseconds. Default: ${budgetDefaults.timeoutMs} (${fmtDur(budgetDefaults.timeoutMs)}) — the configured global default. A role document's own timeoutMs applies to that role, and this parameter applies to one task. 0 and negative values fall back to the default.`,
         },
         maxTurns: {
           type: "number",
           description:
-            `Optional maximum turns before pausing. Default: ${budgetDefaults.maxTurns} — the configured global default. A role document's own maxTurns applies to that role, and this parameter applies to one task. 0 is rejected.`,
+            `Optional maximum turns before pausing. Default: ${budgetDefaults.maxTurns} — the configured global default. A role document's own maxTurns applies to that role, and this parameter applies to one task. 0 and negative values fall back to the default.`,
         },
       },
-      required: ["task"],
+      required: ["task", "agent", "description"],
     },
     execute: async (
       _id: string,
@@ -2130,7 +2421,12 @@ export default function subagentExtension(pi: {
       // entry must forward the decision so project-layer env is gated (BYTE-5 #1).
       const projectTrusted = ctx?.isProjectTrusted?.() ?? true;
 
-      const item = normalizeTask(input);
+      // `id` is an internal field; the tool schema never advertises it. Strip a
+      // model-supplied value so it cannot become `--session-id <parent-session>`
+      // and open an existing (possibly parent) session as the child.
+      const cleanInput: SubagentInput = { ...input };
+      delete cleanInput.id;
+      const item = normalizeTask(cleanInput);
       // Fail the tool call before any task is registered: an unknown role must
       // surface as an error the model can correct, not as a silently different
       // child (issue 097).
@@ -2142,8 +2438,8 @@ export default function subagentExtension(pi: {
       // id alongside it would point --session and --session-id at the same id.
       const childSessionId = item.resume || item.id || `sub_${randomBytes(6).toString("hex")}`;
       const runInput: SubagentInput = item.resume
-        ? input
-        : { ...input, id: childSessionId };
+        ? cleanInput
+        : { ...cleanInput, id: childSessionId };
       // Mirror runPi's cwd resolution: the launch details land in the transcript at
       // once, before the child process exists, so they cannot wait for spawn.
       const launchCwd = item.cwd ? resolve(item.cwd) : cwd;
@@ -2158,6 +2454,7 @@ export default function subagentExtension(pi: {
 
       const record: SubagentTaskRecord = {
         id: taskId,
+        sessionId: childSessionId,
         parentSessionId: sessionId,
         description: describeTask(item),
         agent: item.agent,
@@ -2214,7 +2511,11 @@ export default function subagentExtension(pi: {
         content: [
           {
             type: "text",
-            text: `Subagent started (ID: ${taskId}). Its full result will arrive as a new message — continue with other work or end your turn now.`,
+            text: [
+              `Subagent started (task ID: ${taskId}, sessionID: ${childSessionId}).`,
+              "status: running",
+              "Its full result will arrive as a new message. Do not sleep, poll, ask it for status, or duplicate its work; continue on non-overlapping tasks, or end your turn if there is nothing else to do.",
+            ].join("\n"),
           },
         ],
         // Issue 115: the transcript's launch record doubles as the durable pointer
@@ -2329,6 +2630,13 @@ export default function subagentExtension(pi: {
     agentBusy = true;
   });
 
+  // A goal loop keeps `agentBusy` true across continuations and only settles
+  // when the whole loop stops. Flush at each turn boundary so a child result
+  // reaches the next continuation instead of waiting for the goal to end.
+  pi.on?.("turn_end", () => {
+    flushPendingExits();
+  });
+
   pi.on?.("agent_settled", () => {
     agentBusy = false;
     flushPendingExits();
@@ -2399,23 +2707,52 @@ export default function subagentExtension(pi: {
   });
 }
 
-function formatSubagentExitMessage(task: BackgroundSubagentTask): string {
-  const outcome =
-    task.status === "cancelled"
-      ? "was cancelled"
-      : task.status === "paused"
-        ? "was paused"
-        : task.status === "failed"
-          ? "failed"
-          : "completed successfully";
+export function formatSubagentExitMessage(task: BackgroundSubagentTask): string {
+  const state = task.status === "succeeded" ? "completed" : task.status;
+  const body: string[] = [
+    task.output.trim() ? task.output : "Subagent completed without a text response.",
+  ];
+
+  // opencode appends the child's still-running background work to the completion
+  // notice. In this repository the child is a `pi -p` process, so its own
+  // background tasks stop when it exits; what the parent can still act on is the
+  // work running in the parent session, read from the shared registry.
+  const work = runningBackgroundWork(task.parentSessionId);
+  if (work.length > 0) {
+    body.push(
+      [
+        "Background work still running:",
+        ...work.map(
+          (item) => `- ${item.kind} (${item.id}): ${oneLine(item.label, 100)}`,
+        ),
+      ].join("\n"),
+    );
+  }
+  body.push("Background tasks started by the child, if any, stop when its process exits.");
+
   const logs = (task.progress?.runs ?? [])
     .map((run) => {
       const path = sessionLogPath(run);
       return path ? `- ${run.agent}: ${path}` : undefined;
     })
     .filter((line): line is string => Boolean(line));
-  const logSection = logs.length
-    ? `\n\nSession log${logs.length > 1 ? "s" : ""} (full model behaviour history):\n${logs.join("\n")}`
-    : "";
-  return `[Subagent Task ${task.id}] (${task.description}) ${outcome}.\n\n${task.output}${logSection}`;
+  if (logs.length > 0) {
+    body.push(
+      `Session log${logs.length > 1 ? "s" : ""} (full model behaviour history):\n${logs.join("\n")}`,
+    );
+  }
+
+  const sessionId =
+    task.sessionId ?? task.progress?.runs.at(-1)?.sessionId ?? task.id;
+  return `<subagent sessionID="${escapeAttribute(sessionId)}" state="${state}" description="${escapeAttribute(task.description)}">\n${body.join("\n\n")}\n</subagent>`;
+}
+
+function escapeAttribute(value: string): string {
+  return value
+    .replace(/\s+/g, " ")
+    .trim()
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }

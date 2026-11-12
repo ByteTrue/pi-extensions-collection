@@ -13,6 +13,8 @@
 - **官方安装**：`pi install git:…`，更新 `pi update --extensions`。checkout 归 Pi：更新时 reset 到远端提交并清掉未跟踪文件，不能就地改。
 - **版本**：整个包一条版本轴，发布与钉版本用 git tag（首个 `v1.0.0`，当前 `v2.0.0`）。旧的 `ByteTrue/pi-subagent` 仓库已归档，它的 `@v0.18.0` 安装命令不再有效。
 - **两个上下文扩展**：`context-prune` 管修剪、历史检索与提醒；`auto-compact` 管 400k 自动压缩。两者可以只留一个。
+- **模型可见契约以 opencode 为参照**：工具描述、参数、结果文本、完成通知、错误文案与循环护栏对齐 opencode v2.2.7 的同类能力；内部架构（Effect、permission、job registry、plugin storage）不搬。`context-prune` 与 `auto-compact` 不在对齐范围。
+- **后台工作注册表**：`background-terminal` 与 `subagent` 在进程内注册 `Symbol.for("pi-extensions.background-work")`，`goal` 和 subagent 完成通知读取它。注册表是可选的：提供方没加载时退回原行为。
 
 ## 不可破的约束
 
@@ -20,12 +22,16 @@
 - **子目录 `package.json` 永远 private、永不发布**：npm 上找不到这个仓库的任何扩展，分发只走 git 包。
 - **工具名必须全局唯一**：Pi 遇到两个扩展注册同名工具会拒绝启动，后加载的那个扩展整个不加载（连它别的工具一起失去）。`context-prune` 的 `ctx_reduce` / `ctx_search` / `ctx_expand` 与 `@cortexkit/pi-magic-context` 同名，两者只能加载一个，用 `pi config` 关掉 `context-prune`。扩展自身看不到别人注册了什么：加载期调用 `pi.getAllTools()` 会抛「runtime not initialized」。`auto-compact` 不注册工具，不受影响。
 - **裁剪只在 agent 边界落地**：`context-prune` 在工具循环中只排队，新的用户轮次或 `agent_settled` 后的下一次上下文才改写，不能为了立即缩小上下文破坏当前缓存前缀。手动候选与自动裁剪共用 4000 字符门槛；小结果只能通过显式 ID 裁剪，不能进入提醒诱导重复操作。
+- **后台任务默认无寿命上限**：`background_run` 不传 `timeout`（或传 `0`）就只在命令退出、显式 timeout 到期、`background_kill` 或 Pi 会话退出时结束；没有第二层硬顶。Pi 正常退出和 SIGTERM/SIGHUP 会杀掉任务；SIGKILL 或硬崩溃无法运行清理，但每个任务写 journal，下一次扩展加载会 `reapOrphans` 掉 owner 已死的进程组和日志；直到下次启动前，任务可能继续跑。
+- **`subagent` 的 `agent` 与 `description` 必填**：没有匿名 plain child；未知角色报错并列出可选角色。`resume` 只接受本扩展创建的 `sub_…` 会话。子进程在 SIGKILL/crash 后由下一次扩展加载的 journal reaper 回收；直到下次启动前它可能继续跑。
+- **`goal` 的循环护栏**：objective 包成 `<untrusted_objective>` 并转义，上限 4000 字符；50 轮、连续 3 次无工具调用会暂停；有后台工作在跑时 hold，不注入 continuation；进程重启后遗留的 active goal 恢复为 paused。
 
 ## 做 / 不做
 
 **做**
 
 - 一个 git 包维护 7 个扩展。
+- 模型可见契约以 opencode 同类能力为参照，差异写在对应扩展的 `README.md` 与 `byissue/epics/2026-11-12-x-对齐-opencode-设计/`。
 - 需要依赖就写进对应扩展的 `package.json`，由 Pi 安装。
 - 保持无构建：Pi 用 jiti 直接加载 TS 入口，依赖来自 `node_modules`。
 - 文档随行为改：用户可见的行为变化同时改该目录 `README.md` 与本文件。
@@ -35,6 +41,7 @@
 - 不发 npm，不加 `publishConfig` 或任何发布字段。
 - 不把 `node_modules` 提交进仓库，也不手工 vendor 依赖。
 - 不做安装器脚本、插件市场、通用框架。
+- 不对齐 opencode 的内部架构：pi 没有 Effect service、permission 服务、job registry 或 plugin storage，这些位置标 `不适用`，不造替代框架。
 
 ## 已排除的方案
 
@@ -51,4 +58,6 @@
 - 被取代的中间形态（clone + pull） → `decisions/2026-11-11-clone-and-pull-distribution.md`
 - 更早的停发 npm → `decisions/001-copy-in-distribution-no-npm.md`
 - 分裂的来源与验证证据 → `byissue/epics/2026-11-04-x-仓库分裂与分发形态收敛/spec.md`
+- 与 opencode 的对齐范围、逐项结论与取舍 → `byissue/epics/2026-11-12-x-对齐-opencode-设计/spec.md` 与同目录 `ledger.md`
+- 扩展间后台工作注册表的契约 → `byissue/notes/2026-11-12-background-work-registry.md`
 - Pi 扩展发现、开关、依赖解析的实测边界 → `byissue/notes/2026-11-11-pi-extension-loading-probes.md`

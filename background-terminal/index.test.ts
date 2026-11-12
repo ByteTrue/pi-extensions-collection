@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import registerBackgroundTerminal, { manager } from "./background-terminal.js";
@@ -53,7 +55,7 @@ describe("background-terminal extension", () => {
     // No tool_call/tool_result subscription: the foreground-timeout hook moved to the
     // separate small-extensions/bash-timeout extension (BYTE-10) — this package's
     // installed source contains no hook code at all.
-    expect(events.sort()).toEqual(["agent_settled", "agent_start", "session_shutdown", "session_start"]);
+    expect(events.sort()).toEqual(["agent_settled", "agent_start", "session_shutdown", "session_start", "turn_end"]);
     // No renderer: Pi's default custom-message rendering already labels and boxes the content.
     expect(rendererTypes).toEqual([]);
     expect(toolNames).not.toContain("bash");
@@ -70,7 +72,8 @@ describe("background-terminal extension", () => {
 
     expect(sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
     expect(sent[0]?.message.customType).toBe("background-exit");
-    expect(sent[0]?.message.content).toContain("exited with code 0");
+    expect(sent[0]?.message.content).toContain('state="completed"');
+    expect(sent[0]?.message.content).toContain("Exit code: 0");
     expect(sent[0]?.message.content).toContain("notify-payload");
 
     await manager.clearSession(sessionId);
@@ -176,7 +179,8 @@ describe("background-terminal extension", () => {
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.message.content).toContain("exited with code 0");
+    expect(sent[0]?.message.content).toContain('state="completed"');
+    expect(sent[0]?.message.content).toContain("Exit code: 0");
     expect(sent[0]?.message.content).not.toContain("background tasks finished");
     expect(Array.isArray(sent[0]?.message.details)).toBe(false);
 
@@ -198,5 +202,126 @@ describe("background-terminal extension", () => {
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
 
     expect(sent).toEqual([]);
+  });
+
+
+  it("kills a task with no lifetime when the session ends (no zombie process)", async () => {
+    const probe = join(tmpdir(), `bt-shutdown-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    const { handlers } = harness();
+    const sessionId = "shutdown-session";
+    const ctx = ctxFor(sessionId);
+    await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctx);
+    const task = manager.start(`sleep 5; echo alive > ${JSON.stringify(probe)}`, process.cwd(), sessionId);
+
+    await handlers.session_shutdown?.({ type: "session_shutdown", reason: "quit" }, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    expect(existsSync(probe)).toBe(false);
+    expect(manager.get(task.id, sessionId)).toBeNull();
+  });
+
+  it("wraps the completion notice in a shell tag with a bounded output tail", async () => {
+    const { sent, handlers } = harness();
+    const sessionId = "notice-format-session";
+    await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctxFor(sessionId));
+
+    manager.start(
+      `node -e "for (let i=0;i<200;i++) console.log('line-'+i+'-'+'x'.repeat(30))"`,
+      process.cwd(),
+      sessionId,
+    );
+    await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 8000 });
+
+    const content = sent[0]?.message.content ?? "";
+    expect(content).toMatch(/^<shell id="bg_[0-9a-f]+" state="completed" command="/);
+    expect(content).toContain("line-199");
+    expect(content).toContain("[earlier output omitted]");
+    expect(content).toContain("Exit code: 0");
+    expect(content).toContain("</shell>");
+
+    await manager.clearSession(sessionId);
+  });
+
+
+  it("flushes a completion at turn_end while the agent is still busy", async () => {
+    const { sent, handlers } = harness();
+    const sessionId = "turn-end-session";
+    const ctx = ctxFor(sessionId);
+    await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.agent_start?.({ type: "agent_start" }, ctx);
+
+    manager.start('node -e "console.log(\'turn-end\')"', process.cwd(), sessionId);
+    await vi.waitFor(() => {
+      const task = manager.list(sessionId)[0];
+      expect(task?.status).toBe("exited");
+    }, { timeout: 8000 });
+    await settle();
+    expect(sent).toEqual([]);
+
+    await handlers.turn_end?.({ type: "turn_end" }, ctx);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.message.content).toContain("turn-end");
+
+    await manager.clearSession(sessionId);
+  });
+
+  it("does not leak ANSI or drop the first line without a truncation marker", async () => {
+    const { sent, handlers } = harness();
+    const sessionId = "tail-format-session";
+    await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctxFor(sessionId));
+
+    manager.start(
+      `node -e "let o=[...Array(51)].map((_,i)=>'row'+i).join('\\n'); process.stdout.write('\\x1b[31m'+o+'\\x1b[0m')"`,
+      process.cwd(),
+      sessionId,
+    );
+    await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 8000 });
+
+    const content = sent[0]?.message.content ?? "";
+    expect(content).toContain("row50");
+    expect(content).toContain("[earlier output omitted]");
+    expect(content).not.toContain("row0");
+    expect(content).not.toContain("\u001b");
+
+    await manager.clearSession(sessionId);
+  });
+
+
+  it("reports a non-zero exit code and a timed-out lifetime in the notice", async () => {
+    const { sent, handlers } = harness();
+    const sessionId = "notice-status-session";
+    await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctxFor(sessionId));
+
+    manager.start('node -e "process.exit(3)"', process.cwd(), sessionId);
+    await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 8000 });
+    expect(sent[0]?.message.content).toContain("Exit code: 3");
+
+    sent.length = 0;
+    manager.start("sleep 30", process.cwd(), sessionId, { timeoutSeconds: 1 });
+    await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 8000 });
+    const content = sent[0]?.message.content ?? "";
+    expect(content).toContain('state="timed_out"');
+    expect(content).toContain("Timed out after 1 seconds");
+    expect(content).toContain("Do not start another copy");
+
+    await manager.clearSession(sessionId);
+  });
+
+  it("sends a killed notice when background_kill stops a task", async () => {
+    const { sent, handlers } = harness();
+    const sessionId = "killed-notice-session";
+    await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctxFor(sessionId));
+
+    const task = manager.start('node -e "setInterval(() => {}, 1000)"', process.cwd(), sessionId);
+    expect(manager.kill(task.id, sessionId)).toBe(true);
+    await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 8000 });
+
+    const content = sent[0]?.message.content ?? "";
+    expect(sent[0]?.message.customType).toBe("background-exit");
+    expect(content).toContain('state="killed"');
+    expect(content).toContain("The task was stopped.");
+    expect(content).toContain("</shell>");
+
+    await manager.clearSession(sessionId);
   });
 });

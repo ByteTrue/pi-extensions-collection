@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { manager, registerBackgroundRunTool } from "./background-terminal.js";
+import { manager, registerBackgroundRunTool, runningBackgroundWork } from "./background-terminal.js";
 import { call, registerOne } from "./test-helpers.js";
 
 const SESSION = "background-run-session";
@@ -21,7 +21,9 @@ describe("background_run tool", () => {
     expect(Date.now() - startedAt).toBeLessThan(2000);
     const text = result.content[0]?.text ?? "";
     expect(text).toMatch(/Started in background: bg_[0-9a-f]+/);
-    expect(text).toMatch(/Hard timeout: 600s\. Its exit will arrive as a new message — continue with other work or end your turn now\. Until then the output file is partial\./);
+    expect(text).toContain("status: running");
+    expect(text).toContain("No lifetime cap");
+    expect(text).toContain("Do not poll or sleep on it");
 
     const id = text.match(/bg_[0-9a-f]+/)?.[0];
     expect(manager.get(id!, SESSION)?.status).toBe("running");
@@ -39,45 +41,48 @@ describe("background_run tool", () => {
     await manager.clearSession(SESSION);
   });
 
-  it("applies the 600s default lifetime; explicit timeouts win up to the 28800s hard cap, above which they are clamped", async () => {
+  it("has no lifetime by default; an explicit timeout is honored without a second cap", async () => {
     const result = await call(tool(), { command: "echo x" }, SESSION);
     const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
     await vi.waitFor(() => expect(manager.get(id!, SESSION)?.status).not.toBe("running"), { timeout: 5000 });
-    expect(manager.get(id!, SESSION)?.timeoutSeconds).toBe(600);
+    expect(manager.get(id!, SESSION)?.timeoutSeconds).toBeUndefined();
+    expect(result.content[0]?.text).toContain("No lifetime cap");
 
     const result2 = await call(tool(), { command: "echo y", timeout: 1800 }, SESSION);
     const id2 = result2.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
     await vi.waitFor(() => expect(manager.get(id2!, SESSION)?.status).not.toBe("running"), { timeout: 5000 });
     expect(manager.get(id2!, SESSION)?.timeoutSeconds).toBe(1800);
+    expect(result2.content[0]?.text).toContain("Lifetime: 1800s");
 
-    // 0.8.x taught 86400 for dev servers — now clamped to the hard cap, which is below it.
     const result3 = await call(tool(), { command: "echo z", timeout: 86400 }, SESSION);
     const id3 = result3.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
     await vi.waitFor(() => expect(manager.get(id3!, SESSION)?.status).not.toBe("running"), { timeout: 5000 });
-    expect(manager.get(id3!, SESSION)?.timeoutSeconds).toBe(28_800);
-    expect(result3.content[0]?.text).toContain("Hard timeout: 28800s");
+    expect(manager.get(id3!, SESSION)?.timeoutSeconds).toBe(86_400);
+    expect(result3.content[0]?.text).toContain("Lifetime: 86400s");
     await manager.clearSession(SESSION);
   });
 
-  it("treats degenerate timeouts (0, negative, NaN, Infinity) as absent and falls back to the 600s default", async () => {
-    // 0 must not reach ops.exec (Node convention reads it as "unbounded" — the opposite of
-    // this tool's hard lifetime cap); NaN/Infinity carry no meaningful bound either.
+  it("treats 0, negative, NaN and Infinity as no lifetime", async () => {
+    // 0 is an explicit opt-out (opencode semantics); negative/non-finite values
+    // carry no meaningful bound and are also treated as absent.
     const t = tool();
     for (const timeout of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
       const result = await call(t, { command: "echo degenerate", timeout }, SESSION);
-      expect(result.content[0]?.text).toContain("Hard timeout: 600s");
+      expect(result.content[0]?.text).toContain("No lifetime cap");
       const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
-      expect(manager.get(id!, SESSION)?.timeoutSeconds).toBe(600);
+      expect(manager.get(id!, SESSION)?.timeoutSeconds).toBeUndefined();
     }
     await manager.clearSession(SESSION);
   });
 
   it("a short explicit timeout hard-kills the task as timed_out", { timeout: 10_000 }, async () => {
+    await manager.clearSession(SESSION);
     const exits: string[] = [];
     manager.init((task) => exits.push(task.id));
     const result = await call(tool(), { command: "sleep 30", timeout: 0.5 }, SESSION);
     const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
-    await vi.waitFor(() => expect(exits).toEqual([id]), { timeout: 8000 });
+    // Another test's late completion may be collected too; this task must notify once.
+    await vi.waitFor(() => expect(exits.filter((exit) => exit === id)).toEqual([id]), { timeout: 8000 });
     const task = manager.get(id!, SESSION);
     expect(task?.status).toBe("timed_out");
     manager.init(() => {});
@@ -118,6 +123,27 @@ describe("background_run tool", () => {
     } finally {
       process.env.PATH = origPath;
     }
+    await manager.clearSession(SESSION);
+  });
+
+
+  it("publishes running shells to the shared background-work registry", async () => {
+    const result = await call(tool(), { command: "sleep 30" }, SESSION);
+    const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
+    expect(
+      runningBackgroundWork(SESSION).some((work) => work.kind === "shell" && work.id === id),
+    ).toBe(true);
+
+    await manager.clearSession(SESSION);
+    expect(runningBackgroundWork(SESSION).some((work) => work.id === id)).toBe(false);
+  });
+
+
+  it("clamps an explicit lifetime at pi's platform maximum", async () => {
+    const result = await call(tool(), { command: "echo huge", timeout: 99_999_999 }, SESSION);
+    const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
+    expect(manager.get(id!, SESSION)?.timeoutSeconds).toBe(2_147_483);
+    expect(result.content[0]?.text).toContain("Lifetime: 2147483s");
     await manager.clearSession(SESSION);
   });
 });

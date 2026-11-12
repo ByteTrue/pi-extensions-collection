@@ -34,8 +34,8 @@ afterEach(() => {
 });
 
 describe("sweepOrphanLogs", () => {
-  it("deletes bg_*.log files older than 24h and keeps fresh ones", () => {
-    const oldPath = makeLog("bg_old1234.log", 2);
+  it("deletes bg_*.log files older than 7 days and keeps fresh ones", () => {
+    const oldPath = makeLog("bg_old1234.log", 8);
     const freshPath = makeLog("bg_fresh5678.log");
 
     sweepOrphanLogs();
@@ -48,7 +48,7 @@ describe("sweepOrphanLogs", () => {
     mkdirSync(DIR, { recursive: true });
     const task = manager.start("sleep 60", process.cwd(), "sweep-live-session");
     track(task.outputPath);
-    const stale = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const stale = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
     utimesSync(task.outputPath, stale, stale);
 
     sweepOrphanLogs();
@@ -69,7 +69,7 @@ describe("sweepOrphanLogs", () => {
   it("is fail-soft: an unremovable entry (e.g. a directory named like a log) never propagates", () => {
     const awkward = track(join(DIR, "bg_dirlike.log"));
     mkdirSync(awkward, { recursive: true });
-    const stale = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const stale = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
     utimesSync(awkward, stale, stale);
 
     expect(() => sweepOrphanLogs()).not.toThrow();

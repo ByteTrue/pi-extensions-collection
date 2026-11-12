@@ -54,57 +54,64 @@ const result = (
 });
 
 describe("registerBashDefaultTimeout", () => {
-  it("injects a 300s default timeout into bash calls that did not pass one", async () => {
+  it("injects a 120s default timeout into bash calls that did not pass one", async () => {
     const handlers = harness(registerBashDefaultTimeout);
     const call = event("bash", { command: "find /" });
     await handlers["tool_call"]?.(call, {});
-    expect(call.input).toEqual({ command: "find /", timeout: 300 });
+    expect(call.input).toEqual({ command: "find /", timeout: 120 });
   });
 
-  it("injects a 300s default timeout into powershell calls that did not pass one", async () => {
+  it("injects a 120s default timeout into powershell calls that did not pass one", async () => {
     const handlers = harness(registerBashDefaultTimeout);
     const call = event("powershell", { command: "Get-ChildItem /" });
     await handlers["tool_call"]?.(call, {});
-    expect(call.input).toEqual({ command: "Get-ChildItem /", timeout: 300 });
+    expect(call.input).toEqual({ command: "Get-ChildItem /", timeout: 120 });
   });
 
-  it("clamps an explicitly passed timeout above 300s down to 300 (foreground bash must not outlive the cap)", async () => {
+  it("leaves an explicitly passed timeout above the default untouched (no 300s hard cap)", async () => {
     const handlers = harness(registerBashDefaultTimeout);
     const call = event("bash", { command: "npm test", timeout: 1800 });
     await handlers["tool_call"]?.(call, {});
-    expect(call.input.timeout).toBe(300);
+    expect(call.input.timeout).toBe(1800);
   });
 
-  it("respects an explicit timeout at or below 300s, including exactly the cap", async () => {
+  it("clamps only at pi's platform maximum, far above the old cap", async () => {
     const handlers = harness(registerBashDefaultTimeout);
-    const below = event("bash", { command: "npm run build", timeout: 120 });
-    await handlers["tool_call"]?.(below, {});
-    expect(below.input.timeout).toBe(120);
-    // Boundary: the cap is inclusive — a value exactly at it is passed through unchanged.
-    const atCap = event("bash", { command: "npm run build", timeout: 300 });
-    await handlers["tool_call"]?.(atCap, {});
-    expect(atCap.input.timeout).toBe(300);
+    const call = event("bash", { command: "npm test", timeout: 99_999_999 });
+    await handlers["tool_call"]?.(call, {});
+    expect(call.input.timeout).toBe(2_147_483);
   });
 
-  it("treats a zero timeout as absent and injects the 300s default", async () => {
+  it("respects an explicit timeout at or below the default", async () => {
+    const handlers = harness(registerBashDefaultTimeout);
+    const below = event("bash", { command: "npm run build", timeout: 60 });
+    await handlers["tool_call"]?.(below, {});
+    expect(below.input.timeout).toBe(60);
+    const atDefault = event("bash", { command: "npm run build", timeout: 120 });
+    await handlers["tool_call"]?.(atDefault, {});
+    expect(atDefault.input.timeout).toBe(120);
+  });
+
+  it("turns an explicit zero timeout into 'no timeout' (opencode semantics)", async () => {
     const handlers = harness(registerBashDefaultTimeout);
     const call = event("bash", { command: "sleep 5", timeout: 0 });
     await handlers["tool_call"]?.(call, {});
-    expect(call.input.timeout).toBe(300);
+    // Pi rejects timeout <= 0; removing it is the built-in's "no timeout".
+    expect(call.input).toEqual({ command: "sleep 5" });
   });
 
-  it("treats a negative timeout as absent and injects the 300s default", async () => {
+  it("treats a negative timeout as absent and injects the 120s default", async () => {
     const handlers = harness(registerBashDefaultTimeout);
     const call = event("bash", { command: "sleep 5", timeout: -5 });
     await handlers["tool_call"]?.(call, {});
-    expect(call.input.timeout).toBe(300);
+    expect(call.input.timeout).toBe(120);
   });
 
   it("covers the powershell tool (same schema, same hang risk on Windows)", async () => {
     const handlers = harness(registerBashDefaultTimeout);
     const call = event("powershell", { command: "Get-ChildItem" });
     await handlers["tool_call"]?.(call, {});
-    expect(call.input.timeout).toBe(300);
+    expect(call.input.timeout).toBe(120);
   });
 
   it("ignores non-shell tool calls", async () => {
@@ -118,12 +125,12 @@ describe("registerBashDefaultTimeout", () => {
     const handlers = harness(registerBashDefaultTimeout);
     const call = event("powershell", { command: "npm run dev", waitSeconds: 5 });
     await handlers["tool_call"]?.(call, {});
-    expect(call.input).toEqual({ command: "npm run dev", timeout: 300, waitSeconds: 5 });
+    expect(call.input).toEqual({ command: "npm run dev", timeout: 120, waitSeconds: 5 });
   });
 
   it("appends steering text to a bash timeout error and echoes all other fields", async () => {
     const handlers = harness(registerBashDefaultTimeout);
-    const res = result("bash", "Command timed out after 300 seconds", true, {
+    const res = result("bash", "Command timed out after 120 seconds", true, {
       truncation: { truncated: true, totalLines: 5000 },
       fullOutputPath: "/tmp/pi-bash-x.log",
     });
@@ -134,7 +141,7 @@ describe("registerBashDefaultTimeout", () => {
     };
     expect(out.content).toHaveLength(2);
     expect(out.content[1]?.text).toContain("background_run");
-    expect(out.content[0]?.text).toBe("Command timed out after 300 seconds");
+    expect(out.content[0]?.text).toBe("Command timed out after 120 seconds");
     // agent-session REPLACES details/isError/usage from the hook result — dropping them
     // here would lose truncation info, so they must be echoed.
     expect(out.details).toEqual({ truncation: { truncated: true, totalLines: 5000 }, fullOutputPath: "/tmp/pi-bash-x.log" });
@@ -143,18 +150,25 @@ describe("registerBashDefaultTimeout", () => {
 
   it("steers powershell timeout errors the same way", async () => {
     const handlers = harness(registerBashDefaultTimeout);
-    const res = result("powershell", "Command timed out after 300 seconds", true);
+    const res = result("powershell", "Command timed out after 120 seconds", true);
     const out = (await handlers["tool_result"]?.(res, {})) as { content: { text: string }[] };
-    expect(out.content[1]?.text).toContain("hard-capped at 300s");
+    expect(out.content[1]?.text).toContain("background_run");
   });
 
+
+  it("steers a fractional timeout error too", async () => {
+    const handlers = harness(registerBashDefaultTimeout);
+    const res = result("bash", "Command timed out after 2.5 seconds", true);
+    const out = (await handlers["tool_result"]?.(res, {})) as { content: { text: string }[] };
+    expect(out.content[1]?.text).toContain("background_run");
+  });
   it("does not touch non-error results or non-timeout errors", async () => {
     const handlers = harness(registerBashDefaultTimeout);
     const ok = result("bash", "done", false);
     expect(await handlers["tool_result"]?.(ok, {})).toBeUndefined();
     // Timeout-looking text in a NON-error result must not be steered: the isError
     // branch exists so a success result quoting a timeout is left alone.
-    const okQuoting = result("bash", "previous attempt: Command timed out after 300 seconds", false);
+    const okQuoting = result("bash", "previous attempt: Command timed out after 120 seconds", false);
     expect(await handlers["tool_result"]?.(okQuoting, {})).toBeUndefined();
     const other = result("bash", "Command exited with code 1", true);
     expect(await handlers["tool_result"]?.(other, {})).toBeUndefined();
@@ -162,7 +176,7 @@ describe("registerBashDefaultTimeout", () => {
 
   it("does not touch timeout errors from other tools", async () => {
     const handlers = harness(registerBashDefaultTimeout);
-    const res = result("background_run", "Command timed out after 300 seconds", true);
+    const res = result("background_run", "Command timed out after 120 seconds", true);
     expect(await handlers["tool_result"]?.(res, {})).toBeUndefined();
   });
 });
