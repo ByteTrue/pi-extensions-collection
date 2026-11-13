@@ -70,6 +70,14 @@ describe("subagent completion delivery", () => {
     expect(collapsed).toContain("FIRST_LINE");
     expect(collapsed).toContain("Ctrl+O");
     expect(collapsed).not.toContain("SECOND_LINE");
+    const structured = {
+      customType: "subagent-exit",
+      content: "<subagent sessionID=\"sub_test\">\nSECOND_LINE",
+      details: { id: "sub_test", status: "succeeded", description: "Review patch" },
+    } as Parameters<MessageRenderer>[0];
+    const concise = renderer(structured, options, theme)!.render(120).join("\n");
+    expect(concise).toContain("sub_test completed — Review patch");
+    expect(concise).not.toContain("<subagent");
     const expanded = renderer(message, { ...options, expanded: true }, theme)!.render(120).join("\n");
     expect(expanded).toContain("SECOND_LINE");
   });

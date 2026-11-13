@@ -2310,7 +2310,14 @@ export default function subagentExtension(pi: {
   pi.registerMessageRenderer?.("subagent-exit", (message, { expanded, outputPad, keyText }, theme) => {
     const content = typeof message.content === "string" ? message.content : "";
     const label = theme.bold(theme.fg("customMessageLabel", `[${message.customType}]`));
-    const summary = oneLine(content.split("\n").find((line) => line.trim()) ?? "(no output)", 160);
+    const rawDetails = message.details as Record<string, unknown> | Record<string, unknown>[] | undefined;
+    const details = Array.isArray(rawDetails) ? undefined : rawDetails;
+    const id = typeof details?.id === "string" ? details.id : undefined;
+    const rawStatus = typeof details?.status === "string" ? details.status : undefined;
+    const state = rawStatus === "succeeded" ? "completed" : rawStatus;
+    const description = typeof details?.description === "string" ? details.description : undefined;
+    const fallback = content.split("\n").find((line) => line.trim() && !line.trimStart().startsWith("<")) ?? "(no output)";
+    const summary = oneLine(id ? `${id}${state ? ` ${state}` : ""}${description ? ` — ${description}` : ""}` : fallback, 120);
     const text = expanded
       ? `${label}\n${content}`
       : `${label} ${summary} ${theme.fg("dim", `(${keyText("app.tools.expand")} to expand)`)}`;

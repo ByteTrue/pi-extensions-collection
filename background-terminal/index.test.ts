@@ -92,6 +92,14 @@ describe("background-terminal extension", () => {
     expect(collapsed).toContain("FIRST_LINE");
     expect(collapsed).toContain("Ctrl+O");
     expect(collapsed).not.toContain("SECOND_LINE");
+    const structured = {
+      customType: "background-exit",
+      content: "<shell id=\"bg_test\" state=\"completed\">\nSECOND_LINE",
+      details: { id: "bg_test", status: "exited", command: "npm test" },
+    } as Parameters<MessageRenderer>[0];
+    const concise = renderer(structured, options, theme)!.render(120).join("\n");
+    expect(concise).toContain("bg_test completed — npm test");
+    expect(concise).not.toContain("<shell");
     const expanded = renderer(message, { ...options, expanded: true }, theme)!.render(120).join("\n");
     expect(expanded).toContain("SECOND_LINE");
   });

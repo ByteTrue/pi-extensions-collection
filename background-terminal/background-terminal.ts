@@ -1012,7 +1012,16 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
   pi.registerMessageRenderer("background-exit", (message, { expanded, outputPad, keyText }, theme) => {
     const content = typeof message.content === "string" ? message.content : "";
     const label = theme.bold(theme.fg("customMessageLabel", `[${message.customType}]`));
-    const summary = truncateLine(content.split("\n").find((line) => line.trim()) ?? "(no output)", 160).text;
+    const details = message.details as Partial<BackgroundTask> | Partial<BackgroundTask>[] | undefined;
+    const detail = Array.isArray(details) ? undefined : details;
+    const state = detail?.status === "exited" ? "completed" : detail?.status;
+    const fallback = content.split("\n").find((line) => line.trim() && !line.trimStart().startsWith("<")) ?? "(no output)";
+    const summary = truncateLine(
+      detail?.id
+        ? `${detail.id}${state ? ` ${state}` : ""}${detail.command ? ` — ${detail.command}` : ""}`
+        : fallback,
+      120,
+    ).text;
     const text = expanded
       ? `${label}\n${content}`
       : `${label} ${summary} ${theme.fg("dim", `(${keyText("app.tools.expand")} to expand)`)}`;
