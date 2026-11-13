@@ -1,6 +1,19 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	createAgentSession,
+	DefaultResourceLoader,
+	SessionManager,
+	SettingsManager,
+	type ExtensionAPI,
+	type ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import registerBashTimeout, { registerBashDefaultTimeout } from "./bash-timeout.js";
+
+const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
 type FakeToolCall = {
@@ -208,4 +221,54 @@ describe("bash-timeout extension", () => {
     expect(toolNames).not.toContain("bash");
     expect(toolNames).not.toContain("powershell");
   });
+});
+
+// The timeout patch replaces `content`. ExtensionRunner deletes `structuredContent`
+// unless the handler also returns it, so a patch that forgets it silently erases a
+// tool's machine-readable payload. Only the real runner proves the field survives.
+describe("structuredContent through the real ExtensionRunner", () => {
+	it("survives the timeout steering patch", { timeout: 15_000 }, async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-bash-timeout-structured-"));
+		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+		try {
+			const settingsManager = SettingsManager.create(repoRoot, agentDir);
+			const resourceLoader = new DefaultResourceLoader({
+				cwd: repoRoot,
+				agentDir,
+				settingsManager,
+				additionalExtensionPaths: [join(repoRoot, "bash-timeout/bash-timeout.ts")],
+				noExtensions: true,
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				noContextFiles: true,
+			});
+			await resourceLoader.reload();
+			({ session } = await createAgentSession({
+				cwd: repoRoot,
+				agentDir,
+				settingsManager,
+				resourceLoader,
+				sessionManager: SessionManager.inMemory(),
+				noTools: "all",
+			}));
+			const event: ToolResultEvent = {
+				type: "tool_result",
+				toolCallId: "timeout",
+				toolName: "bash",
+				input: { command: "sleep 999" },
+				content: [{ type: "text", text: "Command timed out after 120 seconds" }],
+				structuredContent: { answer: 42 },
+				details: undefined,
+				isError: true,
+			};
+			const patch = await session.extensionRunner.emitToolResult(event);
+			expect(patch?.structuredContent).toEqual({ answer: 42 });
+			expect(patch?.content).toHaveLength(2);
+			expect(patch?.content?.[1]).toMatchObject({ type: "text" });
+		} finally {
+			session?.dispose();
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
 });

@@ -9,7 +9,6 @@
     "auto-compact",
     "background-terminal",
     "bash-timeout",
-    "context-prune",
     "goal",
     "subagent"
   ],
@@ -19,7 +18,6 @@
       "./auto-compact/auto-compact.ts",
       "./background-terminal/background-terminal.ts",
       "./bash-timeout/bash-timeout.ts",
-      "./context-prune/context-prune.ts",
       "./goal/goal.ts",
       "./subagent/subagent.ts"
     ]

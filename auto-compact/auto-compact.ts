@@ -4,7 +4,7 @@
 // compacts once the context passes 400k, instead of Pi's default
 // "window - reserveTokens". Models with a smaller window are not touched; Pi's
 // own policy applies there. Compaction itself stays Pi's own: synchronous, on
-// the current model. Pruning stale tool results is context-prune's job.
+// the current model.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** Compact once the context passes this many tokens — but only for models whose

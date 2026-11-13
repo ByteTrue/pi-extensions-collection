@@ -27,6 +27,4 @@ and toggle it off; nothing is deleted.
 
 ## Interaction with other extensions
 
-It registers no tools, so it conflicts with nothing. Keep it when
-`context-prune` is replaced by `@cortexkit/pi-magic-context`: the 400k rule is
-useful whatever does the pruning.
+It registers no tools, so it conflicts with nothing.
