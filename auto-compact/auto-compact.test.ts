@@ -61,6 +61,17 @@ describe("agent_settled", () => {
 		expect(typeof compactCalls[0]?.onError).toBe("function");
 	});
 
+	it("does not compact after an aborted run", async () => {
+		const { handlers, compactCalls, ctx } = harness({ tokens: COMPACT_AT_TOKENS + 5_000, contextWindow: 1_000_000 });
+		const original = ctx.compact;
+		ctx.compact = (opts) => {
+			original(opts);
+			opts.onComplete?.();
+		};
+		await handlers["agent_settled"]?.({ aborted: true }, ctx);
+		expect(compactCalls).toHaveLength(0);
+	});
+
 	it("does not compact below the threshold, on small windows, or without usage", () => {
 		const below = harness({ tokens: 1_000, contextWindow: 1_000_000 });
 		below.handlers["agent_settled"]?.({}, below.ctx);

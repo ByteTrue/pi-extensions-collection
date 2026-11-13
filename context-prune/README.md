@@ -55,9 +55,10 @@ reclaims at least 2% of the usable window; smaller batches wait, for at most
 three passes. Existing placeholders are replayed verbatim on every pass, so once
 something is pruned it stays byte-identical.
 
-State is in memory only. On resume or `/reload`, earlier `ctx_reduce` calls and
-stale/duplicate results are re-derived from the session entries, so pruned results
-stay pruned across restarts without any database.
+State is in memory only. On resume or `/reload`, earlier `ctx_reduce` calls with
+successful tool results and stale/duplicate results are re-derived from the
+session entries, so pruned results stay pruned across restarts without any
+database. Aborted or otherwise failed reduce calls are not replayed.
 
 ## Tools
 

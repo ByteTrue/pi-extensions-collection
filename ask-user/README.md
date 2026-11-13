@@ -69,6 +69,10 @@ Known limits, deliberately not fixed here:
   indicator while a dialog is pushed onto the extension-dialog stack.
 - Non-TUI modes (print / JSON / RPC) are untouched — they have no spinner.
 
+Tool calls execute sequentially so one dialog cannot restore the spinner while
+another is open. The tool's `AbortSignal` is forwarded to RPC `select` and
+`input` dialogs, allowing an RPC abort to dismiss the pending question.
+
 The tool declares `constrainedSampling: {type: "json_schema", strict: "prefer"}`,
 the same request Pi's built-in `read`/`bash`/`edit`/`write` tools make. Strict
 mode lets the provider constrain the argument text to a valid JSON object, which

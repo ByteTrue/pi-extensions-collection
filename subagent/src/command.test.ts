@@ -1,7 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
-import { pickModel, pickThinking } from "./command.js";
+import { pickModel, pickThinking, runSubagentCommand } from "./command.js";
 import { promptFuzzySelect } from "./tui-picker.js";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadSubagentSettings, updateSubagentSettings } from "./settings.js";
 
 describe("command and tui-picker unit tests", () => {
   it("promptFuzzySelect falls back to ctx.ui.select and handles selection/cancel", async () => {
@@ -44,6 +48,66 @@ describe("command and tui-picker unit tests", () => {
     (mockCtx.ui.select as any).mockResolvedValue(undefined);
     const cancelRes = await pickThinking(mockCtx);
     expect(cancelRes).toBeUndefined();
+  });
+
+  it("keeps global values when project settings override them", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-scope-picker-"));
+    const agentDir = join(dir, "agent");
+    const projectDir = join(dir, "project");
+    mkdirSync(projectDir, { recursive: true });
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    updateSubagentSettings(projectDir, "global", (current) => ({
+      ...current,
+      defaultModel: "global/a",
+      defaultThinking: "low",
+    }));
+    updateSubagentSettings(projectDir, "project", (current) => ({
+      ...current,
+      defaultModel: "project/b",
+      defaultThinking: "high",
+    }));
+    const notifications: string[] = [];
+    let firstMenu = true;
+    const ctx = {
+      cwd: projectDir,
+      hasUI: true,
+      mode: "rpc",
+      isProjectTrusted: () => true,
+      modelRegistry: { getAvailable: () => [] },
+      sessionManager: { getSessionId: () => "scope-test" },
+      ui: {
+        select: vi.fn(async (title: string, options: string[]) => {
+          if (title === "Subagent Settings") {
+            if (firstMenu) {
+              firstMenu = false;
+              return "⚙️ Configure Default Subagent Model & Thinking";
+            }
+            return "🚪 Exit";
+          }
+          if (title === "Where should subagent settings be saved?") {
+            return options.find((option) => option.startsWith("Global"));
+          }
+          if (title.startsWith("Select Subagent Model") || title.startsWith("Select Subagent Thinking Level")) {
+            return options.find((option) => option.startsWith("Keep current"));
+          }
+          throw new Error(`Unexpected picker: ${title}`);
+        }),
+        notify: (message: string) => notifications.push(message),
+      },
+    } as unknown as ExtensionCommandContext;
+
+    try {
+      await runSubagentCommand(ctx);
+      const global = loadSubagentSettings(projectDir, false);
+      expect(global.defaultModel).toBe("global/a");
+      expect(global.defaultThinking).toBe("low");
+      expect(notifications.some((message) => message.includes("global/a"))).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("pickModel returns selected model or undefined on cancel", async () => {

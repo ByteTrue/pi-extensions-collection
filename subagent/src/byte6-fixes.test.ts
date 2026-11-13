@@ -8,6 +8,7 @@ import {
   normalizeTask,
   SubagentTaskManager,
   type SubagentInput,
+  type SubagentTaskRecord,
 } from "./index.js";
 
 // The fake pi CLI logs its argv and exits with a chosen code after a delay, so
@@ -128,6 +129,30 @@ describe("session_shutdown reload keeps notifications (BYTE-6 #17)", () => {
     await handlers.get("session_shutdown")?.({ reason: "reload" });
     expect(sent).toHaveLength(1);
     expect(sent[0]?.customType).toBe("subagent-exit");
+  });
+});
+
+describe("session shutdown reporting", () => {
+  it("emits a cancelled terminal snapshot before deleting running records", async () => {
+    const manager = new SubagentTaskManager();
+    const changes: Array<SubagentTaskRecord | undefined> = [];
+    manager.init(() => {}, (task) => changes.push(task));
+    manager.register({
+      id: "shutdown-task",
+      parentSessionId: "shutdown-session",
+      description: "running",
+      status: "running",
+      output: "",
+      startedAt: Date.now(),
+      controller: new AbortController(),
+      notifyOnExit: false,
+      done: Promise.resolve(),
+    });
+
+    await manager.clearSession("shutdown-session");
+
+    expect(changes.some((task) => task?.id === "shutdown-task" && task.status === "cancelled")).toBe(true);
+    expect(manager.get("shutdown-task")).toBeUndefined();
   });
 });
 

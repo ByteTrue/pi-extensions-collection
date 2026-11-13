@@ -58,6 +58,17 @@ describe("sweepOrphanLogs", () => {
     await manager.clearSession("sweep-live-session");
   });
 
+  it("keeps a stale log while another live Pi owns its journal", () => {
+    const id = "bg_abcdefabcdefabcd";
+    const outputPath = makeLog(`${id}.log`, 8);
+    const journalPath = track(join(DIR, `${id}.journal.json`));
+    writeFileSync(journalPath, JSON.stringify({ taskId: id, ownerPid: process.pid, startedAt: Date.now() }));
+
+    sweepOrphanLogs();
+
+    expect(existsSync(outputPath)).toBe(true);
+  });
+
   it("ignores files that do not match the bg_*.log pattern", () => {
     const stranger = makeLog("not-a-bg-file.log", 2);
 

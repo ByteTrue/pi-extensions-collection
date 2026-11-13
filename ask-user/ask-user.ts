@@ -231,8 +231,9 @@ function selectDialog(
   ctx: ExtensionContext,
   title: string,
   rows: string[],
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
-  return withoutWorkingSpinner(ctx, () => ctx.ui.select(title, rows));
+  return withoutWorkingSpinner(ctx, () => ctx.ui.select(title, rows, { signal }));
 }
 
 /** Collect a freeform answer: multiline editor in TUI, input dialog elsewhere.
@@ -242,13 +243,14 @@ async function collectFreeform(
   question: string,
   ctx: ExtensionContext,
   prefill?: string,
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
   const text = await withoutWorkingSpinner(ctx, () =>
     ctx.mode === "tui"
       ? prefill !== undefined
         ? ctx.ui.editor(question, prefill)
         : ctx.ui.editor(question)
-      : ctx.ui.input(question, "Type your answer"),
+      : ctx.ui.input(question, "Type your answer", { signal }),
   );
   return text === undefined ? undefined : text.trim();
 }
@@ -389,6 +391,7 @@ async function multiSelectFallback(
   customText: string | undefined,
   customChecked: boolean,
   allowBack: boolean,
+  signal?: AbortSignal,
 ): Promise<MultiOutcome | undefined> {
   const selected = new Set(picked);
   let custom = customText;
@@ -416,7 +419,7 @@ async function multiSelectFallback(
       ...(allowBack ? [BACK_LABEL] : []),
     ];
 
-    const selectedRow = await selectDialog(ctx, title, rows);
+    const selectedRow = await selectDialog(ctx, title, rows, signal);
     if (selectedRow === undefined) return undefined;
     if (allowBack && selectedRow === BACK_LABEL) return { kind: "back" };
     if (doneRow && selectedRow === doneRow) {
@@ -427,7 +430,7 @@ async function multiSelectFallback(
         customOn = false;
         continue;
       }
-      const text = await collectFreeform(title, ctx, custom);
+      const text = await collectFreeform(title, ctx, custom, signal);
       if (text === undefined) return undefined;
       custom = text || undefined;
       customOn = Boolean(text);
@@ -450,6 +453,7 @@ function multiSelectDialog(
   customText: string | undefined,
   customChecked: boolean,
   allowBack: boolean,
+  signal?: AbortSignal,
 ): Promise<MultiOutcome | undefined> {
   // `custom` only exists on the interactive TUI surface; RPC mode keeps the
   // built-in dialog loop so BySpace and headless callers still work. Tests and
@@ -458,7 +462,7 @@ function multiSelectDialog(
   if (ctx.mode === "tui" && typeof custom === "function") {
     return multiSelectCustom(ctx, title, options, picked, customText, customChecked, allowBack);
   }
-  return multiSelectFallback(ctx, title, options, picked, customText, customChecked, allowBack);
+  return multiSelectFallback(ctx, title, options, picked, customText, customChecked, allowBack, signal);
 }
 
 function formatAnswers(questions: NormalizedQuestion[], states: QuestionState[]): string {
@@ -493,6 +497,7 @@ function formatQuestionTitle(
 export async function askUserExecute(
   params: AskUserParams,
   ctx: ExtensionContext,
+  signal?: AbortSignal,
 ): Promise<AskUserToolResult> {
   const normalized = normalizeQuestions(params);
   if ("error" in normalized) {
@@ -521,7 +526,7 @@ export async function askUserExecute(
     // 1. Open question (no options)
     if (q.options.length === 0) {
       if (index === 0) {
-        const text = await collectFreeform(title, ctx, state.customText);
+        const text = await collectFreeform(title, ctx, state.customText, signal);
         if (text === undefined) return dismissedResult();
         state.customText = text || undefined;
         state.answers = text ? [text] : [];
@@ -531,7 +536,7 @@ export async function askUserExecute(
 
       const keepRow = state.customText ? `✓ Keep answer: ${state.customText}` : undefined;
       const openRows = [...(keepRow ? [keepRow] : []), OTHER_LABEL, BACK_LABEL];
-      const selected = await selectDialog(ctx, title, openRows);
+      const selected = await selectDialog(ctx, title, openRows, signal);
       if (selected === undefined) return dismissedResult();
       if (selected === BACK_LABEL) {
         index -= 1;
@@ -542,7 +547,7 @@ export async function askUserExecute(
           index += 1;
         continue;
       }
-      const text = await collectFreeform(title, ctx, state.customText);
+      const text = await collectFreeform(title, ctx, state.customText, signal);
       if (text === undefined) return dismissedResult();
       state.customText = text || undefined;
       state.answers = text ? [text] : [];
@@ -560,6 +565,7 @@ export async function askUserExecute(
         state.customText,
         state.customChecked,
         index > 0,
+        signal,
       );
       if (!outcome) return dismissedResult();
       if (outcome.kind === "back") {
@@ -567,7 +573,7 @@ export async function askUserExecute(
         continue;
       }
       if (outcome.kind === "other") {
-        const text = await collectFreeform(title, ctx, state.customText);
+        const text = await collectFreeform(title, ctx, state.customText, signal);
         if (text === undefined) return dismissedResult();
         state.customText = text || undefined;
         state.customChecked = Boolean(text);
@@ -591,7 +597,7 @@ export async function askUserExecute(
     );
     const rows = [...optionRows, OTHER_LABEL, ...(index > 0 ? [BACK_LABEL] : [])];
 
-    const selected = await selectDialog(ctx, title, rows);
+    const selected = await selectDialog(ctx, title, rows, signal);
     if (selected === undefined) {
       return dismissedResult();
     }
@@ -600,7 +606,7 @@ export async function askUserExecute(
       continue;
     }
     if (selected === OTHER_LABEL) {
-      const text = await collectFreeform(title, ctx, state.customText);
+      const text = await collectFreeform(title, ctx, state.customText, signal);
       if (text === undefined) return dismissedResult();
       state.customText = text || undefined;
       state.answers = text ? [text] : [];
@@ -644,15 +650,16 @@ export default function askUserExtension(pi: ExtensionAPI): void {
     // proxy) becomes unrepresentable instead of arriving as a broken tool call.
     // `prefer` falls back to plain non-strict declarations when the provider
     // cannot do strict mode, so no provider loses the tool.
+    executionMode: "sequential",
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     async execute(
       _toolCallId: string,
       params: unknown,
-      _signal: AbortSignal,
+      signal: AbortSignal,
       _onUpdate: (update: unknown) => void,
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<unknown>> {
-      const result = await askUserExecute(params as AskUserParams, ctx);
+      const result = await askUserExecute(params as AskUserParams, ctx, signal);
       return { ...result, details: undefined };
     },
   });

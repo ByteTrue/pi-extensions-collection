@@ -742,6 +742,13 @@ export function registerContextPrune(pi: ExtensionAPI): void {
 		}
 		if (!entries || entries.length === 0) return;
 		const msgs: ToolResultLike[] = [];
+		const successfulReduceCalls = new Set(
+			entries
+				.map((entry) => entry.message)
+				.filter((msg) => msg?.role === "toolResult" && msg.toolName === "ctx_reduce" && !msg.isError)
+				.map((msg) => msg?.toolCallId)
+				.filter((id): id is string => typeof id === "string"),
+		);
 		for (const entry of entries) {
 			const msg = entry.message as ToolResultLike | undefined;
 			if (!msg?.role) continue;
@@ -751,7 +758,7 @@ export function registerContextPrune(pi: ExtensionAPI): void {
 			}
 			if (msg.role === "assistant" && Array.isArray(msg.content)) {
 				for (const block of msg.content) {
-					if (block.type !== "toolCall" || block.name !== "ctx_reduce") continue;
+					if (block.type !== "toolCall" || block.name !== "ctx_reduce" || !block.id || !successfulReduceCalls.has(block.id)) continue;
 					const ids = (block.arguments as { ids?: unknown } | undefined)?.ids;
 					if (Array.isArray(ids)) {
 						for (const id of ids) if (typeof id === "string") s.requested.add(id);
@@ -891,6 +898,7 @@ export function registerContextPrune(pi: ExtensionAPI): void {
 					}),
 				},
 			],
+			structuredContent: event.structuredContent,
 		};
 	});
 

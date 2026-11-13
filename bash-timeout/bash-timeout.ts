@@ -78,6 +78,7 @@ export function registerBashDefaultTimeout(pi: ExtensionAPI): void {
     // full-output path that ride on `details`.
     return {
       content: [...event.content, { type: "text" as const, text: TIMEOUT_STEERING }],
+      structuredContent: event.structuredContent,
       details: event.details,
       isError: event.isError,
       ...(event.usage ? { usage: event.usage } : {}),

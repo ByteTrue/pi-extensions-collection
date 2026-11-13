@@ -209,6 +209,44 @@ describe("registration", () => {
     expect(items.additionalProperties).toBeUndefined();
   });
 
+  it("executes sequentially so one dialog cannot restore the spinner for another", () => {
+    expect(harness().executionMode).toBe("sequential");
+  });
+
+  it("forwards the tool abort signal to an RPC dialog", async () => {
+    const tool = harness();
+    const { ctx } = ctxWithRecorder({}, { mode: "rpc" });
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    let resolveDialog: ((value: string | undefined) => void) | undefined;
+    ctx.ui.select = (_title, _rows, opts) => {
+      observedSignal = opts?.signal;
+      return new Promise<string | undefined>((resolve) => {
+        resolveDialog = resolve;
+        opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+      });
+    };
+    const pending = tool.execute(
+      "call",
+      { questions: [{ question: "Runner?", options: [{ label: "vitest" }] }] },
+      controller.signal,
+      () => {},
+      ctx,
+    );
+    await flushTicks();
+
+    try {
+      controller.abort();
+      await flushTicks();
+      expect(observedSignal).toBe(controller.signal);
+      const result = (await pending) as { content: { text: string }[] };
+      expect(result.content[0]!.text).toContain("dismissed");
+    } finally {
+      resolveDialog?.(undefined);
+      await pending;
+    }
+  });
+
   it("leads with the trigger condition and includes batching + multi-select + do-not-ask rules", () => {
     const tool = harness();
     expect(

@@ -279,6 +279,10 @@ function readLocationSettings(location: SettingsLocation): SubagentSettings {
     : parseSubagentSection(read.value);
 }
 
+export function loadSubagentSettingsForScope(cwd: string, scope: SettingsScope): SubagentSettings {
+  return readLocationSettings(settingsLocationForScope(cwd, scope));
+}
+
 export function loadSubagentSettings(cwd: string, projectTrusted = true): SubagentSettings {
   const globalSettings = readLocationSettings(settingsLocationForScope(cwd, "global"));
 
@@ -336,6 +340,13 @@ export function updateSubagentSettings(
   return targetPath;
 }
 
+export function isValidAgentName(value: string): boolean {
+  if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)) return false;
+  const trimmed = value.trim();
+  const name = trimmed.toLowerCase().endsWith(".md") ? trimmed.slice(0, -3) : trimmed;
+  return name.length > 0 && name.length <= 128;
+}
+
 export function listDiscoveredAgentNames(cwd: string, projectTrusted = true): string[] {
   const names = new Set<string>();
 
@@ -346,7 +357,8 @@ export function listDiscoveredAgentNames(cwd: string, projectTrusted = true): st
       const files = readdirSync(dirPath);
       for (const file of files) {
         if (file.endsWith(".md") && !file.startsWith(".")) {
-          names.add(file.slice(0, -3));
+          const name = file.slice(0, -3);
+          if (isValidAgentName(name)) names.add(name);
         }
       }
     } catch {}
@@ -366,7 +378,7 @@ export function listDiscoveredAgentNames(cwd: string, projectTrusted = true): st
   const settings = loadSubagentSettings(cwd, projectTrusted);
   if (settings.agents) {
     for (const key of Object.keys(settings.agents)) {
-      names.add(key);
+      if (isValidAgentName(key)) names.add(key);
     }
   }
 

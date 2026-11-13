@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { createWriteStream, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -15,6 +15,7 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,8 @@ interface InternalTask extends BackgroundTask {
   controller: AbortController;
   notifyOnExit: boolean;
   notified: boolean;
+  notificationPending: boolean;
+  settledAt?: number;
   done: Promise<void>;
   pidPath: string;
   startPath: string;
@@ -88,10 +91,39 @@ interface StartOptions {
 
 /** Recent-output preview held in memory for background_status; the full output lives in the file. */
 const TAIL_PREVIEW_CHARS = 4000;
+const SETTLED_HISTORY_LIMIT = 100;
+const COMPLETION_BATCH_CAP_CHARS = 50_000;
 /** Output-file cap: beyond this the file stops growing and a truncation marker is appended. */
 export const OUTPUT_FILE_CAP_BYTES = 50 * 1024 * 1024;
 
 const OUTPUT_DIR = join(tmpdir(), "background-terminal");
+const TASK_ID_PATTERN = /^bg_[a-f0-9]{16}$/;
+
+function ensureOutputDir(): void {
+  mkdirSync(OUTPUT_DIR, { recursive: true, mode: 0o700 });
+  const info = lstatSync(OUTPUT_DIR);
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error(`background-terminal refuses non-directory state path: ${OUTPUT_DIR}`);
+  }
+  if (process.platform !== "win32") {
+    const uid = process.getuid?.();
+    if (uid === undefined || info.uid !== uid) {
+      throw new Error(`background-terminal refuses state directory owned by another user: ${OUTPUT_DIR}`);
+    }
+    if ((info.mode & 0o077) !== 0) chmodSync(OUTPUT_DIR, 0o700);
+  }
+}
+
+function readOwnedStateFile(path: string): string {
+  const info = lstatSync(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error(`unsafe background state file: ${path}`);
+  if (process.platform !== "win32") {
+    const uid = process.getuid?.();
+    if (uid === undefined || info.uid !== uid) throw new Error(`foreign background state file: ${path}`);
+  }
+  return readFileSync(path, "utf8");
+}
+
 /** How long a session shutdown waits for a killed task before letting Pi exit.
  * A task that survives this wait stays in the journal for the next-start reaper. */
 const SHUTDOWN_WAIT_MS = 5_000;
@@ -99,6 +131,8 @@ const SHUTDOWN_WAIT_MS = 5_000;
  * a live task in another Pi process can be silent for a long time; keep this well
  * above any plausible live task age. $TMPDIR is OS-cleaned eventually. */
 const ORPHAN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** A spawned wrapper can survive its owner before it has written its PID. */
+const ORPHAN_STARTUP_GRACE_MS = 10_000;
 
 /**
  * Removes bg_*.log files left behind by crashed Pi processes. Crash paths
@@ -109,18 +143,25 @@ const ORPHAN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
  * would eventually remove it too.
  */
 export function sweepOrphanLogs(): void {
+  ensureOutputDir();
   let entries: string[];
   try {
     entries = readdirSync(OUTPUT_DIR);
   } catch {
     return; // No dir yet, or unreadable — nothing to sweep.
   }
-  const live = new Set(manager.listAll().map((task) => task.outputPath));
+  const live = new Set([
+    ...manager.listAll().map((task) => task.outputPath),
+    ...(manager.retiredOutputs?.() ?? []),
+  ]);
+  const journaled = new Set(
+    entries.filter((entry) => entry.startsWith("bg_") && entry.endsWith(".journal.json")).map((entry) => entry.slice(0, -".journal.json".length)),
+  );
   const cutoff = Date.now() - ORPHAN_MAX_AGE_MS;
   for (const entry of entries) {
     if (!entry.startsWith("bg_") || !entry.endsWith(".log")) continue;
     const path = join(OUTPUT_DIR, entry);
-    if (live.has(path)) continue;
+    if (live.has(path) || journaled.has(entry.slice(0, -".log".length))) continue;
     try {
       if (statSync(path).mtimeMs < cutoff) rmSync(path, { force: true });
     } catch {
@@ -147,9 +188,13 @@ function wrapCommand(command: string, pidPath: string, startPath: string, taskId
 }
 
 function cleanupTaskMeta(task: { pidPath: string; startPath: string; journalPath: string }): void {
-  rmSync(task.journalPath, { force: true });
-  rmSync(task.pidPath, { force: true });
-  rmSync(task.startPath, { force: true });
+  for (const path of [task.journalPath, task.pidPath, task.startPath]) {
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // Metadata cleanup must not suppress the completion notification.
+    }
+  }
 }
 
 interface JournalRecord {
@@ -202,6 +247,13 @@ function killTaskTree(pid: number): void {
     } catch {}
     return;
   }
+  if (process.platform === "darwin") {
+    // Match Pi's backend: pausing the group keeps a dying child from waking its
+    // shell into the next command before the shell itself is killed.
+    try {
+      process.kill(-pid, "SIGSTOP");
+    } catch {}
+  }
   try {
     process.kill(-pid, "SIGKILL");
   } catch {
@@ -233,6 +285,7 @@ function cleanupOrphan(record: Pick<JournalRecord, "taskId" | "journalPath" | "p
  * never killed. A task that cannot be verified is left for a later load.
  */
 export function reapOrphans(): void {
+  ensureOutputDir();
   let names: string[];
   try {
     names = readdirSync(OUTPUT_DIR);
@@ -243,41 +296,46 @@ export function reapOrphans(): void {
     if (!name.startsWith("bg_") || !name.endsWith(".journal.json")) continue;
     const journalPath = join(OUTPUT_DIR, name);
     try {
-      const parsed = JSON.parse(readFileSync(journalPath, "utf8")) as Partial<JournalRecord>;
-      const id = typeof parsed.taskId === "string" ? parsed.taskId : name.slice(0, -".journal.json".length);
+      const parsed = JSON.parse(readOwnedStateFile(journalPath)) as Partial<JournalRecord>;
+      const id = name.slice(0, -".journal.json".length);
+      if (!TASK_ID_PATTERN.test(id) || parsed.taskId !== id) continue;
+      if (!Number.isInteger(parsed.ownerPid) || (parsed.ownerPid ?? 0) <= 0) continue;
       const paths = orphanPaths(id);
       const record: JournalRecord = {
         taskId: id,
-        ownerPid: typeof parsed.ownerPid === "number" ? parsed.ownerPid : -1,
+        ownerPid: parsed.ownerPid!,
         command: typeof parsed.command === "string" ? parsed.command : "",
-        outputPath: typeof parsed.outputPath === "string" ? parsed.outputPath : paths.outputPath,
-        pidPath: typeof parsed.pidPath === "string" ? parsed.pidPath : paths.pidPath,
-        startPath: typeof parsed.startPath === "string" ? parsed.startPath : paths.startPath,
+        outputPath: paths.outputPath,
+        pidPath: paths.pidPath,
+        startPath: paths.startPath,
         journalPath,
-        startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : 0,
+        startedAt: typeof parsed.startedAt === "number" && Number.isFinite(parsed.startedAt) ? parsed.startedAt : 0,
       };
-      if (record.ownerPid > 0 && isProcessAlive(record.ownerPid)) continue;
+      if (isProcessAlive(record.ownerPid)) continue;
 
       let pid = 0;
       try {
-        pid = Number(readFileSync(record.pidPath, "utf8").trim());
-      } catch {}
-      if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {
+        pid = Number(readOwnedStateFile(record.pidPath).trim());
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+      }
+      const hasPid = Number.isInteger(pid) && pid > 0;
+      if (!hasPid && record.startedAt > 0 && Date.now() - record.startedAt < ORPHAN_STARTUP_GRACE_MS) continue;
+      if (!hasPid || !isProcessAlive(pid)) {
         cleanupOrphan(record);
         continue;
       }
 
-      const recordedStart = (() => {
-        try {
-          return readFileSync(record.startPath, "utf8").trim();
-        } catch {
-          return "";
-        }
-      })();
+      let recordedStart = "";
+      try {
+        recordedStart = readOwnedStateFile(record.startPath).trim();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+      }
       const currentStart = processStart(pid);
-      const verified =
-        (recordedStart !== "" && currentStart !== "" && currentStart === recordedStart) ||
-        commandMatches(id, pid);
+      const verified = recordedStart !== "" && currentStart !== ""
+        ? currentStart === recordedStart
+        : commandMatches(id, pid);
       if (!verified) {
         // A reused PID or an unreadable start marker: never kill it. Drop the
         // journal only after the grace period so a later load can retry.
@@ -295,6 +353,7 @@ export function reapOrphans(): void {
 
 export class BackgroundManager {
   private readonly tasks = new Map<string, InternalTask>();
+  private readonly retiredOutputPaths = new Map<string, Set<string>>();
   private onExit?: (task: BackgroundTask) => void;
   private onChange?: () => void;
 
@@ -313,7 +372,7 @@ export class BackgroundManager {
   }
 
   private spawn(command: string, cwd: string, parentSessionId: string, options?: StartOptions): InternalTask {
-    mkdirSync(OUTPUT_DIR, { recursive: true });
+    ensureOutputDir();
     const id = `bg_${randomBytes(8).toString("hex")}`;
     const outputPath = join(OUTPUT_DIR, `${id}.log`);
     const pidPath = join(OUTPUT_DIR, `${id}.pid`);
@@ -321,7 +380,7 @@ export class BackgroundManager {
     const journalPath = join(OUTPUT_DIR, `${id}.journal.json`);
     // Create the file synchronously so callers can rely on it existing the moment start() returns;
     // createWriteStream opens asynchronously and would otherwise race the caller.
-    writeFileSync(outputPath, "");
+    writeFileSync(outputPath, "", { flag: "wx", mode: 0o600 });
     const fileStream = createWriteStream(outputPath, { flags: "a" });
     const controller = new AbortController();
     const decoder = new StringDecoder("utf8");
@@ -342,6 +401,7 @@ export class BackgroundManager {
       controller,
       notifyOnExit: true,
       notified: false,
+      notificationPending: false,
       done: Promise.resolve(),
       pidPath,
       startPath,
@@ -374,6 +434,7 @@ export class BackgroundManager {
         startPath,
         startedAt: Date.now(),
       }),
+      { flag: "wx", mode: 0o600 },
     );
     const wrapped = wrapCommand(command, pidPath, startPath, id);
     const execution = ops
@@ -420,6 +481,7 @@ export class BackgroundManager {
         return outputClosed;
       })
       .then(() => {
+        task.settledAt = Date.now();
         cleanupTaskMeta(task);
         this.emitChange();
         this.maybeNotify(task);
@@ -464,11 +526,43 @@ export class BackgroundManager {
     if (task.notified) return;
     if (!task.notifyOnExit) return;
     task.notified = true;
+    task.notificationPending = true;
     this.onExit?.(this.toPublic(task));
+    this.pruneSettledHistory();
+  }
+
+  retiredOutputs(): string[] {
+    return Array.from(this.retiredOutputPaths.values()).flatMap((paths) => Array.from(paths));
+  }
+
+  pendingNotifications(parentSessionId: string): BackgroundTask[] {
+    return Array.from(this.tasks.values())
+      .filter((task) => task.parentSessionId === parentSessionId && task.notificationPending)
+      .map((task) => this.toPublic(task));
+  }
+
+  notificationDelivered(id: string): void {
+    const task = this.tasks.get(id);
+    if (task) task.notificationPending = false;
+    this.pruneSettledHistory();
+  }
+
+  private pruneSettledHistory(): void {
+    const removable = Array.from(this.tasks.values())
+      .filter((task) => task.status !== "running" && task.notified && !task.notificationPending)
+      .sort((a, b) => (a.settledAt ?? a.createdAt.getTime()) - (b.settledAt ?? b.createdAt.getTime()));
+    for (const task of removable.slice(0, -SETTLED_HISTORY_LIMIT)) {
+      this.tasks.delete(task.id);
+      const paths = this.retiredOutputPaths.get(task.parentSessionId) ?? new Set<string>();
+      paths.add(task.outputPath);
+      this.retiredOutputPaths.set(task.parentSessionId, paths);
+    }
   }
 
   async clearSession(parentSessionId: string): Promise<void> {
     const tasks = Array.from(this.tasks.values()).filter((task) => task.parentSessionId === parentSessionId);
+    const retiredOutputs = this.retiredOutputPaths.get(parentSessionId) ?? new Set<string>();
+    this.retiredOutputPaths.delete(parentSessionId);
 
     for (const task of tasks) {
       task.notifyOnExit = false;
@@ -476,8 +570,8 @@ export class BackgroundManager {
       this.tasks.delete(task.id);
     }
 
-    await Promise.all(
-      tasks.map(async (task) => {
+    await Promise.all([
+      ...tasks.map(async (task) => {
         // Do not hang Pi forever on a process that refuses to die. If the wait
         // times out, the journal stays and the next-start reaper kills it.
         const settled = await Promise.race([
@@ -488,7 +582,8 @@ export class BackgroundManager {
         cleanupTaskMeta(task);
         await rm(task.outputPath, { force: true }).catch(() => {});
       }),
-    );
+      ...Array.from(retiredOutputs, (path) => rm(path, { force: true }).catch(() => {})),
+    ]);
   }
 
   private emitChange(): void {
@@ -511,6 +606,8 @@ export class BackgroundManager {
       controller: _controller,
       notifyOnExit: _notifyOnExit,
       notified: _notified,
+      notificationPending: _notificationPending,
+      settledAt: _settledAt,
       done: _done,
       pidPath: _pidPath,
       startPath: _startPath,
@@ -912,6 +1009,17 @@ function formatTaskOption(task: BackgroundTask): string {
 // ---------------------------------------------------------------------------
 
 export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
+  pi.registerMessageRenderer("background-exit", (message, { expanded, outputPad, keyText }, theme) => {
+    const content = typeof message.content === "string" ? message.content : "";
+    const label = theme.bold(theme.fg("customMessageLabel", `[${message.customType}]`));
+    const summary = truncateLine(content.split("\n").find((line) => line.trim()) ?? "(no output)", 160).text;
+    const text = expanded
+      ? `${label}\n${content}`
+      : `${label} ${summary} ${theme.fg("dim", `(${keyText("app.tools.expand")} to expand)`)}`;
+    const box = new Box(outputPad, 1, (value) => theme.bg("customMessageBg", value));
+    box.addChild(new Text(text, 0, 0));
+    return box;
+  });
   // A SIGKILLed/crashed Pi cannot run session_shutdown; kill the tasks its
   // journal left behind before starting new work. Then sweep stale logs from
   // sessions that predate the journal.
@@ -921,42 +1029,66 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
   let currentSessionId: string | null = null;
   let updateStatus: (() => void) | undefined;
   let agentBusy = false;
-  let pendingExits: BackgroundTask[] = [];
+  const pendingKey = Symbol.for("@bytetrue/pi-background-terminal.pending-exits");
+  const pendingStore = globalThis as unknown as Record<symbol, { tasks: BackgroundTask[]; legacyAdopted?: boolean } | undefined>;
+  const pendingState = (pendingStore[pendingKey] ??= { tasks: [] });
+  const pendingExits = pendingState.tasks;
+  const enqueueExit = (task: BackgroundTask) => {
+    const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
+    if (index >= 0) pendingExits[index] = task;
+    else pendingExits.push(task);
+  };
 
   // Pi drains the followUp queue one message at a time by default, so one message per exit
   // would wake the agent into a separate turn per task. Exits that land while the agent is
   // busy are buffered and flushed as a single message when it settles; followUp messages are
   // only delivered once the agent finishes anyway, so this changes no delivery timing.
   const flushPendingExits = () => {
-    const batch = pendingExits;
-    pendingExits = [];
-    const first = batch[0];
-    if (!first) return;
-    const content =
-      batch.length === 1
-        ? formatExitMessage(first)
-        : `${batch.length} background tasks finished:\n\n${batch.map(formatExitMessage).join("\n\n")}`;
-    pi.sendMessage(
-      {
-        customType: "background-exit",
-        content,
-        display: true,
-        details: batch.length === 1 ? first : batch,
-      },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
+    if (!currentSessionId) return;
+    const batch = pendingExits.filter((task) => task.parentSessionId === currentSessionId);
+    if (batch.length === 0) return;
+    for (const completion of formatCompletionBatches(batch)) {
+      const tasks = completion.tasks;
+      try {
+        pi.sendMessage(
+          {
+            customType: "background-exit",
+            content: completion.content,
+            display: true,
+            details: completion.summarized
+              ? tasks.length === 1 ? summaryDetails(tasks[0]!) : tasks.map(summaryDetails)
+              : tasks.length === 1 ? tasks[0] : tasks,
+          },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      } catch {
+        break;
+      }
+      for (const task of tasks) {
+        manager.notificationDelivered?.(task.id);
+        const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
+        if (index >= 0) pendingExits.splice(index, 1);
+      }
+    }
   };
 
   manager.init(
     (task) => {
+      enqueueExit(task);
       if (!currentSessionId || task.parentSessionId !== currentSessionId) return;
       // followUp + triggerTurn is what makes this hands-off: it wakes an idle agent into a new turn
       // with the outcome, so nothing has to poll background_status to notice completion.
-      pendingExits.push(task);
       if (!agentBusy) flushPendingExits();
     },
     () => updateStatus?.(),
   );
+  // shortcut: legacy records lack delivery state, so first upgrade may replay an old notice; exactly-once needs a host handoff API.
+  if (!pendingState.legacyAdopted && typeof manager.pendingNotifications !== "function") {
+    pendingState.legacyAdopted = true;
+    for (const task of manager.listAll()) {
+      if (task.status !== "running") enqueueExit(task);
+    }
+  }
 
   registerBackgroundCommand(pi);
   // No foreground-timeout hook here: the default for bash/powershell lives in the
@@ -985,36 +1117,46 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     currentSessionId = sessionId;
+    for (const task of manager.pendingNotifications?.(sessionId) ?? []) enqueueExit(task);
     updateStatus = () => {
       const running = manager.list(sessionId).filter((task) => task.status === "running").length;
       ctx.ui.setStatus("background-terminal", running === 0 ? undefined : `bg:${running}`);
     };
     updateStatus();
+    if (!agentBusy) flushPendingExits();
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
     // "reload" re-fires session_shutdown/session_start on the SAME session (extensions and config
     // hot-reload), it does not end the session. Background tasks must survive a /reload.
-    if (event.reason === "reload") return;
+    if (event.reason === "reload") {
+      flushPendingExits();
+      return;
+    }
 
     const sessionId = ctx.sessionManager.getSessionId();
     ctx.ui.setStatus("background-terminal", undefined);
     updateStatus = undefined;
-    pendingExits = [];
+    for (let index = pendingExits.length - 1; index >= 0; index--) {
+      if (pendingExits[index]?.parentSessionId === sessionId) pendingExits.splice(index, 1);
+    }
     if (currentSessionId === sessionId) currentSessionId = null;
     await manager.clearSession(sessionId);
   });
 }
 
+function notificationState(task: BackgroundTask): string {
+  return task.status === "exited" && !task.error
+    ? "completed"
+    : task.status === "failed" || task.status === "exited"
+      ? "failed"
+      : task.status === "timed_out"
+        ? "timed_out"
+        : "killed";
+}
+
 function formatExitMessage(task: BackgroundTask): string {
-  const state =
-    task.status === "exited"
-      ? "completed"
-      : task.status === "failed"
-        ? "failed"
-        : task.status === "timed_out"
-          ? "timed_out"
-          : "killed";
+  const state = notificationState(task);
   const body: string[] = [formatNotificationOutput(task)];
 
   if (task.status === "timed_out") {
@@ -1026,10 +1168,64 @@ function formatExitMessage(task: BackgroundTask): string {
   } else if (task.status === "killed") {
     body.push("The task was stopped.");
   }
+  if (task.error && task.status !== "failed") body.push(`Error: ${task.error}`);
   if (task.exitCode !== null) body.push(`Exit code: ${task.exitCode}`);
   body.push(`Full output: ${task.outputPath}`);
 
   return `<shell id="${escapeAttribute(task.id)}" state="${state}" command="${escapeAttribute(task.command)}">\n${body.join("\n\n")}\n</shell>`;
+}
+
+interface CompletionMessage {
+  content: string;
+  tasks: BackgroundTask[];
+  summarized: boolean;
+}
+
+function summaryDetails(task: BackgroundTask): Record<string, unknown> {
+  return {
+    id: task.id,
+    parentSessionId: task.parentSessionId,
+    status: task.status,
+    exitCode: task.exitCode,
+    outputPath: task.outputPath,
+    ...(task.error ? { error: truncateLine(task.error, 200).text } : {}),
+  };
+}
+
+function formatCompletionBatches(batch: BackgroundTask[]): CompletionMessage[] {
+  let full = batch.length === 1 ? "" : `${batch.length} background tasks finished:\n\n`;
+  for (let index = 0; index < batch.length; index++) {
+    const separator = batch.length > 1 && index > 0 ? "\n\n" : "";
+    const formatted = formatExitMessage(batch[index]!);
+    if (full.length + separator.length + formatted.length > COMPLETION_BATCH_CAP_CHARS) {
+      return summarizeCompletionBatches(batch);
+    }
+    full += separator + formatted;
+  }
+  return [{ content: full, tasks: batch, summarized: false }];
+}
+
+function summarizeCompletionBatches(batch: BackgroundTask[]): CompletionMessage[] {
+  const header = `${batch.length} background tasks finished; output summarized to bound this notice:`;
+  const messages: CompletionMessage[] = [];
+  let content = header;
+  let tasks: BackgroundTask[] = [];
+  for (const task of batch) {
+    const error = task.error ? `; Error: ${truncateLine(task.error, 200).text}` : "";
+    const raw = `- ${task.id}: ${notificationState(task)}; Output: ${task.outputPath}${error}`;
+    const line = raw.length > COMPLETION_BATCH_CAP_CHARS - header.length - 100
+      ? truncateLine(raw, COMPLETION_BATCH_CAP_CHARS - header.length - 100).text
+      : raw;
+    if (tasks.length > 0 && content.length + line.length + 1 > COMPLETION_BATCH_CAP_CHARS) {
+      messages.push({ content, tasks, summarized: true });
+      content = header;
+      tasks = [];
+    }
+    content += `\n${line}`;
+    tasks.push(task);
+  }
+  if (tasks.length > 0) messages.push({ content, tasks, summarized: true });
+  return messages;
 }
 
 const NOTIFICATION_TAIL_LINES = 50;

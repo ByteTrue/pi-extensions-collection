@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, readdirSync, readFileSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -9,6 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import {
   loadSubagentSettings,
   listDiscoveredAgentNames,
+  isValidAgentName,
   parsePositiveInt,
   type SubagentSettings,
 } from "./settings.js";
@@ -19,7 +20,8 @@ import {
   listBuiltinAgentNames,
   type AgentConfig,
 } from "./builtin-agents.js";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 
 export { BUILTIN_AGENTS_DIR, listBuiltinAgentNames, type AgentConfig };
 
@@ -134,6 +136,8 @@ const THROTTLE_MS = 300;
 const MAX_FALLBACK_OUTPUT_CHARS = 8192;
 export const DEFAULT_TIMEOUT_MS = 40 * 60 * 1000; // 40 minutes
 export const DEFAULT_MAX_TURNS = 100; // 100 turns
+const SETTLED_HISTORY_LIMIT = 100;
+const EXIT_BATCH_CHAR_LIMIT = 50_000;
 
 /**
  * Package-level budget defaults, exported for the `/subagent` status lines.
@@ -813,7 +817,7 @@ export function findAgentDefinition(
   agentName?: string,
   projectTrusted = true,
 ): { config: AgentConfig; found: boolean } {
-  if (!agentName) return { config: {}, found: false };
+  if (!agentName || !isValidAgentName(agentName)) return { config: {}, found: false };
   const sanitized = agentName
     .replace(/[\\/]/g, "")
     .replace(/\.\./g, "")
@@ -859,6 +863,9 @@ export function resolveAgentRole(
     throw new Error(
       "'agent' is required: pass the name of a role from the roster in the tool description.",
     );
+  if (!isValidAgentName(name)) {
+    throw new Error("Invalid agent role name: use at most 128 characters and no control or line-separator characters.");
+  }
   const { config, found } = findAgentDefinition(cwd, name, projectTrusted);
   if (found) return config;
   // A role explicitly configured in settings is still real even without a
@@ -972,11 +979,7 @@ export function resolveRunCfg(
     defaultSuffixThinking ??
     normalize(inheritedThinking);
 
-  const rawTools = item.tools?.length
-    ? item.tools
-    : roleSettings?.tools?.length
-      ? roleSettings.tools
-      : agentCfg.tools;
+  const rawTools = item.tools ?? roleSettings?.tools ?? agentCfg.tools;
   const tools =
     inheritCodemode && rawTools && rawTools.length > 0 && !rawTools.includes("codemode")
       ? ["codemode", ...rawTools]
@@ -1061,8 +1064,9 @@ export function buildPiArgs(cfg: PiRunConfig): string[] {
   } else if (cfg.thinking) {
     args.push("--thinking", cfg.thinking);
   }
-  if (cfg.tools && cfg.tools.length > 0) {
-    args.push("--tools", cfg.tools.join(","));
+  if (cfg.tools) {
+    if (cfg.tools.length === 0) args.push("--no-tools");
+    else args.push("--tools", cfg.tools.join(","));
   }
   return args;
 }
@@ -1217,6 +1221,12 @@ function finalize(r: RunState, fallback: string): string {
   return r.finalText || fallback.trim() || r.stderrTail.trim();
 }
 
+function finalizeError(r: RunState, error: string): string {
+  const reason = error.trim();
+  const partial = r.finalText || r.textTail.trim();
+  return partial && reason ? `${partial}\n\n${reason}` : partial || finalize(r, reason);
+}
+
 function formatPiOutput(stdout: string, stderr: string): string {
   let ft = "";
   for (const line of stdout.split(/\r?\n/)) {
@@ -1271,6 +1281,33 @@ interface SubagentJournal {
   startedAt: number;
 }
 
+function ensureSubagentOrphanDir(dir: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const info = lstatSync(dir);
+    if (!info.isDirectory() || info.isSymbolicLink()) return false;
+    if (process.platform !== "win32") {
+      const uid = process.getuid?.();
+      if (uid === undefined || info.uid !== uid) return false;
+      // Migrate directories created by older versions without rejecting their valid journals.
+      if ((info.mode & 0o077) !== 0) chmodSync(dir, 0o700);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readOwnedSubagentStateFile(path: string): string {
+  const info = lstatSync(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error(`unsafe subagent state file: ${path}`);
+  if (process.platform !== "win32") {
+    const uid = process.getuid?.();
+    if (uid === undefined || info.uid !== uid) throw new Error(`foreign subagent state file: ${path}`);
+  }
+  return readFileSync(path, "utf8");
+}
+
 function subagentAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -1297,7 +1334,7 @@ function subagentCommandMatches(sessionId: string, pid: number): boolean {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
-    return command.includes(sessionId);
+    return new RegExp(`(?:^|\\s)--session(?:-id)?(?:=|\\s)${sessionId}(?=\\s|$)`).test(command);
   } catch {
     return false;
   }
@@ -1321,15 +1358,16 @@ function killSubagentTree(pid: number): void {
 
 function writeSubagentJournal(sessionId: string, childPid: number): SubagentJournal | undefined {
   try {
-    mkdirSync(SUBAGENT_ORPHAN_DIR, { recursive: true });
+    if (!ensureSubagentOrphanDir(SUBAGENT_ORPHAN_DIR)) return undefined;
     const id = `sub_${randomBytes(6).toString("hex")}`;
     const journalPath = join(SUBAGENT_ORPHAN_DIR, `${id}.journal.json`);
     const startPath = join(SUBAGENT_ORPHAN_DIR, `${id}.start`);
     const startedAt = Date.now();
-    writeFileSync(startPath, subagentProcessStart(childPid));
+    writeFileSync(startPath, subagentProcessStart(childPid), { flag: "wx", mode: 0o600 });
     writeFileSync(
       journalPath,
       JSON.stringify({ sessionId, ownerPid: process.pid, childPid, startPath, startedAt }),
+      { flag: "wx", mode: 0o600 },
     );
     return { sessionId, ownerPid: process.pid, childPid, journalPath, startPath, startedAt };
   } catch {
@@ -1343,46 +1381,48 @@ function cleanupSubagentJournal(journal: Pick<SubagentJournal, "journalPath" | "
 }
 
 /** Kill children left by a Pi process that was SIGKILLed or crashed. */
-export function reapSubagentOrphans(): void {
+export function reapSubagentOrphans(orphanDir = SUBAGENT_ORPHAN_DIR): void {
+  if (!ensureSubagentOrphanDir(orphanDir)) return;
   let names: string[];
   try {
-    names = readdirSync(SUBAGENT_ORPHAN_DIR);
+    names = readdirSync(orphanDir);
   } catch {
     return;
   }
   for (const name of names) {
     if (!name.startsWith("sub_") || !name.endsWith(".journal.json")) continue;
-    const journalPath = join(SUBAGENT_ORPHAN_DIR, name);
+    const journalPath = join(orphanDir, name);
     try {
-      const parsed = JSON.parse(readFileSync(journalPath, "utf8")) as Partial<SubagentJournal>;
-      const startPath =
-        typeof parsed.startPath === "string"
-          ? parsed.startPath
-          : join(SUBAGENT_ORPHAN_DIR, `${name.slice(0, -".journal.json".length)}.start`);
+      const id = name.slice(0, -".journal.json".length);
+      if (!id.startsWith("sub_") || !SESSION_ID_PATTERN.test(id)) continue;
+      const parsed = JSON.parse(readOwnedSubagentStateFile(journalPath)) as Partial<SubagentJournal>;
+      if (typeof parsed.sessionId !== "string" || !SESSION_ID_PATTERN.test(parsed.sessionId)) continue;
+      if (typeof parsed.ownerPid !== "number" || !Number.isSafeInteger(parsed.ownerPid) || parsed.ownerPid <= 0) continue;
+      if (typeof parsed.childPid !== "number" || !Number.isSafeInteger(parsed.childPid) || parsed.childPid <= 0) continue;
+      if (typeof parsed.startedAt !== "number" || !Number.isFinite(parsed.startedAt) || parsed.startedAt <= 0) continue;
       const journal: SubagentJournal = {
-        sessionId: typeof parsed.sessionId === "string" ? parsed.sessionId : "",
-        ownerPid: typeof parsed.ownerPid === "number" ? parsed.ownerPid : -1,
-        childPid: typeof parsed.childPid === "number" ? parsed.childPid : -1,
+        sessionId: parsed.sessionId,
+        ownerPid: parsed.ownerPid,
+        childPid: parsed.childPid,
         journalPath,
-        startPath,
-        startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : 0,
+        startPath: join(orphanDir, `${id}.start`),
+        startedAt: parsed.startedAt,
       };
-      if (journal.ownerPid > 0 && subagentAlive(journal.ownerPid)) continue;
+      if (subagentAlive(journal.ownerPid)) continue;
       if (journal.childPid <= 0 || !subagentAlive(journal.childPid)) {
         cleanupSubagentJournal(journal);
         continue;
       }
-      const recordedStart = (() => {
-        try {
-          return readFileSync(journal.startPath, "utf8").trim();
-        } catch {
-          return "";
-        }
-      })();
+      let recordedStart = "";
+      try {
+        recordedStart = readOwnedSubagentStateFile(journal.startPath).trim();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+      }
       const currentStart = subagentProcessStart(journal.childPid);
-      const verified =
-        (recordedStart !== "" && currentStart !== "" && recordedStart === currentStart) ||
-        subagentCommandMatches(journal.sessionId, journal.childPid);
+      const verified = recordedStart !== "" && currentStart !== ""
+        ? recordedStart === currentStart
+        : subagentCommandMatches(journal.sessionId, journal.childPid);
       if (!verified) {
         if (journal.startedAt > 0 && Date.now() - journal.startedAt > 7 * 24 * 60 * 60 * 1000) {
           cleanupSubagentJournal(journal);
@@ -1552,7 +1592,7 @@ export function runPi(
           ? `timed out after ${fmtDur(elapsedMs)} (limit: ${fmtDur(timeoutMs)}, turns: ${state.usage.turns})`
           : `reached maximum limit of ${maxTurns} turns (turns: ${state.usage.turns})`;
       const partialResult = finalize(state, formatPiOutput(out, err));
-      const notice = `\n\n---\n⚠️ [Subagent session ${state.sessionId} paused: ${reasonText}]\n💡 To resume this session from where it left off, call: subagent({ agent: ${JSON.stringify(state.agent)}, description: "Continue remaining work", resume: ${JSON.stringify(state.sessionId)}, task: "Continue the remaining work" })`;
+      const notice = `\n\n---\n⚠️ [Subagent session ${state.sessionId} paused: ${reasonText}]\n💡 To resume this session from where it left off, call: subagent({ agent: ${JSON.stringify(state.agent)}, description: "Continue remaining work", resume: ${JSON.stringify(state.sessionId)}, cwd: ${JSON.stringify(targetCwd)}, task: "Continue the remaining work" })`;
       return {
         output: partialResult ? `${partialResult}${notice}` : notice.trim(),
         failed: false,
@@ -1618,7 +1658,7 @@ export function runPi(
       const evt = parseJsonEvent(line);
       if (evt && applyEvent(state, evt)) {
         emit();
-        if (state.usage.turns >= maxTurns && !aborted) {
+        if (evt.type === "turn_start" && state.usage.turns >= maxTurns && !aborted) {
           abort("max_turns");
         }
       }
@@ -1662,7 +1702,7 @@ export function runPi(
       state.status = aborted ? "cancelled" : "failed";
       state.errorMessage = e instanceof Error ? e.message : String(e);
       state.finishedAt = Date.now();
-      done({ output: finalize(state, state.errorMessage), failed: true });
+      done({ output: finalizeError(state, state.errorMessage), failed: true });
     });
 
     cli.on("close", (code) => {
@@ -1704,7 +1744,7 @@ export function runPi(
         errBrief.length > MAX_FALLBACK_OUTPUT_CHARS
           ? errBrief.slice(-MAX_FALLBACK_OUTPUT_CHARS)
           : errBrief;
-      done({ output: finalize(state, state.errorMessage), failed: true });
+      done({ output: finalizeError(state, state.errorMessage), failed: true });
     });
 
     cli.stdin?.end(prompt);
@@ -1798,6 +1838,7 @@ export interface SubagentTaskRecord {
   id: string;
   /** Child session id (sub_…); child transcript id. */
   sessionId?: string;
+  cwd?: string;
   parentSessionId: string;
   description: string;
   agent?: string;
@@ -1811,6 +1852,7 @@ export interface SubagentTaskRecord {
   pauseReason?: "timeout" | "max_turns";
   /** Latest streamed progress; the single source for status bar and menu views. */
   progress?: ProgressDetails;
+  notificationPending?: boolean;
 }
 
 export type BackgroundSubagentTask = SubagentTaskRecord;
@@ -1828,6 +1870,7 @@ export function toMessageDetails(
     controller: _controller,
     done: _done,
     notifyOnExit: _notifyOnExit,
+    notificationPending: _notificationPending,
     progress: _progress,
     ...safe
   } = task;
@@ -1987,9 +2030,11 @@ export class SubagentTaskManager {
     failed: boolean,
     cancelled = false,
     paused = false,
+    progress?: ProgressDetails,
   ): void {
     const t = this.tasks.get(id);
     if (!t) return;
+    if (progress) t.progress = cloneProgress(progress);
     t.status = cancelled
       ? "cancelled"
       : paused
@@ -2001,10 +2046,27 @@ export class SubagentTaskManager {
     t.finishedAt = Date.now();
     this.emitChange(t);
     if (t.notifyOnExit) {
+      t.notificationPending = true;
       try {
         this.exitHandler?.(t);
       } catch {}
     }
+    this.pruneSettledHistory();
+  }
+
+  notificationDelivered(id: string): void {
+    const task = this.tasks.get(id);
+    if (task) {
+      task.notificationPending = false;
+    }
+    this.pruneSettledHistory();
+  }
+
+  private pruneSettledHistory(): void {
+    const removable = Array.from(this.tasks.values())
+      .filter((task) => task.status !== "running" && (!task.notifyOnExit || task.notificationPending === false))
+      .sort((a, b) => (a.finishedAt ?? a.startedAt) - (b.finishedAt ?? b.startedAt));
+    for (const task of removable.slice(0, -SETTLED_HISTORY_LIMIT)) this.tasks.delete(task.id);
   }
 
   list(parentSessionId?: string): SubagentTaskRecord[] {
@@ -2027,7 +2089,7 @@ export class SubagentTaskManager {
     );
     for (const t of sessionTasks) {
       t.notifyOnExit = false;
-      if (t.status === "running") t.controller.abort();
+      if (t.status === "running") this.stop(t.id);
       this.tasks.delete(t.id);
     }
     // Do not hang Pi on a child that refuses to die; its journal stays for the
@@ -2178,7 +2240,7 @@ export async function runSubagent(
     const role = item.agent ?? "subagent";
     const sessionId =
       item.resume || item.id || `sub_${randomBytes(6).toString("hex")}`;
-    const agentCfg = resolveAgentRole(cwd, item.agent, subagentSettings);
+    const agentCfg = resolveAgentRole(cwd, item.agent, subagentSettings, projectTrusted);
     const runCfg = resolveRunCfg(
       { ...item, id: sessionId },
       agentCfg,
@@ -2228,6 +2290,7 @@ export default function subagentExtension(pi: {
       handler: (ctx: PiExtensionContext) => unknown;
     },
   ) => void;
+  registerMessageRenderer?: ExtensionAPI["registerMessageRenderer"];
   sendMessage?: (
     message: {
       customType?: string;
@@ -2244,12 +2307,31 @@ export default function subagentExtension(pi: {
   getThinkingLevel?: () => string;
 }): void {
   if (process.env.PI_SUBAGENT_CHILD === "1") return;
+  pi.registerMessageRenderer?.("subagent-exit", (message, { expanded, outputPad, keyText }, theme) => {
+    const content = typeof message.content === "string" ? message.content : "";
+    const label = theme.bold(theme.fg("customMessageLabel", `[${message.customType}]`));
+    const summary = oneLine(content.split("\n").find((line) => line.trim()) ?? "(no output)", 160);
+    const text = expanded
+      ? `${label}\n${content}`
+      : `${label} ${summary} ${theme.fg("dim", `(${keyText("app.tools.expand")} to expand)`)}`;
+    const box = new Box(outputPad, 1, (value) => theme.bg("customMessageBg", value));
+    box.addChild(new Text(text, 0, 0));
+    return box;
+  });
   reapSubagentOrphans();
 
   let currentSessionId: string | null = null;
   let updateStatus: (() => void) | undefined;
   let agentBusy = false;
-  let pendingExits: BackgroundSubagentTask[] = [];
+  const pendingKey = Symbol.for("@bytetrue/pi-subagent.pending-exits");
+  const pendingStore = globalThis as unknown as Record<symbol, { tasks: BackgroundSubagentTask[]; legacyAdopted?: boolean } | undefined>;
+  const pendingState = (pendingStore[pendingKey] ??= { tasks: [] });
+  const pendingExits = pendingState.tasks;
+  const enqueueExit = (task: BackgroundSubagentTask) => {
+    const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
+    if (index >= 0) pendingExits[index] = task;
+    else pendingExits.push(task);
+  };
   let statusTicker: ReturnType<typeof setInterval> | undefined;
   let activeParentModel: string | undefined = undefined;
   let activeParentThinking: string | undefined = undefined;
@@ -2294,35 +2376,84 @@ export default function subagentExtension(pi: {
     );
   };
 
+  type CompletionMessage = { content: string; tasks: BackgroundSubagentTask[]; summarized: boolean };
+  const summaryDetails = (task: BackgroundSubagentTask) =>
+    buildByspaceReportRecord(task, sessionLogPath);
+  const summarizeCompletionBatches = (batch: BackgroundSubagentTask[]): CompletionMessage[] => {
+    const header = `${batch.length} background subagent tasks completed (full results omitted):`;
+    const messages: CompletionMessage[] = [];
+    let content = header;
+    let tasks: BackgroundSubagentTask[] = [];
+    for (const task of batch) {
+      const state = task.status === "succeeded" ? "completed" : task.status;
+      const details = summaryDetails(task);
+      const sessionFile = typeof details.sessionFile === "string" ? details.sessionFile : undefined;
+      const sessionId = typeof details.sessionId === "string" ? details.sessionId : undefined;
+      const cwd = typeof details.cwd === "string" ? details.cwd : undefined;
+      const location = sessionFile ?? (sessionId && cwd ? `${sessionId} (cwd: ${cwd})` : sessionId ?? cwd ?? "unavailable");
+      const raw = `- ${task.id} — ${state}; session log: ${location}`;
+      const line = raw.length > EXIT_BATCH_CHAR_LIMIT - header.length - 100
+        ? oneLine(raw, EXIT_BATCH_CHAR_LIMIT - header.length - 100)
+        : raw;
+      if (tasks.length > 0 && content.length + line.length + 1 > EXIT_BATCH_CHAR_LIMIT) {
+        messages.push({ content, tasks, summarized: true });
+        content = header;
+        tasks = [];
+      }
+      content += `\n${line}`;
+      tasks.push(task);
+    }
+    if (tasks.length > 0) messages.push({ content, tasks, summarized: true });
+    return messages;
+  };
+  const formatCompletionBatches = (batch: BackgroundSubagentTask[]): CompletionMessage[] => {
+    let full = batch.length === 1 ? "" : `${batch.length} background subagent tasks completed:\n\n`;
+    for (let index = 0; index < batch.length; index++) {
+      const separator = batch.length > 1 && index > 0 ? "\n\n---\n\n" : "";
+      const formatted = formatSubagentExitMessage(batch[index]!);
+      if (full.length + separator.length + formatted.length > EXIT_BATCH_CHAR_LIMIT) {
+        return summarizeCompletionBatches(batch);
+      }
+      full += separator + formatted;
+    }
+    return [{ content: full, tasks: batch, summarized: false }];
+  };
+
   const flushPendingExits = () => {
-    const batch = pendingExits;
-    pendingExits = [];
-    const first = batch[0];
-    if (!first) return;
-    const content =
-      batch.length === 1
-        ? formatSubagentExitMessage(first)
-        : `${batch.length} background subagent tasks completed:\n\n${batch.map(formatSubagentExitMessage).join("\n\n---\n\n")}`;
-    pi.sendMessage?.(
-      {
-        customType: "subagent-exit",
-        content,
-        display: true,
-        details:
-          batch.length === 1
-            ? toMessageDetails(first)
-            : batch.map(toMessageDetails),
-      },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
+    if (!currentSessionId || !pi.sendMessage) return;
+    const batch = pendingExits.filter((task) => task.parentSessionId === currentSessionId);
+    if (batch.length === 0) return;
+    for (const completion of formatCompletionBatches(batch)) {
+      const tasks = completion.tasks;
+      try {
+        pi.sendMessage(
+          {
+            customType: "subagent-exit",
+            content: completion.content,
+            display: true,
+            details: completion.summarized
+              ? tasks.length === 1 ? summaryDetails(tasks[0]!) : tasks.map(summaryDetails)
+              : tasks.length === 1 ? toMessageDetails(tasks[0]!) : tasks.map(toMessageDetails),
+          },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      } catch {
+        break;
+      }
+      for (const task of tasks) {
+        subagentManager.notificationDelivered?.(task.id);
+        const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
+        if (index >= 0) pendingExits.splice(index, 1);
+      }
+    }
   };
 
   const byspaceReporter = new ByspaceReporter();
   subagentManager.init(
     (task) => {
+      enqueueExit(task);
       if (!currentSessionId || task.parentSessionId !== currentSessionId)
         return;
-      pendingExits.push(task);
       if (!agentBusy) flushPendingExits();
     },
     (task) => {
@@ -2331,6 +2462,13 @@ export default function subagentExtension(pi: {
         byspaceReporter.report(buildByspaceReportRecord(task, sessionLogPath));
     },
   );
+  // shortcut: legacy records lack delivery state, so first upgrade may replay an old notice; exactly-once needs a host handoff API.
+  if (!pendingState.legacyAdopted) {
+    pendingState.legacyAdopted = true;
+    for (const task of subagentManager.list()) {
+      if (task.status !== "running" && task.notifyOnExit && task.notificationPending === undefined) enqueueExit(task);
+    }
+  }
 
   pi.registerCommand?.("subagent", {
     description: "Configure subagent default/role models, thinking levels and budgets",
@@ -2492,6 +2630,7 @@ export default function subagentExtension(pi: {
             res.failed,
             controller.signal.aborted,
             res.paused,
+            res.details,
           );
         })
         .catch((err) => {
@@ -2504,6 +2643,7 @@ export default function subagentExtension(pi: {
           );
         });
 
+      record.cwd = launchCwd;
       record.done = execution;
       subagentManager.register(record);
 
@@ -2646,6 +2786,9 @@ export default function subagentExtension(pi: {
     trackSessionModel(ctx?.model);
     const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "default";
     currentSessionId = sessionId;
+    for (const task of subagentManager.list(sessionId)) {
+      if (task.notificationPending) enqueueExit(task);
+    }
     // Progress events are throttled and stop while the child thinks, so a 1s ticker
     // keeps the elapsed time honest while anything runs; it is cleared when idle.
     updateStatus = () => {
@@ -2660,6 +2803,7 @@ export default function subagentExtension(pi: {
       }
     };
     updateStatus();
+    if (!agentBusy) flushPendingExits();
   });
 
   pi.on?.("before_agent_start", (_event, ctx) => {
@@ -2701,7 +2845,9 @@ export default function subagentExtension(pi: {
       statusTicker = undefined;
     }
     updateStatus = undefined;
-    pendingExits = [];
+    for (let index = pendingExits.length - 1; index >= 0; index--) {
+      if (pendingExits[index]?.parentSessionId === sessionId) pendingExits.splice(index, 1);
+    }
     if (currentSessionId === sessionId) currentSessionId = null;
     await subagentManager.clearSession(sessionId);
   });

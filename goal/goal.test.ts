@@ -352,14 +352,15 @@ describe("continuation loop", () => {
     expect(lastGoalEntry(h.entries)).toMatchObject({ status: "active", runs: 1 });
   });
 
-  it("pauses when the user interrupted the run", async () => {
+  it("pauses when Pi emits the real aborted settled lifecycle", async () => {
     const h = harness();
     await command(h, "Do the thing");
-    runTurn(h, true);
+    h.handlers.agent_start!({ type: "agent_start" }, h.ctx);
 
-    await settle(h, { outcome: "aborted" });
+    await h.handlers.agent_settled!({ type: "agent_settled", aborted: true }, h.ctx);
 
     expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused" });
+    expect(h.notices.at(-1)?.text).toContain("interrupted");
   });
 
   it("stays out of the way when user input is already queued", async () => {

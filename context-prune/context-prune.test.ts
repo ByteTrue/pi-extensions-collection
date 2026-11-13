@@ -149,7 +149,18 @@ describe("module surface", () => {
 					content: [{ type: "toolCall", id: "reduce-call", name: "ctx_reduce", arguments: { ids: ["recent-reduced"] } }],
 				},
 			},
-			{ type: "message", id: "e3", message: { role: "user", content: "continue" } },
+			{
+				type: "message",
+				id: "e3",
+				message: {
+					role: "toolResult",
+					toolCallId: "reduce-call",
+					toolName: "ctx_reduce",
+					isError: false,
+					content: [{ type: "text", text: "Queued 1 drop." }],
+				},
+			},
+			{ type: "message", id: "e4", message: { role: "user", content: "continue" } },
 		];
 		const { handlers, ctx } = harness({ entries });
 		handlers["session_start"]?.({}, ctx);
@@ -158,6 +169,37 @@ describe("module surface", () => {
 		const msgs = [bigResult("recent-reduced", 2500), { role: "assistant", content: "working" }];
 		handlers["context"]?.({ messages: msgs }, ctx);
 		expect(msgs[0]?.content).toEqual([{ type: "text", text: "[pruned recent-reduced]" }]);
+	});
+
+	it("does not restore a ctx_reduce call that was aborted", () => {
+		const entries = [
+			{ type: "message", id: "e1", message: bigResult("cancel-me", 2500) },
+			{
+				type: "message",
+				id: "e2",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "aborted-reduce", name: "ctx_reduce", arguments: { ids: ["cancel-me"] } }],
+				},
+			},
+			{
+				type: "message",
+				id: "e3",
+				message: {
+					role: "toolResult",
+					toolCallId: "aborted-reduce",
+					toolName: "ctx_reduce",
+					isError: true,
+					content: [{ type: "text", text: "Operation aborted" }],
+				},
+			},
+		];
+		const { handlers, ctx } = harness({ entries });
+		handlers["session_start"]?.({}, ctx);
+
+		const msgs = [bigResult("cancel-me", 2500), { role: "assistant", content: "working" }];
+		handlers["context"]?.({ messages: msgs }, ctx);
+		expect(firstTextLength(msgs[0])).toBe(2500);
 	});
 });
 

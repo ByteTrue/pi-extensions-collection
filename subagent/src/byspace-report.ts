@@ -30,11 +30,13 @@ function childSession(
     | undefined,
 ): { sessionId?: string; cwd?: string; sessionFile?: string } {
   const run = record.progress?.runs[0];
-  if (!run?.sessionId) return {};
-  const sessionFile = resolveSessionFile?.(run);
+  const sessionId = run?.sessionId ?? record.sessionId;
+  if (!sessionId) return {};
+  const cwd = run?.cwd ?? record.cwd;
+  const sessionFile = run ? resolveSessionFile?.(run) : undefined;
   return {
-    sessionId: run.sessionId,
-    ...(run.cwd ? { cwd: run.cwd } : {}),
+    sessionId,
+    ...(cwd ? { cwd } : {}),
     ...(sessionFile ? { sessionFile } : {}),
   };
 }
@@ -84,14 +86,24 @@ export class ByspaceReporter {
     } else {
       this.lastRunning.delete(record.id);
     }
-    try {
-      void fetch(this.url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token: this.token, observations: [record] }),
-      }).catch(() => {});
-    } catch {
-      /* fetch may throw synchronously in exotic runtimes; never propagate */
-    }
+    void (async () => {
+      const attempts = record.status === "running" ? 1 : 2;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        try {
+          const response = await fetch(this.url!, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ token: this.token, observations: [record] }),
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!response.ok) throw new Error(`BySpace report failed with HTTP ${response.status}`);
+          return;
+        } catch {
+          // Retry only terminal states; running progress remains best-effort.
+        }
+      }
+      // A failed running snapshot must not suppress the next identical attempt.
+      this.lastRunning.delete(record.id);
+    })().catch(() => {})
   }
 }

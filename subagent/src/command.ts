@@ -1,6 +1,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   loadSubagentSettings,
+  loadSubagentSettingsForScope,
   updateSubagentSettings,
   describeSettingsPathForScope,
   listDiscoveredAgentNames,
@@ -253,7 +254,7 @@ async function configureDefaultMenu(ctx: ExtensionCommandContext): Promise<void>
   const scope = await chooseScope(ctx);
   if (!scope) return;
 
-  const currentSettings = loadSubagentSettings(ctx.cwd, ctx.isProjectTrusted());
+  const currentSettings = loadSubagentSettingsForScope(ctx.cwd, scope);
 
   const model = await pickModel(ctx, currentSettings.defaultModel);
   if (model === undefined) return;
@@ -277,7 +278,7 @@ async function configureBudgetMenu(ctx: ExtensionCommandContext): Promise<void> 
   const scope = await chooseScope(ctx);
   if (!scope) return;
 
-  const currentSettings = loadSubagentSettings(ctx.cwd, ctx.isProjectTrusted());
+  const currentSettings = loadSubagentSettingsForScope(ctx.cwd, scope);
 
   const maxTurns = await pickBudgetNumber(
     ctx,
@@ -335,7 +336,7 @@ async function configureRoleMenu(ctx: ExtensionCommandContext): Promise<void> {
     const scope = await chooseScope(ctx);
     if (!scope) continue;
 
-    const currentSettings = loadSubagentSettings(ctx.cwd, ctx.isProjectTrusted());
+    const currentSettings = loadSubagentSettingsForScope(ctx.cwd, scope);
     const existingRole = currentSettings.agents?.[roleName] ?? {};
 
     // Issue 102 (decision D2): no provider is hardcoded, so the menu nudges
@@ -505,11 +506,13 @@ async function viewSingleTaskMenu(
       const childId =
         task.sessionId ?? task.progress?.runs[0]?.sessionId ?? task.id;
       const agent = task.agent ?? task.progress?.runs[0]?.agent;
+      const cwd = task.cwd ?? task.progress?.runs[0]?.cwd;
       const resumeCode = [
         "subagent({",
         `  agent: ${JSON.stringify(agent ?? "<role>")},`,
         `  description: ${JSON.stringify(task.description)},`,
         `  resume: ${JSON.stringify(childId)},`,
+        ...(cwd ? [`  cwd: ${JSON.stringify(cwd)},`] : []),
         '  task: "Continue the remaining work"',
         "})",
       ].join("\n");

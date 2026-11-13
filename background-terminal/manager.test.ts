@@ -11,6 +11,7 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     createWriteStream: vi.fn((...args: Parameters<typeof actual.createWriteStream>) => actual.createWriteStream(...args)),
+    rmSync: vi.fn((...args: Parameters<typeof actual.rmSync>) => actual.rmSync(...args)),
   };
 });
 import * as fs from "node:fs";
@@ -156,6 +157,20 @@ describe("BackgroundManager", () => {
     // Snapshots are copies: mutating one must not reach into the manager's own state.
     (started as { status: string }).status = "tampered";
     expect(manager.get(started.id, SESSION_A)?.status).toBe("running");
+  });
+
+  it("still reports completion when metadata cleanup fails", async () => {
+    const manager = createManager();
+    const exits: BackgroundTask[] = [];
+    manager.init((task) => exits.push(task));
+    vi.mocked(fs.rmSync).mockImplementationOnce(() => {
+      throw new Error("EACCES: simulated metadata cleanup failure");
+    });
+
+    manager.start('node -e ""', process.cwd(), SESSION_A);
+
+    await vi.waitFor(() => expect(exits).toHaveLength(1), { timeout: 8000 });
+    expect(exits[0]?.status).toBe("exited");
   });
 
   it("records a write failure on the task instead of letting the stream error crash the process", async () => {

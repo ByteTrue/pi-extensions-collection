@@ -457,7 +457,9 @@ export function registerGoal(pi: ExtensionAPI): void {
   // prompt resolves, so a run started from here would be torn down mid-loop. Holding the
   // handler open until the run settles keeps `/goal` usable headlessly; TUI/RPC return at once.
   const settleWaiters: (() => void)[] = [];
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (event, ctx) => {
+    // Pi skips agent_before_settle for aborted runs, so pause at the real final boundary.
+    if (event.aborted) pauseGoal(ctx, "the run was interrupted");
     // If the boundary committed a continuation but pi suppressed it (the run was
     // aborted), the flag must not classify the next user run as a continuation.
     continuationInjected = false;

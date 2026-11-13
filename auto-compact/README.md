@@ -9,6 +9,11 @@ Compaction itself stays Pi's own: synchronous, on the current model. This
 extension only decides when to start it for large windows, and registers no
 tools, commands, or prompt sections.
 
+The check runs at the final `agent_settled` boundary, not after every automatic
+continuation. A continuous goal loop therefore keeps Pi's default compaction
+policy until the loop stops; the 400k rule is not a hard per-turn limit. Aborted
+runs do not trigger compaction.
+
 ## Install
 
 Part of [pi-extensions-collection](../#install):

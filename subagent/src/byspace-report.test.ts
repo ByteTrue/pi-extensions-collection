@@ -65,6 +65,16 @@ describe("buildByspaceReportRecord", () => {
     });
   });
 
+  it("uses launch pointers when a fast child never emitted progress", () => {
+    const task = makeTask({ sessionId: "launch-session", cwd: "/launch-cwd" });
+    expect(buildByspaceReportRecord(task)).toEqual({
+      id: "sub_abc123",
+      status: "running",
+      sessionId: "launch-session",
+      cwd: "/launch-cwd",
+    });
+  });
+
   it("omits session fields before the child reports its session", () => {
     expect(buildByspaceReportRecord(makeTask())).toEqual({
       id: "sub_abc123",
@@ -135,6 +145,48 @@ describe("ByspaceReporter", () => {
     vi.setSystemTime(1200);
     reporter.report({ id: "sub_1", status: "succeeded" });
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("allows an identical running report after a rejected attempt", async () => {
+    fetchMock
+      .mockRejectedValueOnce(new Error("down"))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const reporter = reporterWith({
+      BYSPACE_SUBAGENT_REPORT_URL: "http://x/report",
+      BYSPACE_SUBAGENT_REPORT_TOKEN: "tok",
+    });
+    const record = { id: "sub_1", status: "running" } as const;
+    reporter.report(record);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    reporter.report(record);
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2), { timeout: 500 });
+  });
+
+  it("retries a terminal report after rejection", async () => {
+    fetchMock
+      .mockRejectedValueOnce(new Error("down"))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const reporter = reporterWith({
+      BYSPACE_SUBAGENT_REPORT_URL: "http://x/report",
+      BYSPACE_SUBAGENT_REPORT_TOKEN: "tok",
+    });
+    reporter.report({ id: "sub_1", status: "failed" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2), { timeout: 500 });
+  });
+
+  it("treats a non-OK terminal response as failed and retries it", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(null, { status: 500 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const reporter = reporterWith({
+      BYSPACE_SUBAGENT_REPORT_URL: "http://x/report",
+      BYSPACE_SUBAGENT_REPORT_TOKEN: "tok",
+    });
+    reporter.report({ id: "sub_1", status: "failed" });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2), { timeout: 500 });
   });
 
   it("swallows fetch rejections", async () => {

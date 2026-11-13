@@ -30,3 +30,12 @@ created: 2026-11-11
 - 临时 agent 目录 + `PI_CODING_AGENT_DIR=...`，把仓库软链到 `extensions/<名>`，跑 `pi --help`。
 - 验证清单真的加载：写 10 行 Node 脚本调 `discoverAndLoadExtensions([], cwd, agentDir)`，打印每个扩展的 `tools` / `commands` 与 `errors`。
 - 验证某项被关掉：在同一目录放一个注册同名工具的探针扩展，看冲突报错是否消失。
+
+## 宿主生命周期与工具结果语义（2026-11-12，Pi 1.5.0）
+
+- Escape 中止的 run 不经过 `agent_before_settle`，而是直接到 `agent_settled {aborted:true}`。goal 的暂停测试必须驱动后一条路径，见 `goal/goal.test.ts`。
+- Pi 在当前模型 turn 的工具结束后才发下一次 `turn_start`。子代理的轮次预算应在这里暂停，不能在 assistant `message_end` 后立即杀进程，否则工具还没执行；见 `subagent/src/run-lifecycle.test.ts`。
+- `tool_result` 处理器替换 `content` 时，如果没有同时返回 `structuredContent`，ExtensionRunner 会删除该字段。集成验证走真实 SDK + ExtensionRunner，见 `context-prune/structured-content.test.ts`。
+- RPC 的 select/input 支持 `opts.signal`，而 RPC abort 会等待 agent idle；工具不把 AbortSignal 传给对话框就可能死等。见 `ask-user/ask-user.test.ts`。
+- `--no-tools` 不是 `--tools` 的空值形式。它设置 `noTools: "all"`，初始工具和 MCP allowlist 都为空；省略 `--tools` 则恢复默认工具。argv 验证见 `subagent/src/security.test.ts`。
+- crash reaper 的目录权限不能替代文件检查：journal/pid/start 必须是当前用户 regular file，符号链接要跳过整份记录。recorded/current start 均存在时，不相等已经证明 PID 复用，命令行 marker 不能覆盖这个矛盾；只有 start 不可取得时才回退。真实进程反例见两个 `reap.test.ts`。

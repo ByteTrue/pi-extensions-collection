@@ -58,6 +58,10 @@ Subagent configuration lives in this package's own file, not in pi's `settings.j
 - Global: `<pkg-config root>/subagent/settings.json`, where `<pkg-config root>` is `$PI_PKG_CFG_DIR` or `<agent dir>/pi-pkg-cfg` (`<agent dir>` is `$PI_CODING_AGENT_DIR` or `~/.pi/agent`).
 - Project: `<project>/.pi/pi-pkg-cfg/subagent/settings.json`, only written when you pick the project scope in `/subagent` and the project is trusted.
 
+Configuration menus edit the raw values in the selected scope, not the merged
+global/project execution view. "Keep current" therefore cannot copy another
+scope's override into the file you are editing.
+
 The file holds the section directly:
 
 ```json
@@ -83,9 +87,9 @@ Note: in print mode (`pi -p`, `--mode json`) the process exits after one turn, s
 
 Note: the `subagent-exit` completion notice is queued while the parent agent is busy in a turn (delivered in a batch at `agent_settled`). If the parent turn runs for hours, notices accumulate for that duration — check `subagent_status` for live status in the meantime.
 
-The notice uses opencode's shape: `<subagent sessionID="sub_…" state="completed|paused|failed|cancelled" description="…">` around the child's full result (or "Subagent completed without a text response."). It also lists background work still running in the parent session. Background tasks started by the child itself stop when its `pi -p` process exits, and the notice says so.
+The notice uses opencode's shape: `<subagent sessionID="sub_…" state="completed|paused|failed|cancelled" description="…">` around the child's full result (or "Subagent completed without a text response."). Fatal child errors are appended to any partial answer. In Pi's TUI, completion messages default to a one-line summary; Ctrl+O expands the full notice. It also lists background work still running in the parent session. Background tasks started by the child itself stop when its `pi -p` process exits, and the notice says so. Final progress always includes the launch session id and cwd, including fast tasks with no earlier progress event. The latest 100 settled tasks are retained after notification; running and unnotified records are not evicted. Each completion message is capped at 50,000 characters. Overflow switches to ID/state/session-log summaries and splits them across messages without omitting tasks. Summary `details` retains only the BySpace terminal fields (`id`, raw `status`, `sessionId`, `cwd`, `sessionFile` when known), never output/progress. Formatting switches incrementally instead of joining the whole batch first. A process-global pending queue covers reload handoff and send retries; first upgrade from a legacy manager reconciles old settled records at-least-once, so an old notice may repeat once because legacy records have no delivery marker. BySpace reporting sends a cancelled snapshot on session shutdown, clears failed running-report dedupe state, and retries terminal reports once with a five-second timeout.
 
-A child that outlives a SIGKILLed or crashed parent writes a journal under `$TMPDIR/pi-subagent` (owner pid, child pid, start time). The next extension load reaps children whose owner is gone, after verifying the start time or the child's `sub_…` session id; the journal is removed. Until that next start the child process may keep running — session_shutdown cannot run after SIGKILL.
+A child that outlives a SIGKILLed or crashed parent writes a journal under `$TMPDIR/pi-subagent` (owner pid, child pid, start time). The directory must be current-user-owned and private (`0700` on POSIX), and journals must have valid IDs and PIDs; cleanup paths come from the validated journal filename, not path strings inside the JSON. The next extension load reaps children whose owner is gone. Journal/start files must be current-user-owned regular files, never symlinks. Recorded and current start times must match when both are available; only an unavailable start time falls back to a full `--session <id>` command argument match. Then the journal is removed. Until that next start the child process may keep running — session_shutdown cannot run after SIGKILL.
 
 #### Parameters
 
@@ -94,11 +98,11 @@ A child that outlives a SIGKILLed or crashed parent writes a journal under `$TMP
 | `task` | `string` | **Yes** | The task instruction / prompt. |
 | `agent` | `string` | **Yes** | Role name from the roster embedded in the tool description: the built-in `reviewer` (independent adversarial review; `read, bash`, maximum thinking), or any custom `.pi/agents/<name>.md`. A name matching no document is rejected with the list of available roles; omitting it is an error. |
 | `description` | `string` | **Yes** | Short 3-5 word label. It titles the child session, the progress card, and the completion notice. |
-| `tools` | `string[]` | No | Optional tool allowlist (e.g. `["read", "grep", "find"]`). |
+| `tools` | `string[]` | No | Optional tool allowlist (e.g. `["read", "grep", "find"]`). An explicit `[]` starts the child with `--no-tools`; omit the field to inherit role/default tools. |
 | `cwd` | `string` | No | Optional working directory for the task. |
-| `resume` | `string` | No | Resume a previous subagent session by id (must start with `sub_`; sessions not created by this extension are rejected). |
+| `resume` | `string` | No | Resume a previous subagent session by id (must start with `sub_`; sessions not created by this extension are rejected). Generated resume instructions also include the resolved child `cwd`. |
 | `timeoutMs` | `number` | No | Timeout in ms. Default: the configured global default (package default 2400000 = 40 minutes); a role document's own `timeoutMs` applies to that role. `0` and negative values fall back to the default, so the ceiling cannot be switched off. Enforced redundantly: a one-shot timer, a per-event deadline check, and a 1s watchdog — a late timer cannot stall the abort (ff 108). |
-| `maxTurns` | `number` | No | Turn limit before pausing. Default: the configured global default (package default 100); a role document's own `maxTurns` applies to that role. `0` and negative values fall back to the default. |
+| `maxTurns` | `number` | No | Turn limit before pausing at the next `turn_start`, after the current turn's tools finish. Natural completion exactly at the limit succeeds. Default: the configured global default (package default 100); a role document's own `maxTurns` applies to that role. `0` and negative values fall back to the default. |
 
 #### Usage Example
 
@@ -179,7 +183,7 @@ tools: read, grep, find
 
 The roster is built when the extension registers the tool. Agent documents added mid-session still resolve immediately when passed as `agent`, but they appear in the advertised roster after a `/reload`. Roles without a `description:` use the default trigger sentence "This subagent should only be called when explicitly requested."
 
-Project-only role names are listed, but their document is not read at load: an untrusted project's `description:` must not enter the tool prompt. Such roles show the default trigger sentence in the roster; the document (prompt, tools, model) is read only when the project is trusted and the role is actually called.
+Project-only role names are listed, but their document is not read at load: an untrusted project's `description:` must not enter the tool prompt. Such roles show the default trigger sentence in the roster; the document (prompt, tools, model) is read only when the project is trusted and the role is actually called. Role names may contain ordinary spaces, dots, and Unicode, but are capped at 128 characters and reject control and line-separator characters in both discovery and resolution.
 
 #### Extension tools and role documents
 

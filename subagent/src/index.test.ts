@@ -39,6 +39,7 @@ import {
   updateSubagentSettings,
   listDiscoveredAgentNames,
 } from "./settings.js";
+import { buildByspaceReportRecord } from "./byspace-report.js";
 import { writeFileSync, unlinkSync, mkdirSync, existsSync, rmSync, readFileSync, mkdtempSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -228,6 +229,7 @@ describe("subagent unit tests", () => {
     );
     expect(defaultCfg.tools).toBeUndefined();
     expect(buildPiArgs(defaultCfg)).not.toContain("--tools");
+    expect(buildPiArgs(defaultCfg)).not.toContain("--no-tools");
 
     // 5. inheritCodemode=false: unchanged
     const unchangedCfg = resolveRunCfg(
@@ -1616,6 +1618,7 @@ const FAKE_PI_CJS = [
   'setInterval(() => {',
   '  n += 1;',
   '  log("turn " + n);',
+  '  if (n > 1) process.stdout.write(JSON.stringify({ type: "turn_start" }) + "\\n");',
   '  process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "turn " + n }], usage: { input: 1, output: 1, cost: { total: 0 }, totalTokens: 2 } } }) + "\\n");',
   '}, 120);',
   'process.on("SIGTERM", () => { log("sigterm"); try { process.kill(gc.pid); } catch {} process.exit(0); });',
@@ -1709,6 +1712,14 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
       const nameIndex = argv.indexOf("--name");
       expect(nameIndex).toBeGreaterThan(-1);
       expect(argv[nameIndex + 1]).toBe("pointer check");
+
+      const task = subagentManager.get(String(details.id));
+      expect(task?.progress?.final).toBe(true);
+      expect(buildByspaceReportRecord(task!)).toMatchObject({
+        status: "succeeded",
+        sessionId: details.sessionId,
+        cwd: resolve(dir),
+      });
     } finally {
       if (prev === undefined) delete process.env.PI_CLI_JS;
       else process.env.PI_CLI_JS = prev;

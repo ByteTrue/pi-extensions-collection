@@ -21,7 +21,8 @@ export function shouldCompact(usage: { tokens: number | null; contextWindow: num
 }
 
 export function registerAutoCompact(pi: ExtensionAPI): void {
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("agent_settled", async (event, ctx) => {
+		if (event.aborted) return;
 		const usage = ctx.getContextUsage();
 		if (!usage || !shouldCompact(usage)) return;
 		// ctx.compact() is fire-and-forget inside Pi; awaiting its callbacks keeps
