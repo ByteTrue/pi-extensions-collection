@@ -194,18 +194,18 @@ describe("subagent unit tests", () => {
     expect(explicitCfg.tools).toEqual(["codemode", "read", "grep", "find"]);
     expect(buildPiArgs(explicitCfg)).toContain("codemode,read,grep,find");
 
-    // 2. Role-defined tools (the reviewer agent) with inheritCodemode=true
-    const reviewerDef = findAgentDefinition(process.cwd(), "reviewer");
-    const reviewerCfg = resolveRunCfg(
-      { agent: "reviewer" },
-      reviewerDef.config,
+    // 2. Role-defined tools (the explore agent) with inheritCodemode=true
+    const exploreDef = findAgentDefinition(process.cwd(), "explore");
+    const exploreCfg = resolveRunCfg(
+      { agent: "explore" },
+      exploreDef.config,
       undefined,
       undefined,
       undefined,
       true,
     );
-    expect(reviewerCfg.tools).toEqual(["codemode", "read", "bash"]);
-    expect(buildPiArgs(reviewerCfg)).toContain("codemode,read,bash");
+    expect(exploreCfg.tools).toEqual(["codemode", "read", "bash", "grep", "find", "ls"]);
+    expect(buildPiArgs(exploreCfg)).toContain("codemode,read,bash,grep,find,ls");
 
     // 3. Already contains codemode: no duplicates
     const alreadyCodemodeCfg = resolveRunCfg(
@@ -288,43 +288,53 @@ describe("subagent unit tests", () => {
     expect(resumeSessionArgs).toContain("sub_123");
   });
 
-  it("ships exactly one built-in role: reviewer (issue 110)", () => {
-    const reviewer = findAgentDefinition(process.cwd(), "reviewer");
-    expect(reviewer.found).toBe(true);
-    expect(reviewer.config.tools).toEqual(["read", "bash"]);
-    expect(reviewer.config.thinking).toBe("max");
-    expect(reviewer.config.systemPrompt).toContain("disciplined review subagent");
-    expect(reviewer.config.description).toContain("Use it to inspect code, diffs, plans");
-    // The reviewer must not be able to modify the tree it reviews.
-    expect(reviewer.config.tools).not.toContain("edit");
-    expect(reviewer.config.tools).not.toContain("write");
-    // The removed roles are gone, not merely unlisted (issue 110).
-    expect(findAgentDefinition(process.cwd(), "explore").found).toBe(false);
+  it("ships exactly opencode's built-in subagent roles: general and explore", () => {
+    // general mirrors opencode's general subagent: text copied from
+    // packages/core/src/plugin/agent.ts:63, no system prompt, no tool
+    // allowlist (it inherits pi's default set).
+    const general = findAgentDefinition(process.cwd(), "general");
+    expect(general.found).toBe(true);
+    expect(general.config.description).toContain("General-purpose agent for researching complex questions");
+    expect(general.config.systemPrompt).toBeUndefined();
+    expect(general.config.tools).toBeUndefined();
+
+    // explore mirrors opencode's explore subagent: prompt and trigger sentence
+    // copied verbatim, read-only tools only.
+    const explore = findAgentDefinition(process.cwd(), "explore");
+    expect(explore.found).toBe(true);
+    expect(explore.config.systemPrompt).toContain("You are a file search specialist");
+    expect(explore.config.description).toContain("Fast agent specialized for exploring codebases");
+    expect(explore.config.tools).toEqual(["read", "bash", "grep", "find", "ls"]);
+    expect(explore.config.tools).not.toContain("edit");
+    expect(explore.config.tools).not.toContain("write");
+
+    // Nothing of our own ships on top: no reviewer, plan, or general-purpose.
+    expect(findAgentDefinition(process.cwd(), "reviewer").found).toBe(false);
     expect(findAgentDefinition(process.cwd(), "plan").found).toBe(false);
     expect(findAgentDefinition(process.cwd(), "general-purpose").found).toBe(false);
   });
 
 
   it("clamps timeoutMs to the Node timer maximum", () => {
-    const reviewer = resolveAgentRole(process.cwd(), "reviewer", {});
-    const huge = resolveRunCfg({ timeoutMs: 1e15 }, reviewer, undefined, undefined, {});
+    const explore = resolveAgentRole(process.cwd(), "explore", {});
+    const huge = resolveRunCfg({ timeoutMs: 1e15 }, explore, undefined, undefined, {});
     expect(huge.timeoutMs).toBe(2_147_483_647);
-    const normal = resolveRunCfg({ timeoutMs: 1234 }, reviewer, undefined, undefined, {});
+    const normal = resolveRunCfg({ timeoutMs: 1234 }, explore, undefined, undefined, {});
     expect(normal.timeoutMs).toBe(1234);
   });
   it("names only new child sessions, not resumed ones", () => {
-    const reviewer = resolveAgentRole(process.cwd(), "reviewer", {});
+    const explore = resolveAgentRole(process.cwd(), "explore", {});
     const fresh = resolveRunCfg(
-      { agent: "reviewer", description: "fresh child" },
-      reviewer,
+      { agent: "explore", description: "fresh child" },
+      explore,
       undefined,
       undefined,
       {},
     );
     expect(fresh.name).toBe("fresh child");
     const resumed = resolveRunCfg(
-      { agent: "reviewer", description: "resumed child", resume: "sub_123" },
-      reviewer,
+      { agent: "explore", description: "resumed child", resume: "sub_123" },
+      explore,
       undefined,
       undefined,
       {},
@@ -340,15 +350,16 @@ describe("subagent unit tests", () => {
     // 1. Omitting the role is rejected: there is no anonymous child.
     expect(() => resolveAgentRole(cwd, undefined, {})).toThrow(/required/);
 
-    // 2. reviewer: read+bash only, thinking pinned to the top level.
-    const reviewer = resolveAgentRole(cwd, "reviewer", {});
-    const reviewerRun = resolveRunCfg({ agent: "reviewer" }, reviewer, undefined, undefined, {});
-    expect(reviewerRun.tools).toEqual(["read", "bash"]);
-    expect(buildPiArgs(reviewerRun)).toContain("read,bash");
-    expect(reviewerRun.thinking).toBe("max");
+    // 2. explore: its own read-only allowlist, no thinking pin (inherits the
+    // parent), which is how opencode's explore document behaves.
+    const explore = resolveAgentRole(cwd, "explore", {});
+    const exploreRun = resolveRunCfg({ agent: "explore" }, explore, undefined, undefined, {});
+    expect(exploreRun.tools).toEqual(["read", "bash", "grep", "find", "ls"]);
+    expect(buildPiArgs(exploreRun)).toContain("read,bash,grep,find,ls");
+    expect(exploreRun.thinking).toBeUndefined();
 
-    // 3. A removed built-in fails loudly and names the surviving role.
-    expect(() => resolveAgentRole(cwd, "explore", {})).toThrow(/reviewer/);
+    // 3. A role that was never re-added fails loudly and names the live roles.
+    expect(() => resolveAgentRole(cwd, "plan", {})).toThrow(/explore/);
   });
 
   it("requires an agent role: no plain child (D8)", () => {
@@ -360,18 +371,17 @@ describe("subagent unit tests", () => {
     const task = "Review the uncommitted diff in packages/subagent";
     expect(buildSubagentPrompt(task, {})).toBe(task);
     // A named role still frames the task as assigned work.
-    const withRole = buildSubagentPrompt(task, resolveAgentRole(process.cwd(), "reviewer", {}));
+    const withRole = buildSubagentPrompt(task, resolveAgentRole(process.cwd(), "explore", {}));
     expect(withRole).toContain("## Assigned Task");
     expect(withRole.endsWith(task)).toBe(true);
   });
 
   it("builds the agent roster with trigger descriptions (issue 102)", () => {
-    // The single built-in role renders name + trigger sentence.
+    // Every built-in role renders name + trigger sentence.
     const roster = buildAgentRosterText(process.cwd());
-    expect(roster).toContain("- reviewer: Independent adversarial reviewer");
-    expect(roster).toContain("Use it to inspect code, diffs, plans");
-    // Removed roles and the (retired) default entry never reappear (issue 110).
-    expect(roster).not.toContain("- explore");
+    expect(roster).toContain("- general: General-purpose agent for researching complex questions");
+    expect(roster).toContain("- explore: Fast agent specialized for exploring codebases");
+    // Roles that were never re-added never reappear.
     expect(roster).not.toContain("- plan");
     expect(roster).not.toContain("- general-purpose");
 
@@ -403,16 +413,16 @@ describe("subagent unit tests", () => {
     const dir = join(tmpdir(), `subagent-agents-${Date.now()}`);
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(
-      join(dir, ".pi", "agents", "reviewer.md"),
-      "---\nmodel: cheap/model\nthinking: low\ntools: read, grep\n---\n\nCustom reviewer prompt.\n",
+      join(dir, ".pi", "agents", "explore.md"),
+      "---\nmodel: cheap/model\nthinking: low\ntools: read, grep\n---\n\nCustom explore prompt.\n",
     );
     try {
-      const reviewer = findAgentDefinition(dir, "reviewer");
-      expect(reviewer.found).toBe(true);
-      expect(reviewer.config.model).toBe("cheap/model");
-      expect(reviewer.config.thinking).toBe("low");
-      expect(reviewer.config.tools).toEqual(["read", "grep"]);
-      expect(reviewer.config.systemPrompt).toBe("Custom reviewer prompt.");
+      const explore = findAgentDefinition(dir, "explore");
+      expect(explore.found).toBe(true);
+      expect(explore.config.model).toBe("cheap/model");
+      expect(explore.config.thinking).toBe("low");
+      expect(explore.config.tools).toEqual(["read", "grep"]);
+      expect(explore.config.systemPrompt).toBe("Custom explore prompt.");
 
       // A role the package no longer ships stays unknown (issue 110).
       const plan = findAgentDefinition(dir, "plan");
@@ -425,7 +435,7 @@ describe("subagent unit tests", () => {
   it("inherits the parent session's thinking level, off included", () => {
     // No document/role setting: the parent session's level flows through, off included.
     for (const level of ["minimal", "medium", "max", "off"]) {
-      const cfg = resolveRunCfg({ agent: "reviewer" }, {}, level, "p/m", {});
+      const cfg = resolveRunCfg({ agent: "explore" }, {}, level, "p/m", {});
       expect(cfg.thinking).toBe(level);
       expect(cfg.model).toBe(`p/m:${level}`);
       expect(buildPiArgs(cfg)).toContain(`p/m:${level}`);
@@ -675,12 +685,12 @@ describe("subagent unit tests", () => {
     const settings = {
       defaultMaxTurns: 100,
       defaultTimeoutMs: 2400000,
-      agents: { reviewer: { maxTurns: 120, timeoutMs: 3000000 } },
+      agents: { explore: { maxTurns: 120, timeoutMs: 3000000 } },
     };
 
     // 1. The call parameter wins over every configured layer.
     const call = resolveRunCfg(
-      { agent: "reviewer", maxTurns: 200, timeoutMs: 900000 },
+      { agent: "explore", maxTurns: 200, timeoutMs: 900000 },
       doc,
       undefined,
       undefined,
@@ -690,14 +700,14 @@ describe("subagent unit tests", () => {
     expect(call.timeoutMs).toBe(900000);
 
     // 2. A settings role override wins over the role document.
-    const role = resolveRunCfg({ agent: "reviewer" }, doc, undefined, undefined, settings);
+    const role = resolveRunCfg({ agent: "explore" }, doc, undefined, undefined, settings);
     expect(role.maxTurns).toBe(120);
     expect(role.timeoutMs).toBe(3000000);
 
     // 3. The role document wins over the global default: a global setting cannot
     //    shrink a review role's budget, which is the invariant the design settled on.
     const docOnly = resolveRunCfg(
-      { agent: "reviewer" },
+      { agent: "explore" },
       doc,
       undefined,
       undefined,
@@ -712,18 +722,6 @@ describe("subagent unit tests", () => {
     expect(plain.timeoutMs).toBeUndefined();
     expect(DEFAULT_MAX_TURNS).toBe(100);
     expect(DEFAULT_TIMEOUT_MS).toBe(40 * 60 * 1000);
-  });
-
-  it("ships the reviewer budget above the package default", () => {
-    // The shipped role document is the role's own budget; the package default is
-    // the ceiling for roles that carry none. Both are behaviour the README states.
-    const reviewer = resolveAgentRole(process.cwd(), "reviewer", {});
-    expect(reviewer.maxTurns).toBe(150);
-    expect(reviewer.timeoutMs).toBe(3600000);
-    expect(resolveRunCfg({ agent: "reviewer" }, reviewer, undefined, undefined, {})).toMatchObject({
-      maxTurns: 150,
-      timeoutMs: 3600000,
-    });
   });
 
   it("rejects non-positive and non-numeric budgets in documents, settings, and calls", () => {
@@ -746,7 +744,7 @@ describe("subagent unit tests", () => {
     }
 
     // A tool call cannot disable the ceiling either (normalizeTask's > 0 gate).
-    const zeroed = normalizeTask({ task: "x", agent: "reviewer", description: "x", timeoutMs: 0, maxTurns: -3 });
+    const zeroed = normalizeTask({ task: "x", agent: "explore", description: "x", timeoutMs: 0, maxTurns: -3 });
     expect(zeroed.timeoutMs).toBeUndefined();
     expect(zeroed.maxTurns).toBeUndefined();
 
@@ -777,7 +775,7 @@ describe("subagent unit tests", () => {
           subagent: {
             defaultMaxTurns: 100,
             defaultTimeoutMs: 2400000,
-            agents: { reviewer: { maxTurns: 111 }, text: { maxTurns: "120" } },
+            agents: { explore: { maxTurns: 111 }, text: { maxTurns: "120" } },
           },
         }),
       );
@@ -786,7 +784,7 @@ describe("subagent unit tests", () => {
         JSON.stringify({
           subagent: {
             defaultMaxTurns: 150,
-            agents: { reviewer: { timeoutMs: 3000000 }, scout: { maxTurns: 7 } },
+            agents: { explore: { timeoutMs: 3000000 }, scout: { maxTurns: 7 } },
           },
         }),
       );
@@ -797,7 +795,7 @@ describe("subagent unit tests", () => {
       // that role's global object rather than merging key by key.
       expect(trusted.defaultMaxTurns).toBe(150);
       expect(trusted.defaultTimeoutMs).toBe(2400000);
-      expect(trusted.agents?.reviewer).toEqual({ timeoutMs: 3000000 });
+      expect(trusted.agents?.explore).toEqual({ timeoutMs: 3000000 });
       expect(trusted.agents?.scout?.maxTurns).toBe(7);
       // A string budget is dropped, not coerced to 120.
       expect(trusted.agents?.text?.maxTurns).toBeUndefined();
@@ -806,7 +804,7 @@ describe("subagent unit tests", () => {
       const untrusted = loadSubagentSettings(testDir, false);
       expect(untrusted.defaultMaxTurns).toBe(100);
       expect(untrusted.defaultTimeoutMs).toBe(2400000);
-      expect(untrusted.agents?.reviewer).toEqual({ maxTurns: 111 });
+      expect(untrusted.agents?.explore).toEqual({ maxTurns: 111 });
       expect(untrusted.agents?.scout).toBeUndefined();
 
       // A menu write that touches only the model must not erase the budgets.
@@ -817,7 +815,7 @@ describe("subagent unit tests", () => {
       const after = loadSubagentSettings(testDir, true);
       expect(after.defaultMaxTurns).toBe(150);
       expect(after.defaultTimeoutMs).toBe(2400000);
-      expect(after.agents?.reviewer).toEqual({ timeoutMs: 3000000 });
+      expect(after.agents?.explore).toEqual({ timeoutMs: 3000000 });
     } finally {
       if (agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -839,7 +837,7 @@ describe("subagent unit tests", () => {
           defaultThinkingLevel: "medium",
           subagents: {
             agentOverrides: {
-              reviewer: {
+              explore: {
                 model: "bytetrueapi/qwen3.8-max",
                 thinking: "high",
                 tools: ["read", "grep", "find", "bash", "compress", "decompress", "search_context", "acp_status"],
@@ -854,12 +852,12 @@ describe("subagent unit tests", () => {
       // unset means "inherit parent session model".
       expect(loaded.defaultModel).toBeUndefined();
       expect(loaded.defaultThinking).toBeUndefined();
-      expect(loaded.agents?.reviewer?.model).toBe("bytetrueapi/qwen3.8-max");
-      expect(loaded.agents?.reviewer?.thinking).toBe("high");
+      expect(loaded.agents?.explore?.model).toBe("bytetrueapi/qwen3.8-max");
+      expect(loaded.agents?.explore?.thinking).toBe("high");
       // billion-context-pi's `/acp-subagents` writes a tools override here. It must
       // survive parsing: role tools beat the agent document's own `tools:` line.
-      expect(loaded.agents?.reviewer?.tools).toContain("compress");
-      expect(loaded.agents?.reviewer?.tools).toContain("bash");
+      expect(loaded.agents?.explore?.tools).toContain("compress");
+      expect(loaded.agents?.explore?.tools).toContain("bash");
     } finally {
       if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
     }
@@ -898,16 +896,16 @@ You are an expert researcher. Read references carefully.
   it("resolves a known role and rejects an unknown one with the available list (issue 097)", () => {
     expect(() => resolveAgentRole(process.cwd(), undefined)).toThrow(/'agent' is required/);
     expect(() => resolveAgentRole(process.cwd(), "   ")).toThrow(/'agent' is required/);
-    expect(resolveAgentRole(process.cwd(), "reviewer").tools).toEqual(["read", "bash"]);
+    expect(resolveAgentRole(process.cwd(), "explore").tools).toEqual(["read", "bash", "grep", "find", "ls"]);
     expect(() => resolveAgentRole(process.cwd(), "definitely-not-a-role")).toThrow(
       /Unknown agent role "definitely-not-a-role"/,
     );
     expect(() => resolveAgentRole(process.cwd(), "definitely-not-a-role")).toThrow(
       /Use one of the roles above/,
     );
-    // A removed built-in is now an unknown role the model gets told about.
-    expect(() => resolveAgentRole(process.cwd(), "explore")).toThrow(
-      /Unknown agent role "explore".*reviewer/,
+    // A role that was never re-added is an unknown role the model gets told about.
+    expect(() => resolveAgentRole(process.cwd(), "plan")).toThrow(
+      /Unknown agent role "plan".*explore/,
     );
   });
 
@@ -1041,7 +1039,7 @@ You are an expert researcher. Read references carefully.
       writeFileSync(fake, makeFake(trustedLog));
       const trusted = await runSubagent(
         projectDir,
-        { task: "x", agent: "reviewer", description: "trusted", id: "trust-t" },
+        { task: "x", agent: "explore", description: "trusted", id: "trust-t" },
         undefined,
         undefined,
         undefined,
@@ -1055,7 +1053,7 @@ You are an expert researcher. Read references carefully.
       writeFileSync(fake, makeFake(untrustedLog));
       const untrusted = await runSubagent(
         projectDir,
-        { task: "x", agent: "reviewer", description: "untrusted", id: "trust-f" },
+        { task: "x", agent: "explore", description: "untrusted", id: "trust-f" },
         undefined,
         undefined,
         undefined,
@@ -1079,13 +1077,13 @@ You are an expert researcher. Read references carefully.
   });
 
   it("normalizes a single task input, dropping unknown fields (issue 095)", () => {
-    const item = normalizeTask({ task: "  test task  ", agent: " reviewer ", description: "  label  " });
-    expect(item).toEqual({ task: "test task", agent: "reviewer", description: "label" });
+    const item = normalizeTask({ task: "  test task  ", agent: " explore ", description: "  label  " });
+    expect(item).toEqual({ task: "test task", agent: "explore", description: "label" });
 
     // model/thinking never pass through (082 invariant) — not in SubagentInput, but models send junk
     const junk = normalizeTask({
       task: "x",
-      agent: "reviewer",
+      agent: "explore",
       description: "x",
       model: "gpt-5",
       thinking: "off",
@@ -1093,9 +1091,9 @@ You are an expert researcher. Read references carefully.
     expect(junk).not.toHaveProperty("model");
     expect(junk).not.toHaveProperty("thinking");
 
-    expect(() => normalizeTask({ task: "   ", agent: "reviewer", description: "x" })).toThrow(/No task specified/);
+    expect(() => normalizeTask({ task: "   ", agent: "explore", description: "x" })).toThrow(/No task specified/);
     expect(() => normalizeTask({ task: "x", description: "x" })).toThrow(/'agent' is required/);
-    expect(() => normalizeTask({ task: "x", agent: "reviewer" })).toThrow(/'description' is required/);
+    expect(() => normalizeTask({ task: "x", agent: "explore" })).toThrow(/'description' is required/);
   });
 
   it("manages subagent tasks lifecycle including running count and stop", async () => {
@@ -1295,12 +1293,11 @@ You are an expert researcher. Read references carefully.
     const agentParam = props.agent as JsonObject;
     expect(String(agentParam.description)).toContain("Required agent role");
     expect(String(agentParam.description)).not.toContain("Omit it for a plain child");
-    // Issue 102 + 110: the roster with trigger descriptions is embedded in the
-    // tool description; the single built-in role is the reviewer.
-    expect(String(main.description)).toContain("- reviewer: Independent adversarial reviewer");
-    expect(String(main.description)).not.toContain("- explore");
+    // Issue 102: the roster with trigger descriptions is embedded in the tool
+    // description, and the opencode built-in roles are all listed.
+    expect(String(main.description)).toContain("- general: General-purpose agent");
+    expect(String(main.description)).toContain("- explore: Fast agent specialized for exploring codebases");
     expect(String(main.description)).not.toContain("- plan");
-    expect(String(main.description)).not.toContain("- general-purpose");
     expect(String(main.description)).not.toContain("general-purpose");
     // The exact-match threshold and self-deprecating "lowest thinking" wording
     // from 096/100 are gone (issue 102).
@@ -1318,10 +1315,10 @@ You are an expert researcher. Read references carefully.
     };
     const tasks: SubagentTaskRecord[] = [
       { ...base, id: "a", description: "x", status: "succeeded", startedAt: 0 },
-      { ...base, id: "b", description: "y", agent: "reviewer", status: "running", startedAt: 10_000 },
+      { ...base, id: "b", description: "y", agent: "explore", status: "running", startedAt: 10_000 },
       { ...base, id: "c", description: "z", status: "running", startedAt: 70_000 },
     ];
-    expect(formatSubagentStatus(tasks, 100_000)).toBe("sub:2 · reviewer 1m30s · subagent 30s");
+    expect(formatSubagentStatus(tasks, 100_000)).toBe("sub:2 · explore 1m30s · subagent 30s");
     expect(formatSubagentStatus(tasks.filter((t) => t.status !== "running"), 100_000)).toBeUndefined();
   });
 
@@ -1342,12 +1339,12 @@ You are an expert researcher. Read references carefully.
     });
     const tasks = [
       running("a", "scout", 99_000),
-      running("b", "reviewer", 98_000),
+      running("b", "explore", 98_000),
       running("c", undefined, 97_000),
       running("d", "researcher", 96_000),
     ];
     // Oldest first; the 4th collapses into +1 more.
-    expect(formatSubagentStatus(tasks, 100_000)).toBe("sub:4 · researcher 4s · subagent 3s · reviewer 2s · +1 more");
+    expect(formatSubagentStatus(tasks, 100_000)).toBe("sub:4 · researcher 4s · subagent 3s · explore 2s · +1 more");
   });
 
   it("stores streamed progress on the running record and stops after completion", () => {
@@ -1418,10 +1415,10 @@ You are an expert researcher. Read references carefully.
 
   it("describes a task with the short label (no ANSI)", () => {
     expect(
-      describeTask({ task: "  Review\n  the diff  ", description: "Review the diff", agent: "reviewer" }),
+      describeTask({ task: "  Review\n  the diff  ", description: "Review the diff", agent: "explore" }),
     ).toBe("Review the diff");
     // Older/partial callers without a label still get a one-line task.
-    expect(describeTask({ task: "Just a task", description: "", agent: "reviewer" })).toBe(
+    expect(describeTask({ task: "Just a task", description: "", agent: "explore" })).toBe(
       "Just a task",
     );
   });
@@ -1430,14 +1427,14 @@ You are an expert researcher. Read references carefully.
     const base = {
       id: "sub_x",
       parentSessionId: "s",
-      description: "reviewer: Review the diff",
-      agent: "reviewer",
+      description: "explore: Review the diff",
+      agent: "explore",
       controller: new AbortController(),
       notifyOnExit: false,
     };
     const run: RunState = {
       id: "run-1",
-      agent: "reviewer",
+      agent: "explore",
       prompt: "review",
       sessionId: "sub_x",
       status: "running",
@@ -1459,11 +1456,11 @@ You are an expert researcher. Read references carefully.
       status: "running",
       output: "",
       startedAt: 60_000,
-      progress: { kind: "subagent-progress", agent: "reviewer", startedAt: 0, updatedAt: 5, final: false, runs: [run] },
+      progress: { kind: "subagent-progress", agent: "explore", startedAt: 0, updatedAt: 5, final: false, runs: [run] },
     };
     const text = formatSubagentTaskStatus(running, 126_000);
-    expect(text).toContain("[sub_x] reviewer · running · 1m6s");
-    expect(text).toContain("Task: reviewer: Review the diff");
+    expect(text).toContain("[sub_x] explore · running · 1m6s");
+    expect(text).toContain("Task: explore: Review the diff");
     expect(text).toContain("current: bash: npm test");
     expect(text).toContain("turn 6");
     expect(text).toContain("$0.31");
@@ -1677,7 +1674,7 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
         "call_ptr",
         {
           task: "pointer check",
-          agent: "reviewer",
+          agent: "explore",
           description: "pointer check",
           cwd: dir,
           // Not a tool field: a model/injection must not be able to turn this
@@ -1755,7 +1752,7 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
       ) => Promise<{ details?: Record<string, unknown> }>;
       const result = await execute(
         "call_ptr2",
-        { task: "resume check", agent: "reviewer", description: "resume check", resume: "sub_resume_1" },
+        { task: "resume check", agent: "explore", description: "resume check", resume: "sub_resume_1" },
         undefined,
         undefined,
         { sessionManager: { getSessionId: () => "sess-ptr" } },
@@ -2046,14 +2043,14 @@ describe("completion notice shape (D3/D10/D13)", () => {
       notifyOnExit: false,
       progress: {
         kind: "subagent-progress",
-        agent: "reviewer",
+        agent: "explore",
         startedAt: 0,
         updatedAt: 0,
         final: true,
         runs: [
           {
             id: "run-1",
-            agent: "reviewer",
+            agent: "explore",
             prompt: "review",
             sessionId: "sub_child",
             cwd: "/tmp",
@@ -2080,7 +2077,7 @@ describe("completion notice shape (D3/D10/D13)", () => {
       sessionId: "sub_child_2",
       parentSessionId: "parent-session",
       description: "Helper review",
-      agent: "reviewer",
+      agent: "explore",
       status: "running",
       output: "",
       startedAt: 0,
@@ -2093,7 +2090,7 @@ describe("completion notice shape (D3/D10/D13)", () => {
       expect(text).toContain("Subagent completed without a text response.");
       expect(text).toContain("Background work still running:");
       expect(text).toContain("npm test");
-      expect(text).toContain("- subagent (sub_child_2): reviewer: Helper review");
+      expect(text).toContain("- subagent (sub_child_2): explore: Helper review");
       expect(text).toContain("</subagent>");
     } finally {
       providers.delete("test-provider");
@@ -2104,13 +2101,13 @@ describe("completion notice shape (D3/D10/D13)", () => {
 
 it("normalizeTask rejects resume + id together (issue 115 follow-up)", () => {
   expect(() =>
-    normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "sub_1", id: "sub_2" }),
+    normalizeTask({ task: "x", agent: "explore", description: "x", resume: "sub_1", id: "sub_2" }),
   ).toThrow(/either 'resume' or 'id', not both/);
   // Each alone stays fine.
   expect(
-    normalizeTask({ task: "x", agent: "reviewer", description: "x", resume: "sub_1" }).resume,
+    normalizeTask({ task: "x", agent: "explore", description: "x", resume: "sub_1" }).resume,
   ).toBe("sub_1");
   expect(
-    normalizeTask({ task: "x", agent: "reviewer", description: "x", id: "sub_2" }).id,
+    normalizeTask({ task: "x", agent: "explore", description: "x", id: "sub_2" }).id,
   ).toBe("sub_2");
 });

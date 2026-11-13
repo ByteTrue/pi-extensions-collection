@@ -60,24 +60,24 @@ async function executeWithFakePi(cwd: string, input: JsonObject, projectTrusted 
 }
 
 describe("subagent security boundaries", () => {
-  it("does not let an untrusted project replace the built-in reviewer during execution", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "subagent-reviewer-trust-"));
+  it("does not let an untrusted project replace the built-in explore during execution", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-explore-trust-"));
     try {
       mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
-      writeFileSync(join(dir, ".pi", "agents", "reviewer.md"), [
+      writeFileSync(join(dir, ".pi", "agents", "explore.md"), [
         "---",
-        "model: vendor/project-reviewer",
+        "model: vendor/project-explore",
         "tools: read, bash, edit, write",
         "---",
-        "PROJECT_REVIEWER_MARKER",
+        "PROJECT_EXPLORE_MARKER",
       ].join("\n"));
-      expect(resolveAgentRole(dir, "reviewer", undefined, true).systemPrompt).toContain("PROJECT_REVIEWER_MARKER");
+      expect(resolveAgentRole(dir, "explore", undefined, true).systemPrompt).toContain("PROJECT_EXPLORE_MARKER");
 
-      const child = await executeWithFakePi(dir, { task: "review", agent: "reviewer", description: "trust check" }, false);
+      const child = await executeWithFakePi(dir, { task: "review", agent: "explore", description: "trust check" }, false);
 
-      expect(child.input).not.toContain("PROJECT_REVIEWER_MARKER");
-      expect(child.argv).not.toContain("vendor/project-reviewer");
-      expect(child.argv[child.argv.indexOf("--tools") + 1]).toBe("read,bash");
+      expect(child.input).not.toContain("PROJECT_EXPLORE_MARKER");
+      expect(child.argv).not.toContain("vendor/project-explore");
+      expect(child.argv[child.argv.indexOf("--tools") + 1]).toBe("read,bash,grep,find,ls");
       expect(child.argv).not.toContain("write");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -96,7 +96,7 @@ describe("subagent security boundaries", () => {
           [injected]: {},
           [oversized]: {},
           "db.sleuth": {},
-          "database reviewer": {},
+          "database explore": {},
           "审查员": {},
         },
       }));
@@ -105,11 +105,11 @@ describe("subagent security boundaries", () => {
       expect(roster).not.toContain(injected);
       expect(roster).not.toContain(oversized);
       expect(roster).toContain("- db.sleuth:");
-      expect(roster).toContain("- database reviewer:");
+      expect(roster).toContain("- database explore:");
       expect(roster).toContain("- 审查员:");
       expect(() => resolveAgentRole(dir, injected, undefined, true)).toThrow(/Invalid agent role name/);
       expect(resolveAgentRole(dir, "db.sleuth", undefined, true)).toEqual({});
-      expect(resolveAgentRole(dir, "database reviewer", undefined, true)).toEqual({});
+      expect(resolveAgentRole(dir, "database explore", undefined, true)).toEqual({});
       expect(resolveAgentRole(dir, "审查员", undefined, true)).toEqual({});
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -121,7 +121,7 @@ describe("subagent security boundaries", () => {
     try {
       const child = await executeWithFakePi(dir, {
         task: "review",
-        agent: "reviewer",
+        agent: "explore",
         description: "empty tools",
         tools: [],
       });
@@ -129,11 +129,11 @@ describe("subagent security boundaries", () => {
       expect(child.argv).not.toContain("--tools");
 
       const roleOverride = resolveRunCfg(
-        { agent: "reviewer" },
+        { agent: "explore" },
         { tools: ["read", "bash"] },
         undefined,
         undefined,
-        { agents: { reviewer: { tools: [] } } },
+        { agents: { explore: { tools: [] } } },
         true,
       );
       expect(roleOverride.tools).toEqual([]);

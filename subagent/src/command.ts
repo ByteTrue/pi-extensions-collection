@@ -327,7 +327,7 @@ async function configureRoleMenu(ctx: ExtensionCommandContext): Promise<void> {
     if (pickedRole === customOption) {
       const input = await ctx.ui.input(
         "Role Name",
-        "Example: reviewer",
+        "Example: explore",
       );
       if (input === undefined || !input.trim()) continue;
       roleName = input.trim().toLowerCase();
@@ -339,15 +339,7 @@ async function configureRoleMenu(ctx: ExtensionCommandContext): Promise<void> {
     const currentSettings = loadSubagentSettingsForScope(ctx.cwd, scope);
     const existingRole = currentSettings.agents?.[roleName] ?? {};
 
-    // Issue 102 (decision D2): no provider is hardcoded, so the menu nudges
-    // toward a strong model for the adversarial reviewer instead.
-    const model = await pickModel(
-      ctx,
-      existingRole.model,
-      roleName === "reviewer"
-        ? "reviewer runs an independent adversarial review — a strong model fits it best"
-        : undefined,
-    );
+    const model = await pickModel(ctx, existingRole.model);
     if (model === undefined) continue;
 
     const thinking = await pickThinking(ctx, existingRole.thinking);
@@ -546,7 +538,7 @@ export async function runSubagentCommand(
           : "👀 View Subagent Tasks";
       const actionDefault = "⚙️ Configure Default Subagent Model & Thinking";
       const actionBudget = "⏱ Configure Budget (Max Turns / Timeout)";
-      const actionRole = "🎭 Configure an Agent Role (e.g. reviewer)";
+      const actionRole = "🎭 Configure an Agent Role (e.g. explore)";
       const actionShow = "📋 Show Current Configuration";
 
       const choices = [

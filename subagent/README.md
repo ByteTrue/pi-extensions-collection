@@ -7,7 +7,7 @@ Spawns focused child agents in isolated sessions for delegating tasks, code revi
 ## Features
 
 - **⚡️ Zero Bloat & Minimal Context**: Three lightweight tool schemas (~200 tokens) replace heavy multi-thousand-token multi-agent frameworks.
-- **🎭 One Built-in Role, `reviewer`**: an independent adversarial reviewer (`read, bash`, maximum thinking) that reports evidence-backed findings and a merge verdict without touching the tree. It ships as an ordinary agent document in `agents/` — copy it into `.pi/agents/` to customise it.
+- **🎭 opencode's Subagent Roles, Built In**: `general` (multi-step work with the inherited toolset) and `explore` (read-only search specialist; `read, bash, grep, find, ls`) with opencode's own trigger sentences and prompts. No roles of our own ship on top. They ship as ordinary agent documents in `agents/` — copy one into `.pi/agents/` to customise it.
 - **🎯 Explicit Role Required**: every call names a role from the roster, so the child's prompt, model, thinking level and tool allowlist come from a document you can read and edit. A missing or unknown role is rejected with the list of available roles.
 - **📋 Role Roster in the Tool Description**: each role document's `description:` frontmatter — a trigger sentence ("Use it to…") — is embedded in the `subagent` tool description, so the dispatching model sees when to use every role, including your custom `.pi/agents/*.md` (issue 102).
 - **🛡️ Runaway Guardrails**: Package default 40-minute timeout and 100-turn limit prevent infinite loops or burning quota. Both are configurable per role and globally (`/subagent` → Configure Budget); 0 and negative values fall back to the default, so the ceiling cannot be switched off.
@@ -19,7 +19,7 @@ Spawns focused child agents in isolated sessions for delegating tasks, code revi
   - **Task Monitor**: View currently running, paused, and recent subagent tasks, inspect progress or output, or stop running tasks.
   - **Fuzzy Model Search**: Model picker with real-time text filter and wrap-around keyboard navigation (Up at top loops to bottom).
   - **Back Navigation**: Pressing `Esc` in any sub-menu smoothly returns to the parent menu level.
-  - **Role & Default Config**: Configure global/project default models, thinking levels, budgets, and per-role overrides (built-in `reviewer` or custom).
+  - **Role & Default Config**: Configure global/project default models, thinking levels, budgets, and per-role overrides (built-in or custom).
 
 ## Installation
 
@@ -48,7 +48,7 @@ Run `/subagent` in the Pi TUI to interactively:
 - **View Active Subagents**: Browse all active/recent subagent tasks in the current session, view output, stop running tasks, or see resume instructions.
 - **Set default subagent model and thinking level**: Use real-time fuzzy search to pick models across all configured providers with wrap-around cursor movement (`Esc` to go back).
 - **Configure Budget**: Set the global default `maxTurns` / `timeoutMs` from preset tiers (50/100/150/200 turns; 20/40/60/120 minutes) or a custom number, in the global or project scope. "Clear override" falls back to the package default (100 turns / 40 minutes).
-- **Configure specific roles**: Customize `reviewer` or any custom role with dedicated model, thinking, and budget overrides (a role budget from settings outranks the role document's own budget).
+- **Configure specific roles**: Customize `general`, `explore`, or any custom role with dedicated model, thinking, and budget overrides (a role budget from settings outranks the role document's own budget).
 - **Run `/subagent list` or `/subagent show`**: View effective configurations and discovered agent templates.
 
 ## Settings Files
@@ -70,7 +70,7 @@ The file holds the section directly:
   "defaultMaxTurns": 100,
   "defaultTimeoutMs": 2400000,
   "agents": {
-    "reviewer": { "model": "bytetrueapi/qwen3.8-max", "thinking": "high", "maxTurns": 150, "timeoutMs": 3600000 }
+    "explore": { "model": "bytetrueapi/qwen3.8-max", "thinking": "high" }
   }
 }
 ```
@@ -96,7 +96,7 @@ A child that outlives a SIGKILLed or crashed parent writes a journal under `$TMP
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `task` | `string` | **Yes** | The task instruction / prompt. |
-| `agent` | `string` | **Yes** | Role name from the roster embedded in the tool description: the built-in `reviewer` (independent adversarial review; `read, bash`, maximum thinking), or any custom `.pi/agents/<name>.md`. A name matching no document is rejected with the list of available roles; omitting it is an error. |
+| `agent` | `string` | **Yes** | Role name from the roster embedded in the tool description: a built-in role (`general`, `explore`) or any custom `.pi/agents/<name>.md`. A name matching no document is rejected with the list of available roles; omitting it is an error. |
 | `description` | `string` | **Yes** | Short 3-5 word label. It titles the child session, the progress card, and the completion notice. |
 | `tools` | `string[]` | No | Optional tool allowlist (e.g. `["read", "grep", "find"]`). An explicit `[]` starts the child with `--no-tools`; omit the field to inherit role/default tools. |
 | `cwd` | `string` | No | Optional working directory for the task. |
@@ -106,13 +106,13 @@ A child that outlives a SIGKILLed or crashed parent writes a journal under `$TMP
 
 #### Usage Example
 
-The built-in reviewer, when the job is an independent adversarial review:
+The built-in explore, when the job is a read-only hunt through the codebase:
 
 ```json
 {
-  "agent": "reviewer",
-  "description": "Review the checkout diff",
-  "task": "Review the uncommitted diff for correctness and evidence-backed findings"
+  "agent": "explore",
+  "description": "Find the retry logic",
+  "task": "Find every place the retry logic is implemented or configured, very thorough; report absolute paths"
 }
 ```
 
@@ -129,9 +129,9 @@ Any other self-contained job needs a small role document first (`.pi/agents/dogf
 Parallel fanout is just several calls in one message:
 
 ```json
-[{ "agent": "reviewer", "description": "Review subagent core",
-   "task": "Review the diff in packages/subagent/src/index.ts" },
- { "agent": "reviewer", "description": "Review the tests",
+[{ "agent": "explore", "description": "Map the child spawn path",
+   "task": "Trace how a child process is spawned and report the exact files and lines" },
+ { "agent": "general", "description": "Review the tests",
    "task": "Review the tests that cover this path and report gaps with evidence" }]
 ```
 
@@ -154,13 +154,20 @@ Stop a running subagent task by id. Idempotent: stopping an already-finished tas
 
 #### Built-in roles
 
-Every call needs a role. The package ships exactly **one** built-in role, `reviewer`: a read-only adversarial reviewer (`read, bash`, maximum thinking) whose reports end with a merge verdict. Add `.pi/agents/<name>.md` (project) or `~/.pi/agent/agents/<name>.md` (user) for any other job. Project documents are loaded only when the project is trusted, the same gate as project settings; user/global documents always load. The document is an ordinary agent file in the package's `agents/` directory, parsed by the same code as your own `.pi/agents/*.md`, and a file with the same name wins over the packaged one. It carries its own budget (150 turns / 60 minutes) for the same reason it carries `thinking: max` — a role's inherent needs live in the role document. Copy it out to customise it:
+Every call needs a role. The package ships **exactly the two subagent roles opencode ships built in** — a general-purpose worker and a read-only search specialist:
+
+| Role | Tools | For |
+|---|---|---|
+| `general` | inherited (`read, bash, edit, write`) | Researching complex questions and executing multi-step work; no role-specific system prompt, like opencode's `general`. |
+| `explore` | `read, bash, grep, find, ls` | Fast, read-only codebase search: files by pattern, code by keyword, or how something works. Say how thorough you want it (`quick` / `medium` / `very thorough`). |
+
+opencode's subagent set is `general` + `explore` (its `plan` is a primary agent, not a subagent), and the trigger sentences and the `explore` prompt here are copied verbatim from it. Add `.pi/agents/<name>.md` (project) or `~/.pi/agent/agents/<name>.md` (user) for any other job. Project documents are loaded only when the project is trusted, the same gate as project settings; user/global documents always load. A built-in document is an ordinary agent file in the package's `agents/` directory, parsed by the same code as your own `.pi/agents/*.md`, and a file with the same name wins over the packaged one. Both built-in documents use the package budget and inherit the parent's model and thinking. Copy one out to customise it:
 
 ```bash
-mkdir -p .pi/agents && cp node_modules/@bytetrue/pi-subagent/agents/reviewer.md .pi/agents/reviewer.md
+mkdir -p .pi/agents && cp node_modules/@bytetrue/pi-subagent/agents/explore.md .pi/agents/explore.md
 ```
 
-**Migrating from ≤ 0.15.x**: the previous built-ins `explore`, `plan`, and `general-purpose` are gone (0.16.0). A call that still passes one of those names is rejected with the available roles; write your own `.pi/agents/<name>.md` to get the old behaviour back.
+**Migrating**: the roles we used to ship on top of opencode's (`reviewer`, and earlier `plan` / `general-purpose`) are gone; `explore` is back under opencode's name and prompt. An `agents.reviewer` block in your settings file still resolves (settings-only roles stay valid), but it now carries no prompt and no tool allowlist — recreate it as `.pi/agents/reviewer.md` for the old behaviour. Any other name with neither a document nor a settings entry is rejected with the list of available roles.
 
 ```markdown
 ---
@@ -187,7 +194,7 @@ Project-only role names are listed, but their document is not read at load: an u
 
 #### Extension tools and role documents
 
-`--tools` is an **allowlist that replaces the default selection**, so a role that names its own `tools:` receives only those names — extension tools are not added on top. The built-in `reviewer` document deliberately names only `read, bash`: `grep`/`find`/`ls` are off by default in pi, so naming them would switch them on for the child, and `bash` already covers search and inspection. It grants no `edit`/`write`, so "reports, does not edit" is a capability boundary, not just a prompt. A role that omits `tools:` inherits pi's full default set, extension tools included.
+`--tools` is an **allowlist that replaces the default selection**, so a role that names its own `tools:` receives only those names — extension tools are not added on top. The built-in `explore` document names `read, bash, grep, find, ls` — `grep`/`find`/`ls` are off by default in pi, and naming them is the point: it is the search specialist. It grants no `edit`/`write`, which makes "search only" a capability boundary rather than just a prompt. A role that omits `tools:` (like `general`) inherits pi's full default set, extension tools included.
 
 If you want a read-only child to also carry an extension's tool (for example the context tools from [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)), add them through settings rather than editing a packaged document: an older billion-context-pi's `/acp-subagents <package-dir>` writes a combined tool list to `subagents.agentOverrides.<role>.tools`, which this extension reads as a per-role override. Note that an override **replaces** the document's `tools:`, so it must list the role's full baseline, not just the additions.
 
@@ -222,9 +229,7 @@ The model priority chain is:
 4. Parent session's current fully qualified provider/model (inherited)
 5. The child `pi` process's own default
 
-Thinking follows the same user-controlled chain: role settings, agent document, subagent default, then the parent session. `reviewer` pins the highest available thinking level.
-
-**Recommendation for `reviewer`**: the document fixes thinking at the top level, but no provider is hardcoded — a strong model makes an independent review worth more than the tokens it costs (`/subagent` → Configure an Agent Role → `reviewer`, or `agents.reviewer.model` in settings). The model picker shows this hint when you configure `reviewer`.
+Thinking follows the same user-controlled chain: role settings, agent document, subagent default, then the parent session. Neither built-in document pins a thinking level, so both inherit; pin one per role in `/subagent` → Configure an Agent Role or `agents.<role>.thinking` when a role deserves more. No provider is hardcoded.
 
 Root-level pi settings `defaultProvider`/`defaultModel`/`defaultThinkingLevel` are deliberately **not** consulted — unset subagent configuration means "inherit".
 
@@ -238,9 +243,9 @@ The budget is the pair `maxTurns` / `timeoutMs`. Its chain has the same shape as
 4. `defaultMaxTurns` / `defaultTimeoutMs` (settings file) — global default
 5. Package constants: **100 turns / 40 minutes**
 
-Layer 3 outranks layer 4, so a global default cannot shrink a role's own budget; `reviewer` ships **150 turns / 60 minutes** because adversarial reviews measured 57–80 turns and up to 39 minutes. The tool description advertises the configured **global** default, evaluated when the tool registers, and says that role documents and this parameter can raise it — after changing settings, `/reload` makes the advertised number follow.
+Layer 3 outranks layer 4, so a global default cannot shrink a role's own budget; neither built-in document carries one, so both take the global default. The tool description advertises the configured **global** default, evaluated when the tool registers, and says that role documents and this parameter can raise it — after changing settings, `/reload` makes the advertised number follow.
 
-**The ceiling cannot be turned off**: `0`, negatives, and non-numeric values are dropped at every layer, and reaching the ceiling pauses the child with a session id and resume hint. **A resumed run gets a fresh full window** — budgets are per segment, not cumulative, so resuming once means two budgets' worth of work. That is the intended reading: one review gets 150 turns, and a resume is a second chance, not an leftover allowance.
+**The ceiling cannot be turned off**: `0`, negatives, and non-numeric values are dropped at every layer, and reaching the ceiling pauses the child with a session id and resume hint. **A resumed run gets a fresh full window** — budgets are per segment, not cumulative, so resuming once means two budgets' worth of work. That is the intended reading: one run gets its budget, and a resume is a second chance, not an leftover allowance.
 
 ## License
 

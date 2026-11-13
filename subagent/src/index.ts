@@ -2503,7 +2503,7 @@ export default function subagentExtension(pi: {
     // Positive-first wording (decision 001): state the wait model instead of only forbidding polling.
     promptGuidelines: [
       "Delegate any self-contained job to subagent so you stay free to keep working or hand control back to the user",
-      "Pass 'agent' with a roster role whose trigger description matches the job — e.g. 'reviewer' for an independent adversarial review; there is no anonymous child",
+      "Pass 'agent' with a roster role whose trigger description matches the job — e.g. 'explore' for a read-only codebase search; there is no anonymous child",
       "Pass 'description' as a short 3-5 word label: it titles the child session and the completion notice",
       "After a subagent starts, continue with non-overlapping work or end your turn; its complete output arrives as a new message that starts your next turn. Do not poll or sleep on it",
     ],
@@ -2517,7 +2517,7 @@ export default function subagentExtension(pi: {
         agent: {
           type: "string",
           description:
-            "Required agent role. Pass the name of a role from the roster in the tool description — the built-in 'reviewer' (independent adversarial review of code, diffs, plans, or current state), or any custom .pi/agents/<name>.md. A name that matches no document is rejected with the list of available roles.",
+            "Required agent role. Pass the name of a role from the roster in the tool description — a built-in role ('general' for multi-step work, 'explore' for read-only search), or any custom .pi/agents/<name>.md. A name that matches no document is rejected with the list of available roles.",
         },
         description: {
           type: "string",

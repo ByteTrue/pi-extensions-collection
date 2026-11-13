@@ -16,7 +16,7 @@ describe("resume instructions", () => {
       sessionId: childId,
       parentSessionId,
       description: "paused custom cwd",
-      agent: "reviewer",
+      agent: "explore",
       status: "paused",
       output: "",
       startedAt: Date.now(),
@@ -24,7 +24,7 @@ describe("resume instructions", () => {
       notifyOnExit: false,
       done: Promise.resolve(),
       progress: {
-        runs: [{ sessionId: childId, cwd: dir, agent: "reviewer" }],
+        runs: [{ sessionId: childId, cwd: dir, agent: "explore" }],
       } as unknown as SubagentTaskRecord["progress"],
     };
     subagentManager.register(record);

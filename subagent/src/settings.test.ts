@@ -112,7 +112,7 @@ describe("legacy global migration", () => {
         subagent: {
           defaultModel: "vendor/legacy-model",
           defaultThinking: "high",
-          agents: { reviewer: { model: "vendor/legacy-reviewer" } },
+          agents: { explore: { model: "vendor/legacy-explore" } },
         },
       },
       null,
@@ -124,7 +124,7 @@ describe("legacy global migration", () => {
     expect(read(newSettingsFile())).toEqual({
       defaultModel: "vendor/legacy-model",
       defaultThinking: "high",
-      agents: { reviewer: { model: "vendor/legacy-reviewer" } },
+      agents: { explore: { model: "vendor/legacy-explore" } },
     });
     // The old file keeps every byte, including Pi's own keys.
     expect(readFileSync(legacyGlobalFile(), "utf-8")).toBe(legacy);
@@ -149,14 +149,14 @@ describe("legacy global migration", () => {
       legacyGlobalFile(),
       JSON.stringify({
         subagents: {
-          agentOverrides: { reviewer: { model: "vendor/legacy-reviewer", thinking: "high" } },
+          agentOverrides: { explore: { model: "vendor/legacy-explore", thinking: "high" } },
         },
       }),
     );
 
-    expect(loadSubagentSettings(cwd).agents?.reviewer?.model).toBe("vendor/legacy-reviewer");
+    expect(loadSubagentSettings(cwd).agents?.explore?.model).toBe("vendor/legacy-explore");
     expect(read(newSettingsFile())).toEqual({
-      agents: { reviewer: { model: "vendor/legacy-reviewer", thinking: "high" } },
+      agents: { explore: { model: "vendor/legacy-explore", thinking: "high" } },
     });
   });
 
@@ -255,7 +255,7 @@ describe("project layer", () => {
   it("overrides the global layer and skips the project layer when untrusted", () => {
     updateSubagentSettings(cwd, "global", () => ({
       defaultModel: "vendor/global",
-      agents: { scout: { model: "vendor/global-scout" }, reviewer: { thinking: "high" } },
+      agents: { scout: { model: "vendor/global-scout" }, explore: { thinking: "high" } },
     }));
     updateSubagentSettings(cwd, "project", () => ({
       defaultModel: "vendor/project",
@@ -265,7 +265,7 @@ describe("project layer", () => {
     const trusted = loadSubagentSettings(cwd, true);
     expect(trusted.defaultModel).toBe("vendor/project");
     expect(trusted.agents?.scout?.model).toBe("vendor/project-scout");
-    expect(trusted.agents?.reviewer?.thinking).toBe("high");
+    expect(trusted.agents?.explore?.thinking).toBe("high");
 
     expect(loadSubagentSettings(cwd, false).defaultModel).toBe("vendor/global");
     expect(loadSubagentSettings(cwd, false).agents?.scout?.model).toBe("vendor/global-scout");

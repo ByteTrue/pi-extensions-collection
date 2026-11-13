@@ -47,6 +47,7 @@ created: 2026-11-12
 - **`bash-timeout` 全量对齐 opencode 的 shell 超时语义**（用户 2026-11-12 确认，选择了「全量对齐」）：默认 120s，显式 `timeout: 0` 关闭超时，显式更大的值不再压回上限，300s 硬上限移除。`background_run` 仍是长任务的去处。
 - **`background-terminal` 的后台任务默认无寿命上限**（用户 2026-11-12：对齐；「只要确保 pi 退出的时候能清理掉不要留僵尸进程」）。显式 `timeout` 仍然生效，但不再有 8 小时硬顶；Pi 会话退出时杀掉全部任务。
 - **`subagent` 的 `agent` 必填，删除 plain child**（用户 2026-11-12：D8 对齐）。省略 `agent` 将报错并列出可选角色。
+- **`subagent` 的内置角色完全对齐 opencode 的子代理角色**（用户 2026-11-13：「把我们的子代理扩展对齐 opencode 的。提示词可以直接复用」「reviewer 干掉，完全对齐 opencode」）：内置只剩 `general` 与 `explore`，自建的 `reviewer` 删除。触发句、以及 `explore` 的 system prompt，从 opencode `packages/core/src/plugin/agent.ts` 原样复用；`general` 不写 `tools:`（继承 pi 默认工具集），`explore` 写 `read, bash, grep, find, ls`（opencode 的 shell/grep/glob/read 的映射；pi 没有 webfetch/websearch 内置工具）。`plan` 不补：opencode 的 plan 是 primary agent，不能当子代理。issue 110 的「只有一个内置角色」由这条取代；`agents.reviewer` 这类只存在于 settings 的角色仍可解析（不带 prompt / tools），`plan` 与 `general-purpose` 仍不可用。
 - **扩展之间允许为体验做进程内耦合**（用户 2026-11-12：「反正都是我们自己的扩展集合，这个耦合对体验的提升我觉得可以做」）。用于 `goal` 判断本会话是否还有后台任务在跑（E6），以及 subagent 完成通知列出仍在运行的后台工作（D10）。耦合必须可选：对方扩展没加载时读不到，就退回当前行为。
 - **`ask-user` 的多选改成真多选**（用户 2026-11-12 指出：opencode 可以连续勾选后一起提交，我们是勾一个提交一个）。TUI 里用 `ctx.ui.custom` 实现空格切换、回车提交、Esc 取消；RPC 没有自定义组件时退回现有的勾选循环。用户 2026-11-12 选择「四项全删」，批次复核页不再保留，逐题作答 + 回退。
 - **`subagent` 的 `resume` 只能续本会话创建的子会话**（D11）。当前只校验 id 形状，模型可以传父会话 id。校验失败时报错，不启动子进程。

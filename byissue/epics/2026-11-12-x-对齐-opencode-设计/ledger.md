@@ -90,6 +90,7 @@ ls "$REF/packages/core/src/plugin/goal"
 | D18 续聊参数叫 `sessionID`（subagent.ts:40-42） | U4 | 不做 | 拟：pi 侧用 `resume`；工具结果与通知里已经返回 child sessionID，语义可对应 |
 | D19 工具声明结构化 `Output` schema（subagent.ts:45-49） | U4 | 不适用 | pi 的工具结果是 text + details，没有 declared output schema；结构化指针放在 details 里 |
 | D20 SIGKILL/crash 后的子进程回收 | U4 | 做了 | 子进程 journal（owner/child pid/start）+ 启动 `reapSubagentOrphans`；真实 SIGKILL 探针；`reap.test.ts` |
+| D21 内置子代理角色完全对齐 opencode：只留 `general`（触发句 verbatim、无 system prompt、无 tools: → 继承 pi 默认集）与 `explore`（触发句与 prompt verbatim、`read, bash, grep, find, ls` 只读）；自建的 `reviewer` 删除；`plan` 不补，opencode 的 plan 是 primary | U4 | 做了 | `agents/general.md` / `agents/explore.md`，`agents/reviewer.md` 已删除；`index.test.ts` 断言 reviewer/plan/general-purpose 均不可发现，roster 与工具描述只列 general/explore；`command.ts` 的 reviewer 专属提示与菜单示例已去掉；真实 `pi --tools read,bash,grep,find,ls` 探针确认五个工具被激活（system prompt 工具列表与 `ls` 调用） |
 | **goal ↔ goal plugin** | | | |
 | E1 objective 包成 `<untrusted_objective>` 并声明是数据不是指令（goal.ts:439-449；kickoff.txt / continuation.txt） | U5 | 做了 | 真实 pi system section 已验证转义；continuation 也重复 objective，覆盖 goal_start 中途建 goal；goalSection 测试 |
 | E2 objective 上限 4000 字符（goal.ts:15,388-391） | U5 | 做了 | `/goal` 与 `goal_start` 都拒绝；测试 |
