@@ -256,40 +256,17 @@ async function collectFreeform(
 }
 
 // ── Multi-select ──────────────────────────────────────────────────────
-// opencode's form toggles multiselect values inside one dialog and submits the
-// whole set at once. Pi has no built-in multiselect dialog, so TUI uses a small
-// custom component (space toggles, enter submits) and RPC keeps the
-// select-and-return loop, which is the closest the RPC dialog surface offers.
+// A loop of `ctx.ui.select` dialogs re-rendered as a checklist, deliberately not
+// a custom component: every dialog here then shares Pi's selector semantics,
+// where Enter always means "activate the highlighted row" and never "submit
+// everything I have so far". A custom dialog made Enter submit the whole set,
+// so a user trained by the other dialogs answered a whole question by accident
+// (reported as "选择也是回车,提交也是回车"). Submission is the explicit
+// `✓ Done (N selected)` row instead.
 type MultiOutcome =
   | { kind: "submit"; values: string[] }
   | { kind: "other" }
   | { kind: "back" };
-
-interface MultiRow {
-  kind: "option" | "other" | "back";
-  label: string;
-  description?: string;
-  value?: string;
-}
-
-function multiSelectRows(
-  options: AskUserOption[],
-  customText: string | undefined,
-  allowBack: boolean,
-): MultiRow[] {
-  const rows: MultiRow[] = options.map((option) => ({
-    kind: "option",
-    label: option.label,
-    ...(option.description ? { description: option.description } : {}),
-    value: option.label,
-  }));
-  rows.push({
-    kind: "other",
-    label: customText ? `Other: ${customText}` : OTHER_LABEL,
-  });
-  if (allowBack) rows.push({ kind: "back", label: BACK_LABEL });
-  return rows;
-}
 
 function multiSelectValues(
   options: AskUserOption[],
@@ -302,88 +279,7 @@ function multiSelectValues(
   return values;
 }
 
-async function multiSelectCustom(
-  ctx: ExtensionContext,
-  title: string,
-  options: AskUserOption[],
-  picked: Set<string>,
-  customText: string | undefined,
-  customChecked: boolean,
-  allowBack: boolean,
-): Promise<MultiOutcome | undefined> {
-  return withoutWorkingSpinner(ctx, () =>
-    ctx.ui.custom<MultiOutcome | undefined>((tui, theme, keybindings, done) => {
-      const rows = multiSelectRows(options, customText, allowBack);
-      const selected = new Set(picked);
-      let custom = customText;
-      let customOn = customChecked && Boolean(customText);
-      let cursor = 0;
-      let finished = false;
-      const finish = (value: MultiOutcome | undefined) => {
-        if (finished) return;
-        finished = true;
-        done(value);
-      };
-      const move = (delta: number) => {
-        cursor = (cursor + delta + rows.length) % rows.length;
-        tui.requestRender();
-      };
-      const toggle = () => {
-        const row = rows[cursor];
-        if (!row) return;
-        if (row.kind === "option" && row.value !== undefined) {
-          if (selected.has(row.value)) selected.delete(row.value);
-          else selected.add(row.value);
-        } else if (row.kind === "other") {
-          if (!custom) {
-            finish({ kind: "other" });
-            return;
-          }
-          customOn = !customOn;
-        }
-        tui.requestRender();
-      };
-      return {
-        render() {
-          const lines = [theme.fg("accent", theme.bold(title))];
-          rows.forEach((row, index) => {
-            const checked =
-              row.kind === "option" && row.value !== undefined
-                ? selected.has(row.value)
-                : row.kind === "other"
-                  ? customOn
-                  : undefined;
-            const mark = checked === undefined ? "" : checked ? "[✓] " : "[ ] ";
-            const pointer = index === cursor ? "> " : "  ";
-            const detail = row.description ? ` — ${row.description}` : "";
-            const text = `${pointer}${mark}${row.label}${detail}`;
-            lines.push(index === cursor ? theme.fg("accent", text) : text);
-          });
-          lines.push(theme.fg("dim", "  ↑↓ move · Space toggle · Enter submit · Esc cancel"));
-          return lines;
-        },
-        handleInput(data: string) {
-          if (keybindings.matches(data, "tui.select.up")) return move(-1);
-          if (keybindings.matches(data, "tui.select.down")) return move(1);
-          if (keybindings.matches(data, "tui.select.cancel")) return finish(undefined);
-          if (data === " ") return toggle();
-          if (!keybindings.matches(data, "tui.select.confirm")) return;
-          const row = rows[cursor];
-          if (!row) return;
-          if (row.kind === "back") return finish({ kind: "back" });
-          // With no custom text, Enter opens the editor. With text that is not
-          // selected, Enter also reopens the editor so it can be changed; a
-          // selected Other submits with the rest.
-          if (row.kind === "other" && (!custom || !customOn)) return finish({ kind: "other" });
-          finish({ kind: "submit", values: multiSelectValues(options, selected, custom, customOn) });
-        },
-        invalidate() {},
-      };
-    }),
-  );
-}
-
-async function multiSelectFallback(
+async function multiSelectDialog(
   ctx: ExtensionContext,
   title: string,
   options: AskUserOption[],
@@ -409,20 +305,15 @@ async function multiSelectFallback(
       ? `${customOn ? "[✓]" : "[ ]"} Other: ${custom}`
       : `[ ] ${OTHER_LABEL}`;
     const count = selected.size + (customOn ? 1 : 0);
-    // Always offer Done, including 0 selected: "Unanswered" is a valid answer
-    // (the TUI component already submits an empty set with Enter).
+    // Always offer Done, including 0 selected: submitting nothing is a valid
+    // answer ("Unanswered").
     const doneRow = `✓ Done (${count} selected)`;
-    const rows = [
-      ...checkedRows,
-      otherRow,
-      ...(doneRow ? [doneRow] : []),
-      ...(allowBack ? [BACK_LABEL] : []),
-    ];
+    const rows = [...checkedRows, otherRow, doneRow, ...(allowBack ? [BACK_LABEL] : [])];
 
     const selectedRow = await selectDialog(ctx, title, rows, signal);
     if (selectedRow === undefined) return undefined;
     if (allowBack && selectedRow === BACK_LABEL) return { kind: "back" };
-    if (doneRow && selectedRow === doneRow) {
+    if (selectedRow === doneRow) {
       return { kind: "submit", values: multiSelectValues(options, selected, custom, customOn) };
     }
     if (selectedRow === otherRow || selectedRow === `[ ] ${OTHER_LABEL}`) {
@@ -443,26 +334,6 @@ async function multiSelectFallback(
     if (selected.has(matched.label)) selected.delete(matched.label);
     else selected.add(matched.label);
   }
-}
-
-function multiSelectDialog(
-  ctx: ExtensionContext,
-  title: string,
-  options: AskUserOption[],
-  picked: Set<string>,
-  customText: string | undefined,
-  customChecked: boolean,
-  allowBack: boolean,
-  signal?: AbortSignal,
-): Promise<MultiOutcome | undefined> {
-  // `custom` only exists on the interactive TUI surface; RPC mode keeps the
-  // built-in dialog loop so BySpace and headless callers still work. Tests and
-  // older hosts without the custom API also take the fallback.
-  const custom = (ctx.ui as unknown as { custom?: unknown }).custom;
-  if (ctx.mode === "tui" && typeof custom === "function") {
-    return multiSelectCustom(ctx, title, options, picked, customText, customChecked, allowBack);
-  }
-  return multiSelectFallback(ctx, title, options, picked, customText, customChecked, allowBack, signal);
 }
 
 function formatAnswers(questions: NormalizedQuestion[], states: QuestionState[]): string {
@@ -632,7 +503,7 @@ export default function askUserExtension(pi: ExtensionAPI): void {
     name: "ask_user",
     label: "Ask user",
     description:
-      "When the next step depends on a decision only the user can make, ask it here instead of ending your turn with a prose question — the user answers by picking options and can go back to revise earlier answers in a multi-question flow. Pass 1-4 items in questions: batch independent decisions into one call, and ask a single question first only when later questions depend on its answer. For each question, pass 2-4 options when choices can be enumerated, set multiple: true when several options can be chosen together, or omit options for a genuinely open question.\n\nUsage notes:\n- An \"Other (type your answer)\" row is always appended; do not include a separate free-form option.\n- Multi-select questions toggle several options in one dialog and submit them together.\n- Batches end with a review page: the user can revise any question before submitting all answers.\n- A dismissed dialog means no answer — fall back to plain prose once and do not re-ask.",
+      "When the next step depends on a decision only the user can make, ask it here instead of ending your turn with a prose question — the user answers by picking options and can go back to revise earlier answers in a multi-question flow. Pass 1-4 items in questions: batch independent decisions into one call, and ask a single question first only when later questions depend on its answer. For each question, pass 2-4 options when choices can be enumerated, set multiple: true when several options can be chosen together, or omit options for a genuinely open question.\n\nUsage notes:\n- An \"Other (type your answer)\" row is always appended; do not include a separate free-form option.\n- Multi-select questions toggle rows and submit from the \"✓ Done (N selected)\" row; nothing submits on its own.\n- With 2+ questions, questions 2..N offer a \"← Back to previous question\" row so the user can revise an earlier answer.\n- A dismissed dialog means no answer — fall back to plain prose once and do not re-ask.",
     promptSnippet:
       "Ask the user 1-4 single- or multi-select decision questions — they pick options instead of typing.",
     promptGuidelines: [

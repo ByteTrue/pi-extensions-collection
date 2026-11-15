@@ -20,13 +20,12 @@ Registers one tool:
   - **Single-select (`options` without `multiple: true`)**: rendered through
     Pi's built-in `ctx.ui.select` dialog with an always-appended
     **"Other (type your answer)"** row.
-  - **Multi-select (`multiple: true`)**: in the TUI a small custom dialog
-    toggles `[✓]` / `[ ]` with Space and submits the whole set with Enter —
-    opencode's multiselect semantics, not one submit per pick. Picking
-    **"Other (type your answer)"** merges custom text into the selection as
-    `[✓] Other: …`. RPC mode keeps the built-in select loop with an always
-    present **"✓ Done (N selected)"** row (0 selected submits `Unanswered`),
-    because the RPC dialog surface has no custom component.
+  - **Multi-select (`multiple: true`)**: a loop of `ctx.ui.select` dialogs
+    re-rendered as a checklist — Enter activates the highlighted row (toggle
+    `[✓]` / `[ ]`, or open **"Other (type your answer)"** and merge it as
+    `[✓] Other: …`), and submission is the explicit **"✓ Done (N selected)"**
+    row (0 selected submits `Unanswered`). Enter never submits a half-built
+    selection on its own: one key does one job, in every dialog.
   - **Back-navigation (`questions.length > 1`)**: questions 2..N include a
     **"← Back to previous question"** row so you can return to an earlier
     question and revise its answer (previous selections are preserved).
@@ -37,9 +36,9 @@ Registers one tool:
   - **No dialog-capable UI (print/JSON mode)**: explicit error — the tool never
     guesses an answer.
 
-No runtime imports and no config. The TUI multiselect dialog is a plain
-component object passed to `ctx.ui.custom` (no pi-tui import); every other
-dialog uses Pi's built-ins. No overlay, no timeout.
+No runtime imports and no config. Every dialog is a Pi built-in
+(`ctx.ui.select` / `editor` / `input`) with the same arrow-keys + Enter
+semantics, in TUI and RPC alike. No custom component, no overlay, no timeout.
 
 ### Every dialog runs with the working spinner hidden
 
@@ -127,7 +126,8 @@ imports.
 ## Tests
 
 `npm --workspace ask-user test` covers registration, single-select option
-composition, the custom TUI multiselect (toggle several, submit once), custom
+composition, the multi-select checklist loop (toggle row by row, submit from
+`✓ Done`), custom
 `Other` merging, multi-question batching with back-navigation, the freeform
 path (empty = `Unanswered`), dismiss semantics, mode guards,
 schema shape (plain JSON Schema, no TypeBox runtime symbols, still convertible

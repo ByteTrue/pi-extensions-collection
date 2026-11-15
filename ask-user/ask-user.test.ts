@@ -62,72 +62,6 @@ function ctxWithRecorder(
   return { ctx, calls, working };
 }
 
-/**
- * Fake custom-component surface: captures the component so the test can drive
- * raw keys, and answers the next editor/input dialog from `freeform`.
- */
-function ctxWithCustom(
-  freeform?: string,
-): {
-  ctx: ExtensionContext;
-  send: (data: string) => void;
-  render: () => string[];
-  editorCalls: number;
-} {
-  let component:
-    | { render?: (width: number) => string[]; handleInput?: (data: string) => void }
-    | undefined;
-  let editorCalls = 0;
-  const ctx = {
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      custom: async (
-        factory: (
-          tui: { requestRender: () => void },
-          theme: { fg: (color: string, text: string) => string; bold: (text: string) => string },
-          keybindings: { matches: (data: string, key: string) => boolean },
-          done: (value: unknown) => void,
-        ) => { render: (width: number) => string[]; handleInput: (data: string) => void },
-      ) =>
-        new Promise((resolve) => {
-          component = factory(
-            { requestRender: () => {} },
-            { fg: (_color, text) => text, bold: (text) => text },
-            {
-              matches: (data, key) =>
-                (key === "tui.select.up" && data === "up") ||
-                (key === "tui.select.down" && data === "down") ||
-                (key === "tui.select.confirm" && data === "enter") ||
-                (key === "tui.select.cancel" && data === "esc"),
-            },
-            resolve,
-          );
-        }),
-      async select() {
-        throw new Error("select should not be used when custom is available");
-      },
-      async input() {
-        editorCalls += 1;
-        return freeform;
-      },
-      async editor() {
-        editorCalls += 1;
-        return freeform;
-      },
-      setWorkingVisible() {},
-    },
-  } as unknown as ExtensionContext;
-  return {
-    ctx,
-    send: (data) => component?.handleInput?.(data),
-    render: () => component?.render?.(80) ?? [],
-    get editorCalls() {
-      return editorCalls;
-    },
-  };
-}
-
 const flushTicks = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 function harness() {
@@ -423,44 +357,6 @@ describe("askUserExecute — multi-select questions (multiple: true)", () => {
     const { ctx } = ctxWithRecorder({ select: "✓ Done (0 selected)" }, { mode: "rpc" });
     const result = (await askUserExecute(multiParams, ctx)) as { content: { text: string }[] };
     expect(result.content[0]!.text).toBe(answeredText(["Which targets?", []]));
-  });
-  it("uses the custom TUI component to toggle several options and submit once", async () => {
-    const { ctx, send, render } = ctxWithCustom();
-    const pending = askUserExecute(multiParams, ctx);
-    await flushTicks();
-    expect(render().some((line) => line.includes("Which targets?"))).toBe(true);
-
-    send(" "); // toggle ESM
-    send("down");
-    send(" "); // toggle CJS
-    send("enter"); // submit both together
-
-    const result = (await pending) as { content: { text: string }[] };
-    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", ["ESM", "CJS"]]));
-  });
-
-  it("opens the freeform editor from the custom Other row and merges the text", async () => {
-    const { ctx, send } = ctxWithCustom("Deno");
-    const pending = askUserExecute(multiParams, ctx);
-    await flushTicks();
-    send("down");
-    send("down");
-    send("down"); // Other row
-    send("enter");
-    await flushTicks();
-    send("enter"); // submit the merged custom answer
-
-    const result = (await pending) as { content: { text: string }[] };
-    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", ["Deno"]]));
-  });
-
-  it("dismisses when the custom dialog is cancelled", async () => {
-    const { ctx, send } = ctxWithCustom();
-    const pending = askUserExecute(multiParams, ctx);
-    await flushTicks();
-    send("esc");
-    const result = (await pending) as { content: { text: string }[] };
-    expect(result.content[0]!.text).toContain("dismissed");
   });
 });
 
