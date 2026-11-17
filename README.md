@@ -72,6 +72,6 @@ first, because a missing entry is silent: the extension never loads.
 
 The rules this repo lives by — one git package, no npm publishing, no build step,
 dependencies installed by Pi, tool names globally unique, what has already been ruled
-out — are in [`byissue/`](./byissue): `spec/index.md` for the current truth,
-`decisions/` for the calls that were made, and the epic that split this repo out of
-its predecessor.
+out — are in [`bywork/memory/`](./bywork/memory), one file per topic. The previous
+workflow's records (spec, decisions, epics, probe notes) are archived read-only in
+[`archive/byissue/`](./archive/byissue).
