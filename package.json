@@ -10,6 +10,7 @@
     "background-terminal",
     "bash-timeout",
     "goal",
+    "hide-direct-tools",
     "subagent"
   ],
   "pi": {
@@ -19,6 +20,7 @@
       "./background-terminal/background-terminal.ts",
       "./bash-timeout/bash-timeout.ts",
       "./goal/goal.ts",
+      "./hide-direct-tools/hide-direct-tools.ts",
       "./subagent/subagent.ts"
     ]
   },
