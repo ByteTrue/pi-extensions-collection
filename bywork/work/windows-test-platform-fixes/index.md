@@ -1,7 +1,7 @@
 ---
 kind: work
 status: complete
-current_unit: "Windows 上 13 个失败用例已全部处理，全仓库测试与类型检查通过"
+current_unit: "Windows 上 13 个失败用例已全部处理，本机测试、类型检查与 Ubuntu CI 均通过"
 next_action: "无"
 must_hold: "保留 POSIX 原有断言与产品行为；不把平台差异改成产品假装 POSIX；commit/push 必须单独授权"
 proof_gap: ""
@@ -53,10 +53,11 @@ Windows 与 POSIX 的差异分成两类，处理方式不同。
 | P4 Windows 上带引号的命令行仍能匹配 session | 同上 | 回收路径解析 PowerShell 返回的 CommandLine | 命令尾部的 `--session <id>"` 能匹配，子进程被杀 | 同一用例通过；正则改为 token 边界 `(?![A-Za-z0-9_-])` | 通过 |
 | P5 Windows 上子代理轮次上限测试不再因目录占用失败 | `subagent` 下 `npx vitest run src/run-lifecycle.test.ts` | 运行 lets the current turn's tools finish 用例 | 临时目录清理成功，没有 EPERM | `evidence/subagent-run-lifecycle-verbose.txt`，该用例通过 | 通过 |
 | P6 全仓库 TypeScript 类型检查通过 | 仓库根目录 `npm run typecheck` | 直接运行 | 所有 workspace 退出码 0 | `evidence/typecheck.txt`，退出码 0 | 通过 |
+| P7 Ubuntu 上保留的 POSIX 断言通过 | GitHub Actions CI | push 后自动运行 | check-manifest、typecheck、npm test 全部通过 | `evidence/ci-44126882500.txt`，run 44126882500 成功，test job 52s | 通过 |
 
 ## 证据与决定
 
-修复前的 13 个失败用例和错误文本在 `evidence/before-failures.md`。修复后的原始输出在 `evidence/npm-test.txt`、`evidence/typecheck.txt`、`evidence/background-verbose.txt`、`evidence/subagent-reap-verbose.txt`。改动范围在 `evidence/git-diff-stat.txt`。
+修复前的 13 个失败用例和错误文本在 `evidence/before-failures.md`。修复后的原始输出在 `evidence/npm-test.txt`、`evidence/typecheck.txt`、`evidence/background-verbose.txt`、`evidence/subagent-reap-verbose.txt`。Ubuntu CI 的结果在 `evidence/ci-44126882500.txt`。改动范围在 `evidence/git-diff-stat.txt`。
 
 关键决定：
 
@@ -69,13 +70,12 @@ Windows 与 POSIX 的差异分成两类，处理方式不同。
 
 ## 完成核对
 
-- 行为门：6 行证明都从本机真实入口跑过，输出保存在 `evidence/`，没有剩余缺口。
+- 行为门：7 行证明都从真实入口跑过，本机输出和 CI 结果保存在 `evidence/`，没有剩余缺口。
 - 范围门：`scope.md` 列出 13 个失败用例，全部映射到通过用例或平台跳过；跳过项保留 POSIX 原断言。
-- 契约门：测试改动保留原断言；跳过只加在 win32；产品改动只在 Windows 分支，POSIX 代码路径未改；正则放宽对 POSIX 是兼容方向。POSIX CI 本次没有复跑，属于推断而非实测。
+- 契约门：测试改动保留原断言；跳过只加在 win32；产品改动只在 Windows 分支，POSIX 代码路径未改；正则放宽对 POSIX 是兼容方向。Ubuntu CI 已通过，保留的 POSIX 断言在 Linux 上实际执行。
 - 完成门：`npm test` 与 `npm run typecheck` 都退出 0，`proof_gap` 为空，`check_work.py` 已通过。
 
 ## 需要你看的
 
-- POSIX CI 没有在本次会话里复跑。跳过条件只认 win32，正则只放宽，推断 Linux 不会回归，但没有原始输出。
 - Windows 上没有进程创建时间，孤儿回收改用命令行 session 标记。PID 被复用且 session 完全相同的极端情况不再有第二道防线。
 - 本机跳过的 12 个用例都是 Windows 无法构造的 POSIX fixture：background-terminal 7 个（3 个符号链接、1 个 chmod、3 个原有平台用例），subagent 5 个（1 个创建时间比较、2 个符号链接、2 个原有平台用例）。
