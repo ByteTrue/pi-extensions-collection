@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
-import { reapSubagentOrphans, SUBAGENT_ORPHAN_DIR } from "./index.js";
+import { reapSubagentOrphans, subagentProcessStart, SUBAGENT_ORPHAN_DIR } from "./index.js";
 
 function alive(pid: number): boolean {
   try {
@@ -12,6 +12,25 @@ function alive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+const isWindows = process.platform === "win32";
+
+function spawnSleeper(sessionId: string) {
+  return spawn(process.execPath, ["-e", `setInterval(() => {}, 1000) // --session ${sessionId}`], {
+    detached: !isWindows,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
+function killTree(pid: number): void {
+  if (isWindows) {
+    try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+    return;
+  }
+  try { process.kill(-pid, "SIGKILL"); } catch {}
+  try { process.kill(pid, "SIGKILL"); } catch {}
 }
 
 function writeJournal(
@@ -24,9 +43,7 @@ function writeJournal(
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const journal = join(dir, `sub_${sessionId}.journal.json`);
   const start = join(dir, `sub_${sessionId}.start`);
-  const startValue = childPid > 0
-    ? execFileSync("ps", ["-p", String(childPid), "-o", "lstart="], { encoding: "utf8" }).trim()
-    : "";
+  const startValue = childPid > 0 ? subagentProcessStart(childPid) : "";
   writeFileSync(start, startValue);
   writeFileSync(
     journal,
@@ -38,10 +55,7 @@ function writeJournal(
 describe("reapSubagentOrphans", () => {
   it("kills a child whose owner is gone and removes its journal", { timeout: 15_000 }, async () => {
     const sessionId = `sub_reap_${Date.now()}`;
-    const child = spawn("/bin/sh", ["-c", `sleep 30 # ${sessionId}`], {
-      detached: true,
-      stdio: "ignore",
-    });
+    const child = spawnSleeper(sessionId);
     const childPid = child.pid!;
     const { journal, start } = writeJournal(sessionId, childPid, 999_999);
     try {
@@ -51,13 +65,15 @@ describe("reapSubagentOrphans", () => {
       expect(existsSync(journal)).toBe(false);
       expect(existsSync(start)).toBe(false);
     } finally {
-      try { process.kill(-childPid, "SIGKILL"); } catch {}
+      killTree(childPid);
       rmSync(journal, { force: true });
       rmSync(start, { force: true });
     }
   });
 
-  it("does not kill a reused PID when the recorded start differs but the command session matches", async () => {
+  // Windows records no creation time and reaps by the command-line session marker,
+  // so a stale-start mismatch is a POSIX-only branch.
+  it.skipIf(isWindows)("does not kill a reused PID when the recorded start differs but the command session matches", async () => {
     const sessionId = `sub_stale_${Date.now()}`;
     const child = spawn(process.execPath, ["-e", `setInterval(() => {}, 1000) // --session ${sessionId}`], { detached: true, stdio: "ignore" });
     const childPid = child.pid!;
@@ -69,13 +85,14 @@ describe("reapSubagentOrphans", () => {
       expect(alive(childPid)).toBe(true);
       expect(existsSync(journal)).toBe(true);
     } finally {
-      try { process.kill(-childPid, "SIGKILL"); } catch {}
+      killTree(childPid);
       rmSync(journal, { force: true });
       rmSync(start, { force: true });
     }
   });
 
-  it.each(["journal", "start"] as const)("refuses a symlinked %s state file", async (kind) => {
+  // Windows needs admin rights or Developer Mode to create symlinks.
+  it.skipIf(isWindows).each(["journal", "start"] as const)("refuses a symlinked %s state file", async (kind) => {
     const sessionId = `sub_symlink_${kind}_${Date.now()}`;
     const child = spawn(process.execPath, ["-e", `setInterval(() => {}, 1000) // --session ${sessionId}`], { detached: true, stdio: "ignore" });
     const childPid = child.pid!;
@@ -90,7 +107,7 @@ describe("reapSubagentOrphans", () => {
       expect(alive(childPid)).toBe(true);
       expect(existsSync(paths.journal)).toBe(true);
     } finally {
-      try { process.kill(-childPid, "SIGKILL"); } catch {}
+      killTree(childPid);
       rmSync(paths.journal, { force: true });
       rmSync(paths.start, { force: true });
       rmSync(target, { force: true });
@@ -99,17 +116,14 @@ describe("reapSubagentOrphans", () => {
 
   it("leaves a child alone while its owner is alive", async () => {
     const sessionId = `sub_live_${Date.now()}`;
-    const child = spawn("/bin/sh", ["-c", `sleep 30 # ${sessionId}`], {
-      detached: true,
-      stdio: "ignore",
-    });
+    const child = spawnSleeper(sessionId);
     const childPid = child.pid!;
     const { journal, start } = writeJournal(sessionId, childPid, process.pid);
     try {
       reapSubagentOrphans();
       expect(alive(childPid)).toBe(true);
     } finally {
-      try { process.kill(-childPid, "SIGKILL"); } catch {}
+      killTree(childPid);
       rmSync(journal, { force: true });
       rmSync(start, { force: true });
     }
@@ -117,7 +131,7 @@ describe("reapSubagentOrphans", () => {
 
   it("does not kill a process when the journal has no session id", async () => {
     const sessionId = `sub_missing_${Date.now()}`;
-    const child = spawn("/bin/sh", ["-c", `sleep 30 # ${sessionId}`], { detached: true, stdio: "ignore" });
+    const child = spawnSleeper(sessionId);
     const childPid = child.pid!;
     const { journal, start } = writeJournal(sessionId, childPid, 999_999, SUBAGENT_ORPHAN_DIR, { sessionId: undefined });
     try {
@@ -125,7 +139,7 @@ describe("reapSubagentOrphans", () => {
       expect(alive(childPid)).toBe(true);
       expect(existsSync(journal)).toBe(true);
     } finally {
-      try { process.kill(-childPid, "SIGKILL"); } catch {}
+      killTree(childPid);
       rmSync(journal, { force: true });
       rmSync(start, { force: true });
     }
@@ -145,9 +159,9 @@ describe("reapSubagentOrphans", () => {
     }
   });
 
-  it("ignores a hostile startPath even in an otherwise valid journal", async () => {
+  it("ignores a hostile startPath even in an otherwise valid journal", { timeout: 15_000 }, async () => {
     const sessionId = `sub_hostile_path_${Date.now()}`;
-    const child = spawn(process.execPath, ["-e", `setInterval(() => {}, 1000) // ${sessionId}`], { detached: true, stdio: "ignore" });
+    const child = spawnSleeper(sessionId);
     const childPid = child.pid!;
     const victim = join(SUBAGENT_ORPHAN_DIR, `${sessionId}-victim`);
     const { journal, start } = writeJournal(sessionId, childPid, 999_999, SUBAGENT_ORPHAN_DIR, { startPath: victim });
@@ -159,7 +173,7 @@ describe("reapSubagentOrphans", () => {
       expect(existsSync(journal)).toBe(false);
       expect(existsSync(start)).toBe(false);
     } finally {
-      try { process.kill(-childPid, "SIGKILL"); } catch {}
+      killTree(childPid);
       for (const path of [journal, start, victim]) rmSync(path, { force: true });
     }
   });

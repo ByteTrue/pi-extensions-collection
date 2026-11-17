@@ -1317,7 +1317,11 @@ function subagentAlive(pid: number): boolean {
   }
 }
 
-function subagentProcessStart(pid: number): string {
+/** Stable creation time of a live process, or "" when the platform cannot report one. */
+export function subagentProcessStart(pid: number): string {
+  // Windows has no portable creation-time query. Recording "" makes reaping fall
+  // back to the session marker in the command line (see subagentCommandMatches).
+  if (process.platform === "win32") return "";
   try {
     return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
@@ -1328,13 +1332,28 @@ function subagentProcessStart(pid: number): string {
   }
 }
 
+function subagentProcessCommandLine(pid: number): string {
+  if (process.platform === "win32") {
+    // shortcut: PowerShell CIM costs ~0.7 s, so it runs only on the crash-reap path;
+    // add a native process query if orphan reaping ever becomes hot.
+    return execFileSync(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, windowsHide: true },
+    ).trim();
+  }
+  return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+}
+
 function subagentCommandMatches(sessionId: string, pid: number): boolean {
   try {
-    const command = execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return new RegExp(`(?:^|\\s)--session(?:-id)?(?:=|\\s)${sessionId}(?=\\s|$)`).test(command);
+    const command = subagentProcessCommandLine(pid);
+    // A token boundary, not whitespace: Windows quotes the -e script, so the id can be
+    // followed by a closing quote.
+    return new RegExp(`(?:^|\\s)--session(?:-id)?(?:=|\\s)${sessionId}(?![A-Za-z0-9_-])`).test(command);
   } catch {
     return false;
   }

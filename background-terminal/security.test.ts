@@ -43,7 +43,8 @@ describe("background state directory boundary", () => {
     }
   });
 
-  it("tightens an owned loose directory before using it", () => {
+  // Windows reports POSIX mode bits as 0o666 regardless of chmod.
+  it.skipIf(process.platform === "win32")("tightens an owned loose directory before using it", () => {
     mkdirSync(DIR, { recursive: true });
     chmodSync(DIR, 0o755);
 

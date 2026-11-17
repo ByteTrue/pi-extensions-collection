@@ -474,7 +474,9 @@ describe("background-terminal extension", () => {
     const operations = { exec: async () => ({ exitCode: 0 }) };
     const finished = Array.from({ length: 600 }, () => manager.start('node -e ""', process.cwd(), sessionId, { operations }));
     await vi.waitFor(() => expect(manager.list(sessionId).filter((task) => task.status !== "running")).toHaveLength(600));
-    await settle();
+    // Closing 600 output streams can lag the status change on Windows; wait for the
+    // notification queue instead of a fixed delay so the settle flush is deterministic.
+    await vi.waitFor(() => expect(manager.pendingNotifications(sessionId)).toHaveLength(600), { timeout: 20_000 });
 
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
 

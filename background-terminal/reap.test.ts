@@ -118,7 +118,9 @@ describe("reapOrphans", () => {
     }
   });
 
-  it.each(["journal", "pid", "start"] as const)("refuses a symlinked %s state file", async (kind) => {
+  // Creating symlinks needs admin rights or Developer Mode on Windows, so the fixture
+  // cannot be built there; the symlink-rejection logic is POSIX-tested.
+  it.skipIf(process.platform === "win32").each(["journal", "pid", "start"] as const)("refuses a symlinked %s state file", async (kind) => {
     const session = `reap-symlink-${kind}-session`;
     const task = manager.start("sleep 30", process.cwd(), session);
     const journalPath = join(DIR, `${task.id}.journal.json`);

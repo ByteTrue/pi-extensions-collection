@@ -33,7 +33,8 @@ async function runScript(id: string, lines: string[], maxTurns = 100) {
   } finally {
     if (previous === undefined) delete process.env.PI_CLI_JS;
     else process.env.PI_CLI_JS = previous;
-    rmSync(dir, { recursive: true, force: true });
+    // Windows can briefly keep a directory locked after the child exits.
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
 
