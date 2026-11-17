@@ -1,0 +1,73 @@
+npm notice run pi-extensions-collection@0.0.0 test
+npm notice run npm run test --workspaces --if-present
+npm notice run ask-user@0.0.0 test
+npm notice run vitest run
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/ask-user
+
+
+ Test Files  1 passed (1)
+      Tests  28 passed (28)
+   Start at  00:25:56
+   Duration  314ms (transform 51ms, setup 0ms, import 76ms, tests 10ms, environment 0ms)
+
+npm notice run auto-compact@0.0.0 test
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/auto-compact
+
+
+ Test Files  1 passed (1)
+      Tests  8 passed (8)
+   Start at  00:25:57
+   Duration  274ms (transform 37ms, setup 0ms, import 58ms, tests 23ms, environment 0ms)
+
+npm notice run background-terminal@0.0.0 test
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/background-terminal
+
+
+ Test Files  9 passed (9)
+      Tests  68 passed | 7 skipped (75)
+   Start at  00:25:58
+   Duration  17.05s (transform 739ms, setup 0ms, import 37.65s, tests 24.66s, environment 1ms)
+
+npm notice run bash-timeout@0.0.0 test
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/bash-timeout
+
+
+ Test Files  1 passed (1)
+      Tests  17 passed (17)
+   Start at  00:26:15
+   Duration  2.85s (transform 53ms, setup 0ms, import 2.54s, tests 88ms, environment 0ms)
+
+npm notice run goal@0.0.0 test
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/goal
+
+
+ Test Files  1 passed (1)
+      Tests  46 passed (46)
+   Start at  00:26:19
+   Duration  343ms (transform 65ms, setup 0ms, import 94ms, tests 15ms, environment 0ms)
+
+npm notice run hide-direct-tools@0.0.0 test
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/hide-direct-tools
+
+
+ Test Files  1 passed (1)
+      Tests  5 passed (5)
+   Start at  00:26:20
+   Duration  284ms (transform 40ms, setup 0ms, import 61ms, tests 4ms, environment 0ms)
+
+npm notice run subagent@0.0.0 test
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/subagent
+
+
+ Test Files  10 passed (10)
+      Tests  122 passed | 5 skipped (127)
+   Start at  00:26:20
+   Duration  5.12s (transform 1.31s, setup 0ms, import 4.47s, tests 14.30s, environment 1ms)
+

@@ -1,0 +1,15 @@
+npm notice run pi-extensions-collection@0.0.0 npx
+npm notice run ^"vitest^" run src/run-lifecycle.test.ts --reporter=verbose
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/subagent
+
+ ✓ src/run-lifecycle.test.ts > runPi lifecycle boundaries > lets the current turn's tools finish before enforcing maxTurns 764ms
+ ✓ src/run-lifecycle.test.ts > runPi lifecycle boundaries > accepts natural completion exactly at maxTurns 150ms
+ ✓ src/run-lifecycle.test.ts > runPi lifecycle boundaries > keeps partial output and appends the fatal child error 154ms
+ ✓ src/run-lifecycle.test.ts > runPi lifecycle boundaries > keeps streamed text when the child fails before message_end 139ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed (4)
+   Start at  00:29:58
+   Duration  1.78s (transform 159ms, setup 0ms, import 361ms, tests 1.21s, environment 0ms)
+

@@ -1,0 +1,21 @@
+npm notice run pi-extensions-collection@0.0.0 npx
+npm notice run ^"vitest^" run src/reap.test.ts --reporter=verbose
+
+ RUN  v4.1.12 C:/Users/byte/workspace/pi-extensions-collection/subagent
+
+ ✓ src/reap.test.ts > reapSubagentOrphans > kills a child whose owner is gone and removes its journal 1257ms
+ ↓ src/reap.test.ts > reapSubagentOrphans > does not kill a reused PID when the recorded start differs but the command session matches
+ ↓ src/reap.test.ts > reapSubagentOrphans > refuses a symlinked journal state file
+ ↓ src/reap.test.ts > reapSubagentOrphans > refuses a symlinked start state file
+ ✓ src/reap.test.ts > reapSubagentOrphans > leaves a child alone while its owner is alive 296ms
+ ✓ src/reap.test.ts > reapSubagentOrphans > does not kill a process when the journal has no session id 245ms
+ ✓ src/reap.test.ts > reapSubagentOrphans > does not delete a startPath supplied by an invalid-PID journal 5ms
+ ✓ src/reap.test.ts > reapSubagentOrphans > ignores a hostile startPath even in an otherwise valid journal 1180ms
+ ↓ src/reap.test.ts > reapSubagentOrphans > refuses a directory owned by another user
+ ↓ src/reap.test.ts > reapSubagentOrphans > migrates an owned loose directory to private permissions
+
+ Test Files  1 passed (1)
+      Tests  5 passed | 5 skipped (10)
+   Start at  00:27:34
+   Duration  3.56s (transform 159ms, setup 0ms, import 348ms, tests 2.99s, environment 0ms)
+

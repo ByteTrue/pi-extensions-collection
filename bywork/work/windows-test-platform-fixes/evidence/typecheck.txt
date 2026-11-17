@@ -1,0 +1,10 @@
+npm notice run pi-extensions-collection@0.0.0 typecheck
+npm notice run npm run typecheck --workspaces --if-present
+npm notice run ask-user@0.0.0 typecheck
+npm notice run tsc --noEmit
+npm notice run auto-compact@0.0.0 typecheck
+npm notice run background-terminal@0.0.0 typecheck
+npm notice run bash-timeout@0.0.0 typecheck
+npm notice run goal@0.0.0 typecheck
+npm notice run hide-direct-tools@0.0.0 typecheck
+npm notice run subagent@0.0.0 typecheck
