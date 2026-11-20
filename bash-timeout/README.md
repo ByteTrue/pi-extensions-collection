@@ -6,23 +6,16 @@ tools — one extension in this repo.
 Pi's built-in `bash` runs with no timeout unless the model passes one, so a single
 runaway foreground command (`find /`) can wedge the agent for hours. opencode's
 `shell` tool defaults foreground calls to 2 minutes and treats `timeout: 0` as an
-explicit opt-out. This extension copies that contract onto Pi's built-ins with two
-event hooks and nothing else:
+explicit opt-out. This extension applies that behavior through one `tool_call` hook:
 
 - **Default** — a `tool_call` hook injects `timeout: 120` when a `bash`/`powershell`
   call passes none.
 - **Opt-out** — an explicit `timeout: 0` removes the parameter, because Pi's
-  built-in shell rejects `<= 0`; the built-in then runs with no timeout. Any
-  positive value is left untouched; there is no second hard cap (only Pi's own
-  platform maximum of 2,147,483 seconds).
-- **Steering** — when a shell command dies on the timeout, a `tool_result` hook
-  appends one block: pass a larger timeout (or `0` to disable it), or use
-  `background_run` from [`background-terminal`](../background-terminal) so the
-  command's exit arrives as a new message instead of blocking the turn.
+  built-in shell rejects `<= 0`; removing the parameter lets it run without a timeout.
+- **Explicit timeout** — positive values are respected up to Pi's platform maximum
+  of 2,147,483 seconds.
 
-No tool is registered, overridden, or executed here — only a missing parameter gets
-a default value and an explicitly disabled one stays disabled. `background_run`
-(when installed) resolves its own lifetime inside its execute.
+The extension registers no tools or commands and leaves tool results unchanged.
 
 ## Install
 
@@ -49,7 +42,7 @@ Disable `bash-timeout` in `pi config`, or remove the whole package with
 `pi remove git:github.com/ByteTrue/pi-extensions-collection`.
 
 The built-in `bash`/`powershell` tools return to their exact built-in behavior — no
-default timeout, no steering. The extension registers no tools and no commands, so
+default timeout. The extension registers no tools and no commands, so
 there is nothing else to clean up.
 
 ## How it works

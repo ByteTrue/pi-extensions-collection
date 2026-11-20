@@ -5,7 +5,6 @@ import piGoalExtension, {
   CONTINUE_MESSAGE,
   GOAL_DONE_TOOL,
   GOAL_ENTRY,
-  GOAL_START_TOOL,
   MAX_OBJECTIVE_CHARS,
   MAX_ROUNDS,
   RESUME_MESSAGE,
@@ -260,7 +259,7 @@ describe("goal command", () => {
     await command(h, "pause");
     expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused" });
     // Paused keeps goal_done: the objective is still there, and the work may finish later.
-    expect(h.activeTools()).toEqual(expect.arrayContaining([GOAL_START_TOOL, GOAL_DONE_TOOL]));
+    expect(h.activeTools()).toContain(GOAL_DONE_TOOL);
     expect(h.setStatusCalls.at(-1)).toBe("goal:paused");
 
     await command(h, "resume");
@@ -340,7 +339,7 @@ describe("continuation loop", () => {
     expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused", runs: 3 });
     expect(h.notices.at(-1)?.text).toContain("no tools");
     // The loop stops but the objective stays completable: goal_done is still offered.
-    expect(h.activeTools()).toEqual(expect.arrayContaining([GOAL_START_TOOL, GOAL_DONE_TOOL]));
+    expect(h.activeTools()).toContain(GOAL_DONE_TOOL);
   });
 
   it("continues after the kickoff run even when it only answers in text", async () => {
@@ -382,65 +381,6 @@ describe("continuation loop", () => {
 
     await command(h, "clear");
     expect(await settle(h)).toBeUndefined();
-  });
-});
-
-describe("goal_start tool", () => {
-  it("is the tool offered while no goal runs", async () => {
-    const h = harness();
-    await h.handlers.session_start!({ type: "session_start" }, h.ctx);
-    expect(h.activeTools()).toContain(GOAL_START_TOOL);
-    expect(h.activeTools()).not.toContain(GOAL_DONE_TOOL);
-  });
-
-  it("starts a goal the model drafted, and the loop takes over", async () => {
-    const h = harness();
-    const result = await h.tools[GOAL_START_TOOL]!.execute(
-      "call-1",
-      { objective: "Cut p95 latency below 100 ms, verified by the bench, without failing tests" },
-      undefined,
-      undefined,
-      h.ctx,
-    );
-
-    expect(result.isError).toBeUndefined();
-    expect(result.content[0].text).toContain("Goal started:");
-    expect(lastGoalEntry(h.entries)).toMatchObject({
-      objective: "Cut p95 latency below 100 ms, verified by the bench, without failing tests",
-      status: "active",
-      runs: 0,
-    });
-    expect(h.notices.at(-1)?.text).toContain("Goal active:");
-
-    // The tool swap happens at the settle boundary, where the loop also continues.
-    const options: { sections: Record<string, string> } = { sections: {} };
-    await h.handlers.before_agent_start!({ systemPromptOptions: options }, h.ctx);
-    expect(options.sections.goal).toContain("Cut p95 latency below 100 ms");
-
-    runTurn(h, false);
-    expect(await settle(h)).toMatchObject({ continue: true });
-    expect(h.activeTools()).toContain(GOAL_DONE_TOOL);
-    expect(h.activeTools()).not.toContain(GOAL_START_TOOL);
-  });
-
-  it("refuses to replace a running goal", async () => {
-    const h = harness();
-    await command(h, "Original goal");
-    const result = await h.tools[GOAL_START_TOOL]!.execute("call-1", { objective: "Another goal" }, undefined, undefined, h.ctx);
-    expect(result.isError).toBe(true);
-    expect(lastGoalEntry(h.entries)).toMatchObject({ objective: "Original goal", status: "active" });
-  });
-
-  it("replaces a finished goal and rejects an empty objective", async () => {
-    const h = harness();
-    const empty = await h.tools[GOAL_START_TOOL]!.execute("call-1", { objective: "  " }, undefined, undefined, h.ctx);
-    expect(empty.isError).toBe(true);
-
-    await command(h, "First goal");
-    await h.tools[GOAL_DONE_TOOL]!.execute("c", { summary: "s", evidence: "e" }, undefined, undefined, h.ctx);
-    const second = await h.tools[GOAL_START_TOOL]!.execute("c2", { objective: "Second goal" }, undefined, undefined, h.ctx);
-    expect(second.isError).toBeUndefined();
-    expect(lastGoalEntry(h.entries)).toMatchObject({ objective: "Second goal", status: "active", runs: 0 });
   });
 });
 
@@ -528,6 +468,7 @@ describe("session wiring", () => {
   it("leaves goal_done out of the tool set when a session starts without a goal", async () => {
     const h = harness();
     await h.handlers.session_start!({ type: "session_start" }, h.ctx);
+    expect(Object.keys(h.tools)).toEqual([GOAL_DONE_TOOL]);
     expect(h.activeTools()).not.toContain(GOAL_DONE_TOOL);
     expect(h.setStatusCalls.at(-1)).toBeUndefined();
   });
@@ -545,13 +486,13 @@ describe("session wiring", () => {
     expect(options.sections.goal).toBeDefined();
   });
 
-  it("restores a paused goal with both tools", async () => {
+  it("restores a paused goal with the completion tool available", async () => {
     const h = harness([
       { type: "custom", customType: GOAL_ENTRY, data: goal({ status: "paused", objective: "Finish later" }) },
     ]);
     await h.handlers.session_start!({ type: "session_start" }, h.ctx);
 
-    expect(h.activeTools()).toEqual(expect.arrayContaining([GOAL_START_TOOL, GOAL_DONE_TOOL]));
+    expect(h.activeTools()).toContain(GOAL_DONE_TOOL);
     expect(h.setStatusCalls.at(-1)).toBe("goal:paused");
   });
 
@@ -618,15 +559,6 @@ describe("opencode alignment additions", () => {
     await command(h, "x".repeat(MAX_OBJECTIVE_CHARS + 1));
     expect(lastGoalEntry(h.entries)).toBeNull();
     expect(h.notices.at(-1)?.text).toContain("limited to 4000");
-
-    const result = await h.tools[GOAL_START_TOOL]!.execute(
-      "c",
-      { objective: "x".repeat(MAX_OBJECTIVE_CHARS + 1) },
-      undefined,
-      undefined,
-      h.ctx,
-    );
-    expect(result.isError).toBe(true);
   });
 
   it("pauses a goal left active by an earlier process", async () => {
@@ -643,7 +575,7 @@ describe("opencode alignment additions", () => {
       reason: "the Pi process restarted while the goal was active",
     });
     // A paused goal can still be completed or replaced.
-    expect(h.activeTools()).toEqual(expect.arrayContaining([GOAL_START_TOOL, GOAL_DONE_TOOL]));
+    expect(h.activeTools()).toContain(GOAL_DONE_TOOL);
   });
 
 

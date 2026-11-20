@@ -66,6 +66,8 @@ async function pickBudgetNumber(
       label: "Clear override (use the package default)",
       description: "unset this value",
     });
+  } else {
+    items.push({ value: "__CLEAR__", label: "Inherit budget" });
   }
 
   items.push({
@@ -135,8 +137,10 @@ export async function pickModel(
     items.push({
       value: "__CLEAR__",
       label: "Clear model override",
-      description: "inherit parent session model",
+      description: "inherit model",
     });
+  } else {
+    items.push({ value: "__CLEAR__", label: "Inherit model" });
   }
 
   items.push({
@@ -192,6 +196,8 @@ export async function pickThinking(
       label: "Clear thinking override",
       description: "inherit default thinking level",
     });
+  } else {
+    items.push({ value: "__CLEAR__", label: "Inherit thinking level" });
   }
 
   for (const t of THINKING_CHOICES) {

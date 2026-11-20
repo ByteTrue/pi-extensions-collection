@@ -274,62 +274,6 @@ describe("background-terminal extension", () => {
     await manager.clearSession(sessionId);
   });
 
-  it("starts cleanly over a legacy manager that predates notification replay", async () => {
-    const key = Symbol.for("@bytetrue/pi-background-terminal.manager");
-    const store = globalThis as unknown as Record<symbol, unknown>;
-    const previous = store[key];
-    const pendingKey = Symbol.for("@bytetrue/pi-background-terminal.pending-exits");
-    const previousPending = store[pendingKey];
-    delete store[pendingKey];
-    const legacyTask = (id: string, tail: string): BackgroundTask => ({
-      id,
-      command: "legacy",
-      cwd: process.cwd(),
-      parentSessionId: "legacy-manager-session",
-      status: "exited",
-      exitCode: 0,
-      createdAt: new Date(),
-      outputPath: join(tmpdir(), "background-terminal", `${id}.log`),
-      lineCount: 0,
-      tail,
-    });
-    let legacyOnExit: ((task: BackgroundTask) => void) | undefined;
-    const legacy = {
-      listAll: () => [legacyTask("bg_fedcba9876543210", "LEGACY_PENDING_BEFORE_INIT")],
-      list: () => [],
-      init: vi.fn((onExit: typeof legacyOnExit) => { legacyOnExit = onExit; }),
-    };
-    store[key] = legacy;
-    vi.resetModules();
-    try {
-      const { default: register } = await import("./background-terminal.js");
-      const handlers: Record<string, Handler> = {};
-      const sendMessage = vi.fn();
-      register({
-        registerTool: vi.fn(),
-        registerCommand: vi.fn(),
-        registerMessageRenderer: vi.fn(),
-        sendMessage,
-        on: (event: string, handler: Handler) => { handlers[event] = handler; },
-      } as unknown as ExtensionAPI);
-
-      legacyOnExit?.(legacyTask("bg_0123456789abcdef", "LEGACY_RESULT"));
-      await expect(handlers.session_start?.(
-        { type: "session_start", reason: "reload" },
-        ctxFor("legacy-manager-session"),
-      )).resolves.toBeUndefined();
-      expect(legacy.init).toHaveBeenCalledOnce();
-      expect(sendMessage).toHaveBeenCalledOnce();
-      expect(sendMessage.mock.calls[0]?.[0].content).toContain("LEGACY_RESULT");
-      expect(sendMessage.mock.calls[0]?.[0].content).toContain("LEGACY_PENDING_BEFORE_INIT");
-    } finally {
-      store[key] = previous;
-      if (previousPending === undefined) delete store[pendingKey];
-      else store[pendingKey] = previousPending;
-      vi.resetModules();
-    }
-  });
-
   it("retries a completion on the next boundary after sendMessage throws", async () => {
     const runtime = harness();
     const sessionId = "send-retry-session";

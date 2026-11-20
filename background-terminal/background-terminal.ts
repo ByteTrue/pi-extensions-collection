@@ -124,9 +124,21 @@ function readOwnedStateFile(path: string): string {
   return readFileSync(path, "utf8");
 }
 
-/** How long a session shutdown waits for a killed task before letting Pi exit.
- * A task that survives this wait stays in the journal for the next-start reaper. */
-const SHUTDOWN_WAIT_MS = 5_000;
+/** Maximum wait for a task to settle after a stop request. */
+const TASK_SETTLE_WAIT_MS = 5_000;
+
+async function waitForTask(done: Promise<void>): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      done.then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), TASK_SETTLE_WAIT_MS); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Orphan logs older than this are swept at extension load. With no task lifetime,
  * a live task in another Pi process can be silent for a long time; keep this well
  * above any plausible live task age. $TMPDIR is OS-cleaned eventually. */
@@ -522,6 +534,14 @@ export class BackgroundManager {
     return true;
   }
 
+  async stopAndWait(id: string, sessionId: string): Promise<void> {
+    const task = this.tasks.get(id);
+    if (!task || !this.kill(id, sessionId)) throw new Error("Background command is no longer running in this session.");
+    if (!(await waitForTask(task.done)) || task.status !== "killed") {
+      throw new Error("Background command termination could not be confirmed.");
+    }
+  }
+
   private maybeNotify(task: InternalTask): void {
     if (task.notified) return;
     if (!task.notifyOnExit) return;
@@ -574,11 +594,7 @@ export class BackgroundManager {
       ...tasks.map(async (task) => {
         // Do not hang Pi forever on a process that refuses to die. If the wait
         // times out, the journal stays and the next-start reaper kills it.
-        const settled = await Promise.race([
-          task.done.then(() => true),
-          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), SHUTDOWN_WAIT_MS)),
-        ]);
-        if (!settled) return;
+        if (!(await waitForTask(task.done))) return;
         cleanupTaskMeta(task);
         await rm(task.outputPath, { force: true }).catch(() => {});
       }),
@@ -624,22 +640,10 @@ export class BackgroundManager {
 // background_kill, and never notified. Pinning to a process global keeps one manager across
 // re-imports. Tasks stay isolated by parentSessionId, so sharing one manager is safe.
 //
-// A stale install of an older version (e.g. an outdated npm cache) can load first in the same
-// process and occupy the symbol with an instance that lacks newer methods, which would crash
-// this module at load ("manager.listAll is not a function"). Reuse the global only if it has
-// the methods this module needs; otherwise replace it — safe, because extensions all load at
-// startup before any task can start. The check is by capability, not instanceof: /reload
-// re-evaluates the class, so instances worth keeping are not instanceof this module's class.
-const MANAGER_KEY = Symbol.for("@bytetrue/pi-background-terminal.manager");
+// Changing the global state contract requires a Pi restart, not a live upgrade.
+const MANAGER_KEY = Symbol.for("@bytetrue/pi-background-terminal.manager.v2");
 const globalStore = globalThis as unknown as Record<symbol, BackgroundManager | undefined>;
-
-function isCompatibleManager(instance: BackgroundManager | undefined): instance is BackgroundManager {
-  return typeof instance?.listAll === "function";
-}
-
-export const manager: BackgroundManager = isCompatibleManager(globalStore[MANAGER_KEY])
-  ? globalStore[MANAGER_KEY]
-  : (globalStore[MANAGER_KEY] = new BackgroundManager());
+export const manager = (globalStore[MANAGER_KEY] ??= new BackgroundManager());
 
 // ---------------------------------------------------------------------------
 // background work registry (cross-extension, optional)
@@ -1038,10 +1042,9 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
   let currentSessionId: string | null = null;
   let updateStatus: (() => void) | undefined;
   let agentBusy = false;
-  const pendingKey = Symbol.for("@bytetrue/pi-background-terminal.pending-exits");
-  const pendingStore = globalThis as unknown as Record<symbol, { tasks: BackgroundTask[]; legacyAdopted?: boolean } | undefined>;
-  const pendingState = (pendingStore[pendingKey] ??= { tasks: [] });
-  const pendingExits = pendingState.tasks;
+  const pendingKey = Symbol.for("@bytetrue/pi-background-terminal.pending-exits.v2");
+  const pendingStore = globalThis as unknown as Record<symbol, BackgroundTask[] | undefined>;
+  const pendingExits = (pendingStore[pendingKey] ??= []);
   const enqueueExit = (task: BackgroundTask) => {
     const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
     if (index >= 0) pendingExits[index] = task;
@@ -1074,7 +1077,7 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
         break;
       }
       for (const task of tasks) {
-        manager.notificationDelivered?.(task.id);
+        manager.notificationDelivered(task.id);
         const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
         if (index >= 0) pendingExits.splice(index, 1);
       }
@@ -1091,14 +1094,18 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
     },
     () => updateStatus?.(),
   );
-  // shortcut: legacy records lack delivery state, so first upgrade may replay an old notice; exactly-once needs a host handoff API.
-  if (!pendingState.legacyAdopted && typeof manager.pendingNotifications !== "function") {
-    pendingState.legacyAdopted = true;
-    for (const task of manager.listAll()) {
-      if (task.status !== "running") enqueueExit(task);
-    }
-  }
 
+  pi.events?.on("bytetrue.background-terminal.manage", (value) => {
+    const request = value as { sessionId: string; taskId?: string; respond: (result: Promise<unknown>) => void };
+    if (!request || typeof request.respond !== "function" || !currentSessionId || request.sessionId !== currentSessionId) return;
+    const sessionId = currentSessionId;
+    request.respond((async () => {
+      if (request.taskId !== undefined) {
+        await manager.stopAndWait(request.taskId, sessionId);
+      }
+      return manager.list(sessionId).map(({ id, command, status, createdAt }) => ({ id, command, status, createdAt }));
+    })());
+  });
   registerBackgroundCommand(pi);
   // No foreground-timeout hook here: the default for bash/powershell lives in the
   // separate bash-timeout extension, so an install of this package contains no hook
@@ -1126,7 +1133,7 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     currentSessionId = sessionId;
-    for (const task of manager.pendingNotifications?.(sessionId) ?? []) enqueueExit(task);
+    for (const task of manager.pendingNotifications(sessionId)) enqueueExit(task);
     updateStatus = () => {
       const running = manager.list(sessionId).filter((task) => task.status === "running").length;
       ctx.ui.setStatus("background-terminal", running === 0 ? undefined : `bg:${running}`);

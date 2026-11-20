@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, lstatSync, readdirSync, readFileSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, readdirSync, readFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { StringDecoder } from "node:string_decoder";
@@ -20,7 +20,7 @@ import {
   listBuiltinAgentNames,
   type AgentConfig,
 } from "./builtin-agents.js";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 export { BUILTIN_AGENTS_DIR, listBuiltinAgentNames, type AgentConfig };
@@ -201,6 +201,8 @@ export interface RunState {
   sessionId: string;
   /** Child process cwd; with sessionId it locates the persisted session log. */
   cwd?: string;
+  /** Effective config directory passed to the child. */
+  agentDir?: string;
   step?: number;
   status: RunStatus;
   pauseReason?: "timeout" | "max_turns";
@@ -427,11 +429,11 @@ function listSessionDir(dir: string): string[] | undefined {
 }
 
 export function sessionLogPath(
-  run: Pick<RunState, "cwd" | "sessionId">,
+  run: Pick<RunState, "cwd" | "sessionId" | "agentDir">,
 ): string | undefined {
   if (!run.cwd) return undefined;
   const agentDir =
-    process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+    run.agentDir ?? (process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent"));
   const safe = `--${resolve(run.cwd)
     .replace(/^[/\\]/, "")
     .replace(/[/\\:]/g, "-")}--`;
@@ -1409,6 +1411,31 @@ export function reapSubagentOrphans(orphanDir = SUBAGENT_ORPHAN_DIR): void {
     return;
   }
   for (const name of names) {
+    const paseoOwner = /^paseo-([1-9][0-9]{0,9})-[A-Za-z0-9]{6}$/.exec(name);
+    if (paseoOwner) {
+      const path = join(orphanDir, name);
+      try {
+        const info = lstatSync(path);
+        if (info.isDirectory() && Date.now() - info.mtimeMs > 7 * 24 * 60 * 60 * 1000 && !subagentAlive(Number(paseoOwner[1]))) {
+          // A resumed task's replay pointer must survive as long as its transcript.
+          const aliasRoot = join(path, process.platform === "win32" ? "session" : "session.jsonl");
+          const snapshot = (() => {
+            try { return JSON.parse(readOwnedSubagentStateFile(join(path, "status.json"))) as { steps?: Array<{ sessionFile?: unknown }> }; }
+            catch { return undefined; }
+          })();
+          const file = snapshot?.steps?.[0]?.sessionFile;
+          if (typeof file === "string" && (file === aliasRoot || dirname(file) === aliasRoot)) {
+            try {
+              if (statSync(file).isFile()) continue;
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+            }
+          }
+          rmSync(path, { recursive: true, force: true });
+        }
+      } catch {}
+      continue;
+    }
     if (!name.startsWith("sub_") || !name.endsWith(".journal.json")) continue;
     const journalPath = join(orphanDir, name);
     try {
@@ -1590,8 +1617,6 @@ export function runPi(
       resolve(v);
     };
 
-    // Single rendering for paused results — used at abort time (immediate
-    // notify) and by close as a dedupe-safe fallback.
     const pausedResult = (): {
       output: string;
       failed: boolean;
@@ -1624,13 +1649,7 @@ export function runPi(
       aborted = true;
       if (reason) state.pauseReason = reason;
       killSequence();
-      if (!reason) return; // external cancel: settle at close as cancelled
-      // Report paused immediately with the real turn count instead of waiting
-      // for process exit; close only dedupes afterwards.
-      state.status = "paused";
-      state.finishedAt = Date.now();
-      emit();
-      done(pausedResult());
+      // Close drains child output before publishing a terminal result.
     };
 
     // Deadline enforcement is triple-redundant on purpose. On some hosts the
@@ -1674,6 +1693,7 @@ export function runPi(
     emit();
 
     const processLine = (line: string) => {
+      if (aborted) return;
       const evt = parseJsonEvent(line);
       if (evt && applyEvent(state, evt)) {
         emit();
@@ -1717,7 +1737,7 @@ export function runPi(
     });
 
     cli.on("error", (e) => {
-      if (settled) return; // paused already reported at abort time
+      if (settled) return;
       state.status = aborted ? "cancelled" : "failed";
       state.errorMessage = e instanceof Error ? e.message : String(e);
       state.finishedAt = Date.now();
@@ -1727,7 +1747,7 @@ export function runPi(
     cli.on("close", (code) => {
       if (killTimer) clearTimeout(killTimer);
       if (verifyTimer) clearTimeout(verifyTimer);
-      if (settled) return; // paused already reported at abort time
+      if (settled) return;
       buf += stdoutDecoder.end();
       if (buf.trim()) processLine(buf);
       const out = stdout.toString();
@@ -1872,9 +1892,59 @@ export interface SubagentTaskRecord {
   /** Latest streamed progress; the single source for status bar and menu views. */
   progress?: ProgressDetails;
   notificationPending?: boolean;
+  paseo?: { dir: string; snapshot?: string; settled?: boolean; resume?: boolean; sessionAlias?: string };
 }
 
 export type BackgroundSubagentTask = SubagentTaskRecord;
+
+function paseoOutcome(task: SubagentTaskRecord): "completed" | "failed" | "stopped" {
+  return task.status === "succeeded" ? "completed" : task.status === "failed" ? "failed" : "stopped";
+}
+
+function paseoSessionFile(task: SubagentTaskRecord): string | undefined {
+  const run = task.progress?.runs[0];
+  const file = run ? sessionLogPath(run) : task.sessionId ? sessionLogPath({ sessionId: task.sessionId, cwd: task.cwd }) : undefined;
+  if (!file || !task.paseo?.resume) return file;
+  if (task.paseo.sessionAlias) return task.paseo.sessionAlias;
+  // Paseo follows each path once, even when separate tasks resume the same transcript.
+  const win = process.platform === "win32";
+  const link = join(task.paseo.dir, win ? "session" : "session.jsonl");
+  try {
+    symlinkSync(win ? dirname(file) : file, link, win ? "junction" : "file");
+    return task.paseo.sessionAlias = win ? join(link, basename(file)) : link;
+  } catch {
+    return file;
+  }
+}
+
+function publishPaseoStatus(task: SubagentTaskRecord): boolean {
+  if (!task.paseo) return false;
+  const outcome = paseoOutcome(task);
+  const state = !task.paseo.settled ? "running" : outcome === "completed" ? "complete" : outcome;
+  const sessionFile = paseoSessionFile(task);
+  const snapshot = JSON.stringify({ state, steps: [{ agent: task.agent ?? "subagent", sessionFile }] });
+  if (snapshot === task.paseo.snapshot) return Boolean(sessionFile);
+  try {
+    const temporary = join(task.paseo.dir, "status.tmp");
+    writeFileSync(temporary, snapshot, { mode: 0o600 });
+    renameSync(temporary, join(task.paseo.dir, "status.json"));
+    task.paseo.snapshot = snapshot;
+    return Boolean(sessionFile);
+  } catch {
+    // A compatibility snapshot failure must not stop the child.
+    return false;
+  }
+}
+
+function paseoPointer(task: SubagentTaskRecord): string {
+  if (!task.paseo) return "";
+  const file = paseoSessionFile(task);
+  return ["Retention-managed async directory: " + task.paseo.dir, ...(file && !/[\r\n]/.test(file) && file.length < EXIT_BATCH_CHAR_LIMIT / 2 ? ["Session file: " + file] : [])].join("\n") + "\n";
+}
+
+function paseoNoticeHeader(task: SubagentTaskRecord, count: number): string {
+  return count > 1 ? "Background tasks completed (" + count + "):" : "Background task " + paseoOutcome(task) + ": **" + task.id + "**";
+}
 
 /**
  * Pure-data snapshot of a finished task for sendMessage details. Pi core runs
@@ -1891,6 +1961,7 @@ export function toMessageDetails(
     notifyOnExit: _notifyOnExit,
     notificationPending: _notificationPending,
     progress: _progress,
+    paseo: _paseo,
     ...safe
   } = task;
   // Issue 115: hoist the child session pointer to clone-safe top-level fields so
@@ -2063,6 +2134,7 @@ export class SubagentTaskManager {
           : "succeeded";
     t.output = output;
     t.finishedAt = Date.now();
+    if (t.paseo) t.paseo.settled = true;
     this.emitChange(t);
     if (t.notifyOnExit) {
       t.notificationPending = true;
@@ -2102,14 +2174,14 @@ export class SubagentTaskManager {
     ).length;
   }
 
-  async clearSession(parentSessionId: string): Promise<void> {
+  async clearSession(parentSessionId: string, onDrained?: () => void): Promise<void> {
     const sessionTasks = Array.from(this.tasks.values()).filter(
       (t) => t.parentSessionId === parentSessionId,
     );
     for (const t of sessionTasks) {
-      t.notifyOnExit = false;
+      if (!onDrained) t.notifyOnExit = false;
       if (t.status === "running") this.stop(t.id);
-      this.tasks.delete(t.id);
+      if (!onDrained) this.tasks.delete(t.id);
     }
     // Do not hang Pi on a child that refuses to die; its journal stays for the
     // next-start reaper.
@@ -2121,6 +2193,8 @@ export class SubagentTaskManager {
         ]),
       ),
     );
+    onDrained?.();
+    for (const t of sessionTasks) this.tasks.delete(t.id);
     this.emitChange();
   }
 
@@ -2270,6 +2344,9 @@ export async function runSubagent(
     );
     const run = newRun(role, role, item.task, sessionId);
     applyRunConfig(run, runCfg);
+    run.cwd = runCfg.cwd || cwd;
+    const agentDir = buildChildEnv(runCfg).PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+    run.agentDir = resolve(run.cwd, agentDir.replace(/^~(?=$|[/\\])/, () => homedir()));
     details.runs.push(run);
     emit(true);
 
@@ -2326,7 +2403,7 @@ export default function subagentExtension(pi: {
   getThinkingLevel?: () => string;
 }): void {
   if (process.env.PI_SUBAGENT_CHILD === "1") return;
-  pi.registerMessageRenderer?.("subagent-exit", (message, { expanded, outputPad, keyText }, theme) => {
+  const renderExit: MessageRenderer = (message, { expanded, outputPad, keyText }, theme) => {
     const content = typeof message.content === "string" ? message.content : "";
     const label = theme.bold(theme.fg("customMessageLabel", `[${message.customType}]`));
     const rawDetails = message.details as Record<string, unknown> | Record<string, unknown>[] | undefined;
@@ -2343,7 +2420,9 @@ export default function subagentExtension(pi: {
     const box = new Box(outputPad, 1, (value) => theme.bg("customMessageBg", value));
     box.addChild(new Text(text, 0, 0));
     return box;
-  });
+  };
+  pi.registerMessageRenderer?.("subagent-exit", renderExit);
+  pi.registerMessageRenderer?.("subagent-notify", renderExit);
   reapSubagentOrphans();
 
   let currentSessionId: string | null = null;
@@ -2407,6 +2486,7 @@ export default function subagentExtension(pi: {
     buildByspaceReportRecord(task, sessionLogPath);
   const summarizeCompletionBatches = (batch: BackgroundSubagentTask[]): CompletionMessage[] => {
     const header = `${batch.length} background subagent tasks completed (full results omitted):`;
+    const limit = EXIT_BATCH_CHAR_LIMIT - (batch[0]?.paseo ? 100 : 0);
     const messages: CompletionMessage[] = [];
     let content = header;
     let tasks: BackgroundSubagentTask[] = [];
@@ -2417,11 +2497,9 @@ export default function subagentExtension(pi: {
       const sessionId = typeof details.sessionId === "string" ? details.sessionId : undefined;
       const cwd = typeof details.cwd === "string" ? details.cwd : undefined;
       const location = sessionFile ?? (sessionId && cwd ? `${sessionId} (cwd: ${cwd})` : sessionId ?? cwd ?? "unavailable");
-      const raw = `- ${task.id} — ${state}; session log: ${location}`;
-      const line = raw.length > EXIT_BATCH_CHAR_LIMIT - header.length - 100
-        ? oneLine(raw, EXIT_BATCH_CHAR_LIMIT - header.length - 100)
-        : raw;
-      if (tasks.length > 0 && content.length + line.length + 1 > EXIT_BATCH_CHAR_LIMIT) {
+      const pointer = paseoPointer(task);
+      const line = pointer + oneLine(`- ${task.id} — ${state}; session log: ${location}`, limit - header.length - pointer.length - 1);
+      if (tasks.length > 0 && content.length + line.length + 1 > limit) {
         messages.push({ content, tasks, summarized: true });
         content = header;
         tasks = [];
@@ -2433,11 +2511,16 @@ export default function subagentExtension(pi: {
     return messages;
   };
   const formatCompletionBatches = (batch: BackgroundSubagentTask[]): CompletionMessage[] => {
+    if (batch.length === 0) return [];
     let full = batch.length === 1 ? "" : `${batch.length} background subagent tasks completed:\n\n`;
     for (let index = 0; index < batch.length; index++) {
       const separator = batch.length > 1 && index > 0 ? "\n\n---\n\n" : "";
-      const formatted = formatSubagentExitMessage(batch[index]!);
-      if (full.length + separator.length + formatted.length > EXIT_BATCH_CHAR_LIMIT) {
+      const task = batch[index]!;
+      const result = formatSubagentExitMessage(task);
+      const formatted = task.paseo
+        ? paseoPointer(task) + result.replace(/^(?=Retention-managed async directory: |Session file: )/gm, " ")
+        : result;
+      if (full.length + separator.length + formatted.length > EXIT_BATCH_CHAR_LIMIT - (task.paseo ? 100 : 0)) {
         return summarizeCompletionBatches(batch);
       }
       full += separator + formatted;
@@ -2445,23 +2528,31 @@ export default function subagentExtension(pi: {
     return [{ content: full, tasks: batch, summarized: false }];
   };
 
-  const flushPendingExits = () => {
+  const flushPendingExits = (triggerTurn = true) => {
     if (!currentSessionId || !pi.sendMessage) return;
     const batch = pendingExits.filter((task) => task.parentSessionId === currentSessionId);
     if (batch.length === 0) return;
-    for (const completion of formatCompletionBatches(batch)) {
+    const compatible = batch.filter((task) => task.paseo);
+    const messages = [
+      ...formatCompletionBatches(batch.filter((task) => !task.paseo)),
+      ...formatCompletionBatches(compatible.filter((task) => task.status === "succeeded")),
+      ...compatible.filter((task) => task.status !== "succeeded").flatMap((task) => formatCompletionBatches([task])),
+    ];
+    for (const completion of messages) {
       const tasks = completion.tasks;
+      const first = tasks[0]!;
       try {
         pi.sendMessage(
           {
-            customType: "subagent-exit",
-            content: completion.content,
+            customType: first.paseo ? "subagent-notify" : "subagent-exit",
+            content: first.paseo ? `${paseoNoticeHeader(first, tasks.length)}
+${completion.content}` : completion.content,
             display: true,
             details: completion.summarized
               ? tasks.length === 1 ? summaryDetails(tasks[0]!) : tasks.map(summaryDetails)
               : tasks.length === 1 ? toMessageDetails(tasks[0]!) : tasks.map(toMessageDetails),
           },
-          { deliverAs: "followUp", triggerTurn: true },
+          { deliverAs: "followUp", triggerTurn },
         );
       } catch {
         break;
@@ -2484,8 +2575,10 @@ export default function subagentExtension(pi: {
     },
     (task) => {
       updateStatus?.();
-      if (task)
+      if (task) {
+        publishPaseoStatus(task);
         byspaceReporter.report(buildByspaceReportRecord(task, sessionLogPath));
+      }
     },
   );
   // shortcut: legacy records lack delivery state, so first upgrade may replay an old notice; exactly-once needs a host handoff API.
@@ -2639,6 +2732,16 @@ export default function subagentExtension(pi: {
         }
       };
 
+      record.cwd = launchCwd;
+      try {
+        if (ensureSubagentOrphanDir(SUBAGENT_ORPHAN_DIR)) {
+          const dir = mkdtempSync(join(SUBAGENT_ORPHAN_DIR, `paseo-${process.pid}-`));
+          if (/[\r\n]/.test(dir)) rmSync(dir, { recursive: true });
+          else record.paseo = { dir, resume: Boolean(item.resume) };
+        }
+      } catch {}
+      subagentManager.register(record);
+
       const execution = runSubagent(
         cwd,
         runInput,
@@ -2669,9 +2772,15 @@ export default function subagentExtension(pi: {
           );
         });
 
-      record.cwd = launchCwd;
       record.done = execution;
-      subagentManager.register(record);
+      if (record.paseo && !publishPaseoStatus(record)) {
+        // The child can create its transcript without emitting a progress update.
+        const discover = setInterval(() => {
+          if (record.status !== "running" || publishPaseoStatus(record)) clearInterval(discover);
+        }, 500);
+        discover.unref();
+        void execution.finally(() => clearInterval(discover));
+      }
 
       return {
         content: [
@@ -2693,6 +2802,7 @@ export default function subagentExtension(pi: {
           status: "running",
           sessionId: childSessionId,
           cwd: launchCwd,
+          ...(record.paseo && { mode: "single", runId: taskId, asyncId: taskId, asyncDir: record.paseo.dir, results: [] }),
         },
       };
     },
@@ -2871,11 +2981,12 @@ export default function subagentExtension(pi: {
       statusTicker = undefined;
     }
     updateStatus = undefined;
+    agentBusy = true;
+    await subagentManager.clearSession(sessionId, () => flushPendingExits(false));
     for (let index = pendingExits.length - 1; index >= 0; index--) {
       if (pendingExits[index]?.parentSessionId === sessionId) pendingExits.splice(index, 1);
     }
     if (currentSessionId === sessionId) currentSessionId = null;
-    await subagentManager.clearSession(sessionId);
   });
 }
 

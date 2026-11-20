@@ -49,8 +49,6 @@ export const GOAL_SECTION = "goal";
 export const STATUS_KEY = "goal";
 /** Stops the loop: declares the objective verifiably true. Active only while a goal runs. */
 export const GOAL_DONE_TOOL = "goal_done";
-/** Starts a goal the model drafted itself, so the user never has to phrase the objective. */
-export const GOAL_START_TOOL = "goal_start";
 
 export type GoalStatus = "active" | "paused" | "done";
 
@@ -117,10 +115,6 @@ export interface GoalRecord {
 export interface GoalDoneParams {
   summary?: string;
   evidence?: string;
-}
-
-export interface GoalStartParams {
-  objective?: string;
 }
 
 export type GoalCommand =
@@ -326,23 +320,6 @@ const goalDoneParameters = {
   additionalProperties: false,
 } as const;
 
-// Same plain-schema constraint as goal_done. Deliberately one field: the model authors the
-// objective, and outcome + verification + constraints read better as one sentence than as
-// three boxes it has to fill with fragments.
-const goalStartParameters = {
-  type: "object",
-  properties: {
-    objective: {
-      type: "string",
-      minLength: 1,
-      description:
-        "The objective you drafted from the conversation: the end state that must become true, how it will be verified, and any constraint that must not regress.",
-    },
-  },
-  required: ["objective"],
-  additionalProperties: false,
-} as const;
-
 function toolText(text: string, isError = false): AgentToolResult<unknown> {
   return isError
     ? { content: [{ type: "text", text }], isError: true, details: undefined }
@@ -371,20 +348,12 @@ export function registerGoal(pi: ExtensionAPI): void {
   // text-only continuation. A pause does not erase the objective, and the agent may still
   // reach the end of the work (user-driven turns), so it keeps a way to record completion.
   // Without a goal the tool never exists, so it cannot pass as a general "I'm done"
-  // signal; goal_start comes back whenever the goal is not active, so a paused objective
-  // can still be replaced. Rewriting the set only when it actually differs keeps
-  // unrelated loadout changes untouched.
+  // signal. Change the active tool set only when availability changes.
   const syncTool = () => {
     const done = goal?.status === "active" || goal?.status === "paused";
-    const start = goal?.status !== "active";
     const current = pi.getActiveTools();
-    const next = current.filter((name) =>
-      name === GOAL_DONE_TOOL ? done : name === GOAL_START_TOOL ? start : true,
-    );
-    if (start && !next.includes(GOAL_START_TOOL)) next.push(GOAL_START_TOOL);
-    if (done && !next.includes(GOAL_DONE_TOOL)) next.push(GOAL_DONE_TOOL);
-    if (next.length === current.length && next.every((name, index) => name === current[index])) return;
-    pi.setActiveTools(next);
+    if (current.includes(GOAL_DONE_TOOL) === done) return;
+    pi.setActiveTools(done ? [...current, GOAL_DONE_TOOL] : current.filter((name) => name !== GOAL_DONE_TOOL));
   };
 
   // Branch-aware: after /tree navigation the active branch decides which goal is real.
@@ -435,8 +404,6 @@ export function registerGoal(pi: ExtensionAPI): void {
       boot: BOOT_ID,
       updatedAt: Date.now(),
     });
-    // Tool-set edits happen at the settle boundary (or in the /goal command),
-    // never mid-batch from the goal_start tool.
     ctx.ui.notify(`Goal active: ${objective}`, "info");
     return objective;
   };
@@ -528,48 +495,6 @@ export function registerGoal(pi: ExtensionAPI): void {
           }
         }
       }
-    },
-  });
-
-  pi.registerTool({
-    name: GOAL_START_TOOL,
-    label: "Start Goal",
-    description:
-      "Turn the user's request into a durable session goal and start working on it across turns, without the user having to phrase the objective. Call it when the user asks to make something a goal (\"把这个设成 goal\", \"set this as the goal and go\", \"keep working on this until it is done\") or when they hand you an outcome that will obviously need many turns of investigation. Draft the objective yourself from the conversation: the end state that must become true, how success will be verified, and what must not regress — one or two sentences, no restating of the chat. Do not call it for a one-turn task, and do not call it to resume or change an existing goal: while a goal is active this tool fails on purpose.",
-    promptSnippet: "Start a goal you drafted yourself when the user wants a durable objective.",
-    promptGuidelines: [
-      "When the user says to make something a goal but does not spell out the objective, draft it and call goal_start instead of asking them to write it: state the end state, the verification surface, and the constraint that must not regress",
-      "Do not call goal_start for a single-turn task, and do not call it while a goal is already active — /goal clear or /goal pause first",
-    ],
-    parameters: goalStartParameters as unknown as TSchema,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const input = params as GoalStartParams;
-      const objective = (input.objective ?? "").trim();
-      if (!objective) {
-        return toolText("goal_start needs an objective: the end state that must become true.", true);
-      }
-      if (objective.length > MAX_OBJECTIVE_CHARS) {
-        return toolText(
-          `A goal objective is limited to ${MAX_OBJECTIVE_CHARS} characters (got ${objective.length}).`,
-          true,
-        );
-      }
-      if (goal?.status === "active") {
-        return toolText(
-          `A goal is already active, so goal_start did nothing: ${goal.objective}
-` +
-            "Tell the user to run /goal clear (or /goal pause) first if they want a different goal.",
-          true,
-        );
-      }
-      // Tool set is switched at the settle boundary (never mid-batch, where sibling calls
-      // of the same assistant message may still be in flight).
-      const started = startGoal(ctx, objective);
-      if (!started) return toolText("goal_start could not start the goal.", true);
-      return toolText(
-        `Goal started: ${started}\n` +
-          "It is now a durable objective for this session: keep taking concrete steps, and call goal_done with evidence when it is verifiably true. Do not stop to ask whether to continue.",
-      );
     },
   });
 
@@ -681,9 +606,6 @@ export function registerGoal(pi: ExtensionAPI): void {
         {
           type: "custom_message",
           customType: GOAL_ENTRY,
-          // Re-state the objective in every continuation. before_agent_start
-          // runs once per prompt, so a goal created by goal_start mid-run has no
-          // system section for the rest of the automatic loop.
           content: `${objectiveBlock(goal.objective)}\n\n${CONTINUE_MESSAGE}`,
           display: false,
         },

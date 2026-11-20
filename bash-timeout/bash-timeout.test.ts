@@ -1,19 +1,6 @@
-import {
-	createAgentSession,
-	DefaultResourceLoader,
-	SessionManager,
-	SettingsManager,
-	type ExtensionAPI,
-	type ToolResultEvent,
-} from "@earendil-works/pi-coding-agent";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import registerBashTimeout, { registerBashDefaultTimeout } from "./bash-timeout.js";
-
-const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
 type FakeToolCall = {
@@ -22,17 +9,6 @@ type FakeToolCall = {
   toolName: string;
   input: Record<string, unknown>;
 };
-type FakeToolResult = {
-  type: "tool_result";
-  toolCallId: string;
-  toolName: string;
-  input: Record<string, unknown>;
-  content: { type: "text"; text: string }[];
-  details: unknown;
-  isError: boolean;
-  usage?: { inputTokens: number; outputTokens: number };
-};
-
 function harness(register: (pi: ExtensionAPI) => void) {
   const handlers: Record<string, Handler> = {};
   const pi = {
@@ -49,21 +25,6 @@ const event = (toolName: string, input: Record<string, unknown>): FakeToolCall =
   toolCallId: "t1",
   toolName,
   input,
-});
-
-const result = (
-  toolName: string,
-  text: string,
-  isError: boolean,
-  details: unknown = undefined,
-): FakeToolResult => ({
-  type: "tool_result",
-  toolCallId: "t1",
-  toolName,
-  input: { command: "x" },
-  content: [{ type: "text", text }],
-  details,
-  isError,
 });
 
 describe("registerBashDefaultTimeout", () => {
@@ -140,64 +101,10 @@ describe("registerBashDefaultTimeout", () => {
     await handlers["tool_call"]?.(call, {});
     expect(call.input).toEqual({ command: "npm run dev", timeout: 120, waitSeconds: 5 });
   });
-
-  it("appends steering text to a bash timeout error and echoes all other fields", async () => {
-    const handlers = harness(registerBashDefaultTimeout);
-    const res = result("bash", "Command timed out after 120 seconds", true, {
-      truncation: { truncated: true, totalLines: 5000 },
-      fullOutputPath: "/tmp/pi-bash-x.log",
-    });
-    const out = (await handlers["tool_result"]?.(res, {})) as {
-      content: { type: string; text: string }[];
-      details: unknown;
-      isError: boolean;
-    };
-    expect(out.content).toHaveLength(2);
-    expect(out.content[1]?.text).toContain("background_run");
-    expect(out.content[0]?.text).toBe("Command timed out after 120 seconds");
-    // agent-session REPLACES details/isError/usage from the hook result — dropping them
-    // here would lose truncation info, so they must be echoed.
-    expect(out.details).toEqual({ truncation: { truncated: true, totalLines: 5000 }, fullOutputPath: "/tmp/pi-bash-x.log" });
-    expect(out.isError).toBe(true);
-  });
-
-  it("steers powershell timeout errors the same way", async () => {
-    const handlers = harness(registerBashDefaultTimeout);
-    const res = result("powershell", "Command timed out after 120 seconds", true);
-    const out = (await handlers["tool_result"]?.(res, {})) as { content: { text: string }[] };
-    expect(out.content[1]?.text).toContain("background_run");
-  });
-
-
-  it("steers a fractional timeout error too", async () => {
-    const handlers = harness(registerBashDefaultTimeout);
-    const res = result("bash", "Command timed out after 2.5 seconds", true);
-    const out = (await handlers["tool_result"]?.(res, {})) as { content: { text: string }[] };
-    expect(out.content[1]?.text).toContain("background_run");
-  });
-  it("does not touch non-error results or non-timeout errors", async () => {
-    const handlers = harness(registerBashDefaultTimeout);
-    const ok = result("bash", "done", false);
-    expect(await handlers["tool_result"]?.(ok, {})).toBeUndefined();
-    // Timeout-looking text in a NON-error result must not be steered: the isError
-    // branch exists so a success result quoting a timeout is left alone.
-    const okQuoting = result("bash", "previous attempt: Command timed out after 120 seconds", false);
-    expect(await handlers["tool_result"]?.(okQuoting, {})).toBeUndefined();
-    const other = result("bash", "Command exited with code 1", true);
-    expect(await handlers["tool_result"]?.(other, {})).toBeUndefined();
-  });
-
-  it("does not touch timeout errors from other tools", async () => {
-    const handlers = harness(registerBashDefaultTimeout);
-    const res = result("background_run", "Command timed out after 120 seconds", true);
-    expect(await handlers["tool_result"]?.(res, {})).toBeUndefined();
-  });
 });
 
 describe("bash-timeout extension", () => {
-  // The extension's whole contract: nothing registered, two hooks only. It ships as a
-  // single dropped-in file — no tools, no commands, no npm package.
-  it("registers no tools and no commands; subscribes only to tool_call and tool_result", () => {
+  it("registers no tools or commands and leaves tool results untouched", () => {
     const toolNames: string[] = [];
     const commandNames: string[] = [];
     const events: string[] = [];
@@ -217,58 +124,6 @@ describe("bash-timeout extension", () => {
 
     expect(toolNames).toEqual([]);
     expect(commandNames).toEqual([]);
-    expect(events.sort()).toEqual(["tool_call", "tool_result"]);
-    expect(toolNames).not.toContain("bash");
-    expect(toolNames).not.toContain("powershell");
+    expect(events).toEqual(["tool_call"]);
   });
-});
-
-// The timeout patch replaces `content`. ExtensionRunner deletes `structuredContent`
-// unless the handler also returns it, so a patch that forgets it silently erases a
-// tool's machine-readable payload. Only the real runner proves the field survives.
-describe("structuredContent through the real ExtensionRunner", () => {
-	it("survives the timeout steering patch", { timeout: 15_000 }, async () => {
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-bash-timeout-structured-"));
-		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
-		try {
-			const settingsManager = SettingsManager.create(repoRoot, agentDir);
-			const resourceLoader = new DefaultResourceLoader({
-				cwd: repoRoot,
-				agentDir,
-				settingsManager,
-				additionalExtensionPaths: [join(repoRoot, "bash-timeout/bash-timeout.ts")],
-				noExtensions: true,
-				noSkills: true,
-				noPromptTemplates: true,
-				noThemes: true,
-				noContextFiles: true,
-			});
-			await resourceLoader.reload();
-			({ session } = await createAgentSession({
-				cwd: repoRoot,
-				agentDir,
-				settingsManager,
-				resourceLoader,
-				sessionManager: SessionManager.inMemory(),
-				noTools: "all",
-			}));
-			const event: ToolResultEvent = {
-				type: "tool_result",
-				toolCallId: "timeout",
-				toolName: "bash",
-				input: { command: "sleep 999" },
-				content: [{ type: "text", text: "Command timed out after 120 seconds" }],
-				structuredContent: { answer: 42 },
-				details: undefined,
-				isError: true,
-			};
-			const patch = await session.extensionRunner.emitToolResult(event);
-			expect(patch?.structuredContent).toEqual({ answer: 42 });
-			expect(patch?.content).toHaveLength(2);
-			expect(patch?.content?.[1]).toMatchObject({ type: "text" });
-		} finally {
-			session?.dispose();
-			rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
 });

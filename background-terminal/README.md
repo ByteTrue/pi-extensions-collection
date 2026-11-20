@@ -24,7 +24,7 @@ Part of this repo's git package:
 pi install git:github.com/ByteTrue/pi-extensions-collection
 ```
 
-Restart or reload Pi, then ask naturally:
+Restart Pi after installing or updating the package. Let running tasks finish before updating. Then ask naturally:
 
 > Start the test suite running hands-off — get back to me when it finishes.
 
@@ -42,7 +42,7 @@ No built-in tool is overridden, shadowed, or registered under a built-in name.
 
 ## Staying out of the built-ins' way
 
-- `bash` (and `powershell`) keep their exact built-in behavior. The optional 120s default (and the timeout-error steering block) lives in the [`bash-timeout`](../bash-timeout) extension in this repo.
+- The optional 120s default for Pi's built-in `bash` and `powershell` lives in the separate [`bash-timeout`](../bash-timeout) extension.
 - The `background_run` path applies your `shellPath` / `shellCommandPrefix` settings (read through Pi's own `SettingsManager`, honoring project trust) and the same session environment the built-in tools set (`PI_*` variables plus the agent bin dir on `PATH`).
 - Uninstalling removes exactly the three tools above; the built-ins were never touched.
 
@@ -57,7 +57,7 @@ A task ends when:
 - its explicit `timeout` expires (status `timed_out`, the agent is woken); or
 - the owning Pi session shuts down, or Pi receives SIGTERM/SIGHUP: tasks spawn through Pi's own shell backend and are killed with it. **SIGKILL and hard crashes cannot run cleanup.** Each task writes a journal (owner Pi pid, task pid, start time); the next extension load calls `reapOrphans`, kills tasks whose owner is gone, and removes their journal and log. Until that next load the task can keep running; no portable OS primitive kills it at the moment of SIGKILL. A command that daemonizes itself still escapes, same as built-in bash.
 
-Manual stops and `background_kill` report a `killed` notice. Session cleanup is silent because the session is ending. Tasks survive `/reload` inside the same session, but they do not survive Pi exiting. Reload flushes any completions buffered while the agent was busy before returning, and a process-global queue covers the old/new runtime handoff and retries after `sendMessage` failures. First upgrade from a legacy manager also reconciles its settled records at-least-once: an old notice may repeat once because legacy records have no delivery marker. Metadata cleanup failures cannot suppress a completion notice.
+Manual stops and `background_kill` report a `killed` notice. Session cleanup is silent because the session is ending. Tasks survive `/reload` inside the same session, but they do not survive Pi exiting. Reload flushes any completions buffered while the agent was busy before returning, and a process-global queue covers the old/new runtime handoff and retries after `sendMessage` failures. Metadata cleanup failures cannot suppress a completion notice.
 
 Completion notices are wrapped in a `<shell id state command>` tag; the body carries a bounded output tail (last 50 lines or 4,000 characters, with ANSI/control sequences stripped), the exit code or error, and the full output file path. Each completion message is capped at 50,000 characters. Overflow switches to ID/state/path summaries and splits them across as many messages as needed, so every task remains discoverable. Summary `details` contains only minimal terminal fields and output paths, never output tails. Formatting switches to summaries incrementally instead of joining the whole batch first. Output write failures are shown as `failed` even when the command exits zero. In Pi's TUI, completion messages default to a one-line summary; Ctrl+O expands the full notice. `state` is pi's task state (`completed`, `failed`, `timed_out`, `killed`), a superset of opencode's `completed`/`error`/`cancelled`. The same provider registry is exposed to `goal` (wait while shells run) and `subagent` (list still-running work in its completion notice). A notice is delivered at the next turn boundary, not only when the whole goal loop stops. The latest 100 tasks by settlement time are retained after notification; running and unnotified tasks are never evicted by this history limit. Evicted tasks' output files remain readable until real session shutdown and are protected from orphan sweeps, then are cleaned up with the rest of the session output.
 
