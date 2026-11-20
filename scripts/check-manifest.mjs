@@ -9,14 +9,14 @@
 // list and the extension directories drift apart.
 //
 // Runs in CI (ci.yml) and locally: node scripts/check-manifest.mjs
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
 const manifest = rootPackage.pi?.extensions;
-const workspaces = [...(rootPackage.workspaces ?? [])].sort();
+const workspaces = Array.isArray(rootPackage.workspaces) ? [...rootPackage.workspaces].sort() : [];
 
 const dirs = readdirSync(repoRoot, { withFileTypes: true })
   .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules")
@@ -29,14 +29,24 @@ if (!Array.isArray(manifest) || manifest.length === 0) {
   errors.push("root package.json has no pi.extensions list");
 } else {
   for (const name of dirs) {
-    if (!manifest.some((entry) => entry.startsWith(`./${name}/`))) {
+    if (!manifest.some((entry) => typeof entry === "string" && entry.startsWith(`./${name}/`))) {
       errors.push(`manifest has no entry for ${name}`);
     }
   }
   for (const entry of manifest) {
-    if (!existsSync(join(repoRoot, entry))) errors.push(`manifest lists ${entry}, which does not exist`);
-    const dir = entry.replace(/^\.\//, "").split("/")[0];
-    if (!dirs.includes(dir)) errors.push(`manifest entry ${entry} is not inside an extension directory`);
+    if (typeof entry !== "string") {
+      errors.push("manifest entries must be file paths");
+      continue;
+    }
+    const normalized = posix.normalize(entry);
+    const dir = normalized.split("/")[0];
+    if (entry.includes("\\") || entry !== `./${normalized}` || !dirs.includes(dir)) {
+      errors.push(`manifest entry ${entry} is not inside an extension directory`);
+    }
+    const path = join(repoRoot, entry);
+    if (!existsSync(path) || !statSync(path).isFile()) {
+      errors.push(`manifest lists ${entry}, which is not a file`);
+    }
   }
 }
 if (workspaces.join("\n") !== dirs.join("\n")) {

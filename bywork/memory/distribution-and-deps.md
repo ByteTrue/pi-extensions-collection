@@ -6,6 +6,7 @@
 - 不发 npm。每个扩展目录的 `package.json` 永远 private，不加 `publishConfig` 或任何发布字段。
 - 运行时依赖写进扩展自己的 `dependencies`，由 Pi 安装；`devDependencies` 只服务 CI。宿主模块（`@earendil-works/*`、`typebox`）不进 `dependencies`：Pi 把它们映射到自己的副本，物理拷贝会造出重复的类与注册表。
 - 无构建：Pi 用 jiti 直接加载 TS 入口。不提交 `node_modules`，不手工 vendor 依赖。
+- 当前宿主最低为 Pi 1.5.0（渲染器使用 `MessageRenderOptions.keyText`），根包和五个工作区保持同一 peer 下限。CI 在 Windows/Ubuntu 验证 lockfile 版本与最低版本，先执行真实扩展加载，再做类型和测试检查；最低版本测试夹具的精确版本不改变消费者的开放 peer 范围，也不固定 Node。证据见 `bywork/work/audit-followup/compatibility.md`。
 - 工具名必须全局唯一。Pi 在加载期判定冲突并拒绝启动，后加载的扩展整个不加载（连它别的工具一起失去）。扩展自身看不到别人注册了什么，加载期调用 `pi.getAllTools()` 抛「runtime not initialized」。冲突只能靠不加载来预防（`pi config` 的 `-路径` 条目逐项过滤）。
 - 整包一条版本轴，发布与钉版本用 git tag（首个 `v1.0.0`，当前 `v2.0.0`）。subagent 于 2026-11-11 从 `ByteTrue/pi-subagent` 收回本仓，旧仓已归档，其 `@v0.18.0` 安装命令失效；代价是 subagent 不再单独升级。
 - `vendor` 扩展已退役（2026-11-11 用户拍板换成脚本）。读写 `models.json` 的能力在 CFG 仓库的 `provider-model-config` 技能脚本 `vendor.mjs`，本仓不重建这个扩展。

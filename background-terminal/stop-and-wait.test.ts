@@ -14,6 +14,7 @@ it("rejects an unconfirmed stop at the deadline without losing track of the task
     } },
   });
 
+  await vi.waitFor(() => expect(signal).toBeDefined(), { timeout: 8000 });
   vi.useFakeTimers();
   try {
     const onSuccess = vi.fn();

@@ -54,7 +54,7 @@ artifact is exactly the file you see here, tests aside:
 
 ```text
 bash-timeout.ts        hook implementation + default-export entry (registerBashTimeout)
-bash-timeout.test.ts   CI-only: the full hook test suite (never installed)
+bash-timeout.test.ts   development test suite (cloned, but not loaded by Pi)
 package.json           private, never published — exists only so workspace CI runs tests
 ```
 
@@ -63,5 +63,5 @@ package.json           private, never published — exists only so workspace CI 
 - No configurable default value (120s is fixed, matching opencode; pass `timeout` per call to change it)
 - No per-tool or per-project opt-out, and no runtime switch — an install either applies the default or it does not
 - No override of any built-in tool; no tool registration at all
-- No npm package, no versioning, no pinning — updates come with the git package
-- Independent of `background-terminal`: install either alone, or both — they never depend on each other
+- No npm publishing or separate extension releases — updates and tag/commit pinning use the git package
+- Independent of `background-terminal`: enable either entry, or both, through `pi config`

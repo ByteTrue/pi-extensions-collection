@@ -18,9 +18,30 @@ describe("background_kill tool", () => {
     const result = await call(registerOne(registerBackgroundKillTool), { id: started.id }, SESSION_ID);
 
     expect(result.content[0]?.text).toContain("Stopped");
-    await vi.waitFor(() => expect(manager.get(started.id, SESSION_ID)?.status).toBe("killed"), { timeout: 8000 });
+    expect(manager.get(started.id, SESSION_ID)?.status).toBe("killed");
   });
 
+
+  it("rejects an unconfirmed stop instead of reporting success", async () => {
+    let finish!: (error: Error) => void;
+    const completion = new Promise<{ exitCode: number }>((_resolve, reject) => { finish = reject; });
+    const exec = vi.fn(() => completion);
+    const started = manager.start("stalled command", process.cwd(), SESSION_ID, { operations: { exec } });
+    await vi.waitFor(() => expect(exec).toHaveBeenCalledOnce(), { timeout: 8000 });
+    vi.useFakeTimers();
+    try {
+      const onSuccess = vi.fn();
+      const onError = vi.fn();
+      void call(registerOne(registerBackgroundKillTool), { id: started.id }, SESSION_ID).then(onSuccess, onError);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(onSuccess).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledWith(new Error("Background command termination could not be confirmed."));
+      expect(manager.get(started.id, SESSION_ID)?.status).toBe("running");
+    } finally {
+      vi.useRealTimers();
+      finish(new Error("aborted"));
+    }
+  });
 
   it("sends a completion notice when a task is stopped", async () => {
     const exits: string[] = [];

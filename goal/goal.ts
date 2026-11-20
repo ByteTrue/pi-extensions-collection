@@ -2,16 +2,14 @@
  * goal — one durable objective per session; the agent keeps working on it
  * until it declares completion with evidence.
  *
- * A small-extension: shipped as this single file (no npm package, no build step) and
- * installed by scripts/install-small-extension.mjs into ~/.pi/agent/extensions/.
- * Zero runtime imports — the installed artifact is exactly this file; jiti loads
+ * Loaded from the root Pi package manifest with no build step.
+ * Zero runtime imports — jiti loads
  * TypeScript directly (type-only imports disappear at load time). Tool parameters are
  * hand-written JSON Schema, like ask-user.
  *
  * Why it exists: a long task otherwise pauses after every turn and the user restarts
  * it by hand ("继续", "继续推进", ...). Codex solved this with /goal; goal is the
- * same three-part contract at ~250 lines instead of a task tree, an auditor, and a
- * dashboard:
+ * same three-part contract in one file:
  *
  *   1. `/goal <objective>` stores the objective and the rules in the session — the
  *      objective in a system-prompt section (survives compaction), the state in a
@@ -20,13 +18,14 @@
  *      active, the extension appends one hidden continuation message and returns
  *      continue: true. That is the whole loop — no timers, no idle polling.
  *   3. The loop stops only when the model calls `goal_done` with evidence. Two guards
- *      keep it from spinning: a turn that called no tools pauses the goal (Codex's
- *      own suppression rule), and an aborted or failed run pauses it too.
+ *      keep it from spinning: three continuations without tools pause the goal,
+ *      and an aborted or failed run pauses it too.
  *
  * Surface: one command (`/goal` + status|pause|resume|clear), one tool (`goal_done`,
- * activated while a goal is unfinished: active or paused), three event hooks (session_start /
- * session_tree restore, turn_start+tool_call+agent_before_settle drive the loop,
- * before_agent_start injects the goal section), and a footer status line.
+ * activated while a goal is unfinished: active or paused), event hooks (session_start /
+ * session_tree restore, agent_start+tool_call+agent_before_settle drive the loop,
+ * agent_settled handles interruption, before_agent_start injects the goal section),
+ * and a footer status line.
  */
 import type {
   AgentToolResult,
@@ -217,8 +216,8 @@ function toGoalRecord(data: unknown): GoalRecord | null {
   return {
     objective,
     status,
-    runs: typeof record.runs === "number" && Number.isFinite(record.runs) ? record.runs : 0,
-    stalls: typeof record.stalls === "number" && Number.isFinite(record.stalls) ? record.stalls : 0,
+    runs: typeof record.runs === "number" && Number.isSafeInteger(record.runs) && record.runs >= 0 ? record.runs : 0,
+    stalls: typeof record.stalls === "number" && Number.isSafeInteger(record.stalls) && record.stalls >= 0 ? record.stalls : 0,
     boot: typeof record.boot === "string" ? record.boot : "",
     ...(typeof record.reason === "string" ? { reason: record.reason } : {}),
     ...(typeof record.summary === "string" ? { summary: record.summary } : {}),
@@ -430,12 +429,41 @@ export function registerGoal(pi: ExtensionAPI): void {
     // If the boundary committed a continuation but pi suppressed it (the run was
     // aborted), the flag must not classify the next user run as a continuation.
     continuationInjected = false;
+    runIsContinuation = false;
+    runUsedTools = false;
+    syncTool();
     for (const resolve of settleWaiters.splice(0)) resolve();
   });
   const startRun = async (ctx: ExtensionContext, text: string) => {
-    send(ctx, text);
-    if (ctx.mode !== "print" && ctx.mode !== "json") return;
-    await new Promise<void>((resolve) => settleWaiters.push(resolve));
+    if (ctx.mode !== "print" && ctx.mode !== "json") {
+      send(ctx, text);
+      return;
+    }
+    let release: (() => void) | undefined;
+    try {
+      if (ctx.isIdle()) {
+        const model = ctx.model;
+        if (!model) throw new Error("No model selected; configure one with --model before resuming the goal");
+        // Check configured auth first, as the host does for keyless/virtual providers.
+        if (!ctx.modelRegistry.hasConfiguredAuth(model) &&
+          !(await ctx.modelRegistry.getProviderAuth(model.provider))) {
+          throw new Error(`No authentication for "${model.provider}"; configure credentials or run /login ${model.provider} before resuming the goal`);
+        }
+      }
+      // Register before dispatch so even an immediate settlement releases the command.
+      const settled = new Promise<void>((resolve) => {
+        release = resolve;
+        settleWaiters.push(resolve);
+      });
+      send(ctx, text);
+      await settled;
+    } catch (error) {
+      pauseGoal(ctx, `could not start the goal: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    } finally {
+      const index = release ? settleWaiters.indexOf(release) : -1;
+      if (index >= 0) settleWaiters.splice(index, 1);
+    }
   };
 
   pi.registerCommand("goal", {
@@ -549,9 +577,9 @@ export function registerGoal(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_start", async () => {
-    // One run = one segment: the user prompted, or a continuation was injected (each
-    // continuation starts a new run). Both facts are per segment.
-    runIsContinuation = continuationInjected;
+    // Retries and compaction also emit agent_start; only a new continuation resets progress.
+    if (!continuationInjected) return;
+    runIsContinuation = true;
     continuationInjected = false;
     runUsedTools = false;
   });
@@ -561,6 +589,9 @@ export function registerGoal(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event) => {
+    continuationInjected = false;
+    runIsContinuation = false;
+    runUsedTools = false;
     if (!goal || goal.status === "done") return;
     event.systemPromptOptions.sections[GOAL_SECTION] = goalSection(goal);
   });

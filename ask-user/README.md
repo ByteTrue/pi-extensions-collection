@@ -15,8 +15,15 @@ Registers one tool:
 - **`ask_user(questions)`** — 1–4 decision or clarification questions per call.
   - `questions`: array of `{question, options?, multiple?}` items (a single
     question is simply a 1-item array; legacy top-level `{question, options?,
-    multiple?}` is also accepted at runtime). Option labels are meant to be
-    1-5 words with a one-line description.
+    multiple?}` is converted before host schema validation). Calls outside the
+    1–4 question limit are rejected before any dialog opens. Option labels are
+    meant to be 1-5 words with a one-line description. Labels identify answers:
+    they must be unique within each question after trimming, even when their
+    descriptions differ. The entire batch is validated before any UI opens.
+    Labels and rendered rows must not overlap another option or use generated
+    Other/Back/Done row text (including checklist prefixes and custom `Other: …`
+    rows in multi-select). Invalid choices return an error identifying the
+    question and options to rename; labels may repeat in different questions.
   - **Single-select (`options` without `multiple: true`)**: rendered through
     Pi's built-in `ctx.ui.select` dialog with an always-appended
     **"Other (type your answer)"** row.
@@ -28,7 +35,8 @@ Registers one tool:
     selection on its own: one key does one job, in every dialog.
   - **Back-navigation (`questions.length > 1`)**: questions 2..N include a
     **"← Back to previous question"** row so you can return to an earlier
-    question and revise its answer (previous selections are preserved).
+    question and revise its answer. Picks and custom Other text are preserved,
+    including changes made before pressing Done.
   - **Open question (no `options`)**: answered through the built-in multiline
     editor (TUI) or input dialog (RPC).
   - **Dismiss (Esc)**: returns a fixed "dismissed" text so the model falls back
@@ -70,7 +78,12 @@ Known limits, deliberately not fixed here:
 
 Tool calls execute sequentially so one dialog cannot restore the spinner while
 another is open. The tool's `AbortSignal` is forwarded to RPC `select` and
-`input` dialogs, allowing an RPC abort to dismiss the pending question.
+`input` dialogs, allowing an RPC abort to dismiss the pending question. An
+already-aborted call never opens a freeform editor, and answers arriving after
+abort are ignored. Pi's TUI multiline editor has no signal/close API: if a run is
+aborted while that editor is already open, dismiss it with Esc to release the tool.
+Automatic closure requires a host editor cancellation/close API; the extension
+keeps the built-in editor and discards any late answer.
 
 The tool declares `constrainedSampling: {type: "json_schema", strict: "prefer"}`,
 the same request Pi's built-in `read`/`bash`/`edit`/`write` tools make. Strict
@@ -128,7 +141,9 @@ imports.
 `npm --workspace ask-user test` covers registration, single-select option
 composition, the multi-select checklist loop (toggle row by row, submit from
 `✓ Done`), custom
-`Other` merging, multi-question batching with back-navigation, the freeform
+`Other` merging and preservation across back-navigation, option identity and
+generated-row collision checks before UI, the 1–4 question limit,
+legacy arguments through the host validator, the freeform
 path (empty = `Unanswered`), dismiss semantics, mode guards,
 schema shape (plain JSON Schema, no TypeBox runtime symbols, still convertible
 to the strict subset so `strict: "prefer"` can engage), and spinner suppression

@@ -1,13 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   describeSettingsPathForScope,
   loadSubagentSettings,
+  loadSubagentSettingsForScope,
   settingsPathForScope,
   updateSubagentSettings,
 } from "./settings.js";
+import { buildPiArgs, resolveRunCfg } from "./index.js";
 
 const ENV_KEYS = ["PI_CODING_AGENT_DIR", "PI_PKG_CFG_DIR"] as const;
 const saved = new Map<string, string | undefined>();
@@ -92,6 +94,27 @@ describe("settings location", () => {
 
     updateSubagentSettings(cwd, "global", () => ({ defaultModel: "vendor/model-a" }));
     if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o640);
+  });
+
+  it("removes temporary files when the atomic rename fails", () => {
+    const target = newSettingsFile();
+    expect(() => updateSubagentSettings(cwd, "global", () => {
+      mkdirSync(target, { recursive: true });
+      return { env: { API_TOKEN: "private-value" } };
+    })).toThrow();
+    expect(readdirSync(dirname(target))).toEqual(["settings.json"]);
+    expect(statSync(target).isDirectory()).toBe(true);
+  });
+
+  it("preserves prototype-like role and environment names", () => {
+    const settings = JSON.parse(' {"agents":{"__proto__":{"model":"vendor/role"},"constructor":{"thinking":"high"}},"env":{"__proto__":"value"}}');
+    updateSubagentSettings(cwd, "global", () => settings);
+    const loaded = loadSubagentSettings(cwd, false);
+    expect(Object.hasOwn(loaded.agents!, "__proto__")).toBe(true);
+    expect(loaded.agents?.["__proto__"]?.model).toBe("vendor/role");
+    expect(loaded.env?.["__proto__"]).toBe("value");
+    updateSubagentSettings(cwd, "global", (current) => current);
+    expect(read(newSettingsFile())).toEqual(settings);
   });
 
   it("lets PI_PKG_CFG_DIR move the global root", () => {
@@ -201,6 +224,14 @@ describe("legacy global migration", () => {
     expect(readFileSync(path, "utf-8")).toBe("{ not json");
   });
 
+  it("does not reactivate legacy settings when the new path is a directory", () => {
+    writeFileSync(legacyGlobalFile(), JSON.stringify({ subagent: { defaultModel: "vendor/old" } }));
+    mkdirSync(newSettingsFile(), { recursive: true });
+    expect(describeSettingsPathForScope(cwd, "global")).toBe(newSettingsFile());
+    expect(loadSubagentSettings(cwd, false).defaultModel).toBeUndefined();
+    expect(() => updateSubagentSettings(cwd, "global", () => ({}))).toThrow(/refusing to overwrite/i);
+  });
+
   it("marks the legacy path for status lines when the new root cannot be created", () => {
     writeFileSync(legacyGlobalFile(), JSON.stringify({ subagent: { defaultModel: "vendor/old" } }));
     // A plain file where the config root belongs: mkdir fails, so legacy stays live.
@@ -210,6 +241,105 @@ describe("legacy global migration", () => {
       `${legacyGlobalFile()} (legacy (read-only fallback))`,
     );
     expect(loadSubagentSettings(cwd).defaultModel).toBe("vendor/old");
+  });
+});
+
+describe("role field inheritance", () => {
+  const globalRole = {
+    model: "vendor/global", thinking: "high", tools: ["read", "bash"], maxTurns: 150, timeoutMs: 120000,
+  };
+
+  beforeEach(() => {
+    updateSubagentSettings(cwd, "global", () => ({ agents: { explore: globalRole } }));
+  });
+
+  it("inherits omitted fields and overrides only the project's thinking", () => {
+    updateSubagentSettings(cwd, "project", () => ({ agents: { explore: { thinking: "low" } } }));
+    expect(loadSubagentSettingsForScope(cwd, "project").agents?.explore).toStrictEqual({ thinking: "low" });
+    const merged = loadSubagentSettings(cwd);
+    expect(merged.agents?.explore).toEqual({ ...globalRole, thinking: "low" });
+    expect(resolveRunCfg({ agent: "explore" }, {}, undefined, undefined, merged)).toMatchObject({
+      model: "vendor/global:low", tools: ["read", "bash"], maxTurns: 150, timeoutMs: 120000,
+    });
+    expect(loadSubagentSettings(cwd, false).agents?.explore).toEqual(globalRole);
+  });
+
+  it("empty roles and invalid fields inherit instead of silently clearing global fields", () => {
+    for (const role of [{}, { model: false, thinking: 0, tools: "read", maxTurns: 0, timeoutMs: -1 }]) {
+      mkdirSync(dirname(projectSettingsFile()), { recursive: true });
+      writeFileSync(projectSettingsFile(), JSON.stringify({ agents: { explore: role } }));
+      expect(loadSubagentSettingsForScope(cwd, "project").agents?.explore).toStrictEqual({});
+      expect(loadSubagentSettings(cwd).agents?.explore).toEqual(globalRole);
+    }
+  });
+
+  it.each([{ tools: ["grep"] }, { tools: [] }])("replaces tools with $tools without concatenating", ({ tools }) => {
+    updateSubagentSettings(cwd, "project", () => ({ agents: { explore: { tools } } }));
+    const merged = loadSubagentSettings(cwd);
+    expect(merged.agents?.explore).toEqual({ ...globalRole, tools });
+    const run = resolveRunCfg({ agent: "explore" }, { tools: ["bash"] }, undefined, undefined, merged);
+    expect(run.tools).toEqual(tools);
+    expect(buildPiArgs(run)).toContain(tools.length ? "--tools" : "--no-tools");
+  });
+
+  it("round-trips explicit clears and resumes the document/default chain", () => {
+    const cleared = { model: null, thinking: null, tools: null, maxTurns: null, timeoutMs: null };
+    updateSubagentSettings(cwd, "project", () => ({ agents: { explore: cleared } }));
+    updateSubagentSettings(cwd, "project", (settings) => settings);
+    expect(read(projectSettingsFile())).toEqual({ agents: { explore: cleared } });
+    const merged = loadSubagentSettings(cwd);
+    expect(merged.agents?.explore).toEqual(cleared);
+    const document = { model: "vendor/document", thinking: "minimal", tools: ["grep"], maxTurns: 20, timeoutMs: 1000 };
+    expect(resolveRunCfg({ agent: "explore" }, document, "low", "vendor/parent", merged)).toMatchObject({
+      ...document, model: "vendor/document:minimal",
+    });
+    expect(loadSubagentSettings(cwd, false).agents?.explore).toEqual(globalRole);
+  });
+
+  it("clears only explicit empty strings and preserves sibling inheritance", () => {
+    updateSubagentSettings(cwd, "project", () => ({ agents: { explore: { model: "  ", thinking: "" } } }));
+    expect(loadSubagentSettings(cwd).agents?.explore).toEqual({ ...globalRole, model: null, thinking: null });
+    updateSubagentSettings(cwd, "project", (settings) => settings);
+    expect(read(projectSettingsFile())).toEqual({ agents: { explore: { model: null, thinking: null } } });
+  });
+
+  it("applies explicit budget overrides without replacing other role fields", () => {
+    updateSubagentSettings(cwd, "project", () => ({ agents: { explore: { maxTurns: 20.9, timeoutMs: 5000 } } }));
+    expect(loadSubagentSettings(cwd).agents?.explore).toEqual({ ...globalRole, maxTurns: 20, timeoutMs: 5000 });
+  });
+
+  it("normalizes empty model/thinking strings to explicit clears, including legacy migration", () => {
+    writeFileSync(legacyGlobalFile(), JSON.stringify({ subagents: { agentOverrides: {
+      explore: { model: "", thinking: "  ", tools: [], maxTurns: null, timeoutMs: null },
+    } } }));
+    rmSync(newSettingsFile());
+    const cleared = { model: null, thinking: null, tools: [], maxTurns: null, timeoutMs: null };
+    expect(loadSubagentSettings(cwd, false).agents?.explore).toEqual(cleared);
+    expect(read(newSettingsFile())).toEqual({ agents: { explore: cleared } });
+  });
+
+  it("preserves legacy project clears without migrating until an explicit write", () => {
+    const cleared = { model: null, tools: null, maxTurns: null };
+    mkdirSync(dirname(legacyProjectFile()), { recursive: true });
+    const original = JSON.stringify({ subagent: { agents: { explore: cleared } } });
+    writeFileSync(legacyProjectFile(), original);
+    expect(loadSubagentSettings(cwd).agents?.explore).toEqual({ ...globalRole, ...cleared });
+    expect(() => statSync(projectSettingsFile())).toThrow();
+    updateSubagentSettings(cwd, "project", (settings) => settings);
+    expect(read(projectSettingsFile())).toEqual({ agents: { explore: cleared } });
+    expect(readFileSync(legacyProjectFile(), "utf-8")).toBe(original);
+  });
+
+  it("keeps prototype-like names and null-prototype maps through merging", () => {
+    updateSubagentSettings(cwd, "global", () => JSON.parse('{"agents":{"__proto__":{"model":"vendor/global"}},"env":{"__proto__":"global"}}'));
+    updateSubagentSettings(cwd, "project", () => JSON.parse('{"agents":{"__proto__":{"thinking":"low"},"constructor":{"model":null}},"env":{"constructor":"project"}}'));
+    const merged = loadSubagentSettings(cwd);
+    expect(Object.getPrototypeOf(merged.agents)).toBeNull();
+    expect(Object.getPrototypeOf(merged.env)).toBeNull();
+    expect(merged.agents?.["__proto__"]).toEqual({ model: "vendor/global", thinking: "low" });
+    expect(merged.agents?.["constructor"]).toEqual({ model: null });
+    expect(merged.env?.["__proto__"]).toBe("global");
+    expect(merged.env?.["constructor"]).toBe("project");
   });
 });
 

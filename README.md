@@ -8,9 +8,11 @@ and loads every entry in the root `pi` manifest.
 pi install git:github.com/ByteTrue/pi-extensions-collection
 ```
 
-`pi update --extensions` updates them, then `/reload` or restart. Pi owns that
-checkout: an update resets it to the fetched commit and removes untracked files, so
-work in a separate checkout and load the file you are changing with `pi -e`.
+`pi update git:github.com/ByteTrue/pi-extensions-collection` updates this package;
+`pi update --extensions` updates all installed packages. Let running tasks finish,
+update, then restart Pi so process-global managers also use the new code. Pi owns
+that checkout: an update resets it to the fetched commit and removes untracked
+files, so work in a separate checkout and load the file you are changing with `pi -e`.
 
 Each extension is a top-level directory with its own `package.json`: the entry
 file, tests, README, and a private manifest that holds its runtime dependencies and
@@ -18,17 +20,21 @@ the dev dependencies CI uses. Nothing is published to npm.
 
 ## Install
 
+Requires Pi **1.5.0 or newer**. CI checks the locked host and the 1.5.0 minimum on
+Windows and Ubuntu, including real extension loading before types and tests.
+
 ```bash
 pi install git:github.com/ByteTrue/pi-extensions-collection
 ```
 
-Pin a tag or commit by appending it:
-`pi install git:github.com/ByteTrue/pi-extensions-collection@v1`.
+Pin a tag or commit by appending its ref:
+`pi install git:github.com/ByteTrue/pi-extensions-collection@<tag-or-commit>`.
+Pinned installs use the extensions and behavior at that historical revision.
 
 Installation clones the repo into Pi's package directory and runs `npm install`
 there, so any package an extension imports resolves normally. Updating is
-`pi update --extensions`: Pi fetches, resets the checkout, and reinstalls
-dependencies.
+`pi update git:github.com/ByteTrue/pi-extensions-collection`: Pi fetches, resets
+the checkout, and reinstalls dependencies.
 
 `pi config` turns individual extensions off. The setting is a filter on the package
 entry in `~/.pi/agent/settings.json`, for example
@@ -64,7 +70,7 @@ Run `npm install` first if you added a runtime dependency; Pi resolves it from t
 checkout's `node_modules`.
 
 `node scripts/check-manifest.mjs` fails when an extension directory has no entry in the
-root `pi` manifest, or when the manifest lists a file that does not exist. CI runs it
+root `pi` manifest, or when an entry is not a file inside its extension directory. CI runs it
 first, because a missing entry is silent: the extension never loads.
 
 ## Design notes

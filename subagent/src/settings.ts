@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,14 +13,16 @@ const PKG_FILENAME = "settings.json";
 
 export type SettingsScope = "global" | "project";
 
+/** Missing fields inherit global; null skips the global role field and uses document/defaults. */
 export interface SubagentRoleConfig {
-  model?: string;
-  thinking?: string;
-  tools?: string[];
-  /** Turn budget for this role. Positive integers only; anything else is dropped. */
-  maxTurns?: number;
-  /** Timeout budget for this role, in milliseconds. Positive integers only. */
-  timeoutMs?: number;
+  model?: string | null;
+  thinking?: string | null;
+  /** Arrays replace; [] selects no ordinary tools. null uses the role document. */
+  tools?: string[] | null;
+  /** Positive integers only; null restores the document/default budget. */
+  maxTurns?: number | null;
+  /** Positive milliseconds only; null restores the document/default budget. */
+  timeoutMs?: number | null;
 }
 
 export interface SubagentSettings {
@@ -55,7 +57,7 @@ export function parsePositiveInt(raw: unknown): number | undefined {
 
 function parseEnvMap(raw: unknown): Record<string, string> | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const env: Record<string, string> = {};
+  const env: Record<string, string> = Object.create(null);
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
     const name = key.trim();
     if (!name) continue;
@@ -99,21 +101,14 @@ function legacySettingsPath(cwd: string, scope: SettingsScope): string {
   return scope === "project" ? join(cwd, ".pi", "settings.json") : join(agentDir(), "settings.json");
 }
 
-function isFile(path: string): boolean {
-  try {
-    return statSync(path).isFile();
-  } catch {
-    return false;
-  }
-}
-
 /** Anything on disk counts: a directory or unreadable path must still fail closed. */
 function pathExists(path: string): boolean {
   try {
-    statSync(path);
+    lstatSync(path);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code !== "ENOENT" && code !== "ENOTDIR";
   }
 }
 
@@ -141,14 +136,18 @@ function invalidJsonMessage(path: string, reason: "not-json" | "not-object"): st
 function writeSectionFile(path: string, section: Record<string, unknown>, mode: number): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tempPath = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(tempPath, `${JSON.stringify(section, null, 2)}\n`, {
-    encoding: "utf-8",
-    mode,
-  });
-  renameSync(tempPath, path);
+  try {
+    writeFileSync(tempPath, `${JSON.stringify(section, null, 2)}\n`, {
+      encoding: "utf-8",
+      mode,
+    });
+    renameSync(tempPath, path);
+  } finally {
+    rmSync(tempPath, { force: true });
+  }
 }
 
-/** The stored shape: only known keys, and empty values never linger. */
+/** The stored shape: retain explicit role clears, omit unset defaults. */
 function toStoredSection(settings: SubagentSettings): Record<string, unknown> {
   const section: Record<string, unknown> = {};
   if (settings.defaultModel) section.defaultModel = settings.defaultModel;
@@ -158,6 +157,23 @@ function toStoredSection(settings: SubagentSettings): Record<string, unknown> {
   if (settings.agents && Object.keys(settings.agents).length > 0) section.agents = settings.agents;
   if (settings.env && Object.keys(settings.env).length > 0) section.env = settings.env;
   return section;
+}
+
+function parseRoleConfig(c: Record<string, unknown>): SubagentRoleConfig {
+  const role: SubagentRoleConfig = {};
+  for (const key of ["model", "thinking"] as const) {
+    if (c[key] === null) role[key] = null;
+    else if (typeof c[key] === "string") role[key] = c[key].trim() || null;
+  }
+  if (c.tools === null) role.tools = null;
+  else if (Array.isArray(c.tools)) {
+    role.tools = c.tools.map((t) => String(t).trim().toLowerCase()).filter(Boolean);
+  }
+  for (const key of ["maxTurns", "timeoutMs"] as const) {
+    const value = c[key] === null ? null : parsePositiveInt(c[key]);
+    if (value !== undefined) role[key] = value;
+  }
+  return role;
 }
 
 function parseSubagentSection(rawSection: unknown, rootObj?: Record<string, unknown> | null): SubagentSettings {
@@ -178,22 +194,13 @@ function parseSubagentSection(rawSection: unknown, rootObj?: Record<string, unkn
   settings.defaultTimeoutMs = parsePositiveInt(s?.defaultTimeoutMs);
   settings.env = parseEnvMap(s?.env);
 
-  const agentsMap: Record<string, SubagentRoleConfig> = {};
+  const agentsMap: Record<string, SubagentRoleConfig> = Object.create(null);
 
   // Check modern settings.subagent.agents
   if (s?.agents && typeof s.agents === "object" && !Array.isArray(s.agents)) {
     for (const [name, cfg] of Object.entries(s.agents as Record<string, unknown>)) {
       if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) continue;
-      const c = cfg as Record<string, unknown>;
-      const role: SubagentRoleConfig = {};
-      if (typeof c.model === "string" && c.model.trim()) role.model = c.model.trim();
-      if (typeof c.thinking === "string" && c.thinking.trim()) role.thinking = c.thinking.trim();
-      if (Array.isArray(c.tools)) {
-        role.tools = c.tools.map((t) => String(t).trim().toLowerCase()).filter(Boolean);
-      }
-      role.maxTurns = parsePositiveInt(c.maxTurns);
-      role.timeoutMs = parsePositiveInt(c.timeoutMs);
-      agentsMap[name] = role;
+      agentsMap[name] = parseRoleConfig(cfg as Record<string, unknown>);
     }
   }
 
@@ -206,16 +213,7 @@ function parseSubagentSection(rawSection: unknown, rootObj?: Record<string, unkn
         for (const [name, cfg] of Object.entries(overrides)) {
           if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) continue;
           if (agentsMap[name]) continue; // modern wins
-          const c = cfg as Record<string, unknown>;
-          const role: SubagentRoleConfig = {};
-          if (typeof c.model === "string" && c.model.trim()) role.model = c.model.trim();
-          if (typeof c.thinking === "string" && c.thinking.trim()) role.thinking = c.thinking.trim();
-          if (Array.isArray(c.tools)) {
-            role.tools = c.tools.map((t) => String(t).trim().toLowerCase()).filter(Boolean);
-          }
-          role.maxTurns = parsePositiveInt(c.maxTurns);
-          role.timeoutMs = parsePositiveInt(c.timeoutMs);
-          agentsMap[name] = role;
+          agentsMap[name] = parseRoleConfig(cfg as Record<string, unknown>);
         }
       }
     }
@@ -243,7 +241,7 @@ function parseSubagentSection(rawSection: unknown, rootObj?: Record<string, unkn
  */
 export function settingsLocationForScope(cwd: string, scope: SettingsScope): SettingsLocation {
   const target = settingsPathForScope(cwd, scope);
-  if (isFile(target)) return { path: target, legacy: false };
+  if (pathExists(target)) return { path: target, legacy: false };
 
   const legacy = legacySettingsPath(cwd, scope);
   const legacyRead = readFileStrict(legacy);
@@ -289,20 +287,18 @@ export function loadSubagentSettings(cwd: string, projectTrusted = true): Subage
   if (!projectTrusted) return globalSettings;
 
   const projectSettings = readLocationSettings(settingsLocationForScope(cwd, "project"));
+  const agents: Record<string, SubagentRoleConfig> = Object.assign(Object.create(null), globalSettings.agents);
+  for (const [name, role] of Object.entries(projectSettings.agents ?? {})) {
+    agents[name] = { ...agents[name], ...role };
+  }
 
   return {
     defaultModel: projectSettings.defaultModel ?? globalSettings.defaultModel,
     defaultThinking: projectSettings.defaultThinking ?? globalSettings.defaultThinking,
     defaultMaxTurns: projectSettings.defaultMaxTurns ?? globalSettings.defaultMaxTurns,
     defaultTimeoutMs: projectSettings.defaultTimeoutMs ?? globalSettings.defaultTimeoutMs,
-    agents: {
-      ...(globalSettings.agents ?? {}),
-      ...(projectSettings.agents ?? {}),
-    },
-    env: {
-      ...(globalSettings.env ?? {}),
-      ...(projectSettings.env ?? {}),
-    },
+    agents,
+    env: Object.assign(Object.create(null), globalSettings.env, projectSettings.env),
   };
 }
 

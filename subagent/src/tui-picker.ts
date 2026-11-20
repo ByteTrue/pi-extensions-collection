@@ -5,8 +5,6 @@ import {
   Text,
   fuzzyFilter,
   matchesKey,
-  truncateToWidth,
-  visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
@@ -33,7 +31,7 @@ export async function promptFuzzySelect(
 ): Promise<string | undefined> {
   const rawUI = ctx.ui as unknown as Record<string, Function>;
 
-  if (typeof rawUI?.custom === "function") {
+  if (ctx.mode === "tui" && typeof rawUI?.custom === "function") {
     return (
       (await rawUI.custom(
         (tui: any, theme: any, _keybindings: any, done: (val: string | undefined) => void) => {
@@ -48,7 +46,6 @@ export async function promptFuzzySelect(
 
           // Search input box
           const input = new Input();
-          input.focused = true;
           container.addChild(input);
 
           // List container
@@ -123,6 +120,8 @@ export async function promptFuzzySelect(
           updateList();
 
           return {
+            get focused() { return input.focused; },
+            set focused(value: boolean) { input.focused = value; },
             render: (width: number) => container.render(width),
             invalidate: () => container.invalidate(),
             handleInput(data: string) {

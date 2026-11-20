@@ -1,22 +1,25 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { once } from "node:events";
 import { chmodSync, createWriteStream, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { readFile, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, delimiter, isAbsolute, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { finished } from "node:stream/promises";
+import { stripVTControlCharacters } from "node:util";
 import {
-  createLocalBashOperations,
+  getAgentDir,
   SettingsManager,
   truncateLine,
-  type BashOperations,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { pendingCompletionIds, registerCompletionSource, type Completion } from "../shared/completion-delivery.js";
+import { createBackgroundBashOperations, type BackgroundOperations } from "./execution.js";
 
 // ---------------------------------------------------------------------------
 // shell-timeout
@@ -82,7 +85,7 @@ interface StartOptions {
   /** Hard lifetime cap in seconds; the task is killed when it expires. */
   timeoutSeconds?: number;
   /** Shell operations to run the command with; defaults to bash with no custom shellPath. */
-  operations?: BashOperations;
+  operations?: BackgroundOperations;
   /** Environment for the child process; omit to let the backend use the default shell env. */
   env?: NodeJS.ProcessEnv;
   /** Prepended to the command (the user's shellCommandPrefix, e.g. venv activation). */
@@ -146,13 +149,46 @@ const ORPHAN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 /** A spawned wrapper can survive its owner before it has written its PID. */
 const ORPHAN_STARTUP_GRACE_MS = 10_000;
 
+/** A log records its notice store because all Pi profiles share the temporary output directory. */
+function outputHasPendingNotice(outputPath: string, stores: Map<string, Set<string> | null>): boolean {
+  try {
+    const marker = outputPath + ".profile";
+    const info = lstatSync(marker, { throwIfNoEntry: false });
+    if (info && info.size > 32_768) throw new Error("oversized output profile marker: " + marker);
+    const storageDir = info ? readOwnedStateFile(marker) : join(getAgentDir(), "completion-notices");
+    if (!isAbsolute(storageDir)) throw new Error("invalid output profile marker: " + marker);
+    const profile = resolve(storageDir);
+    if (!stores.has(profile)) {
+      try {
+        stores.set(profile, pendingCompletionIds(profile, "background-terminal"));
+      } catch (error) {
+        stores.set(profile, null);
+        console.warn("Could not inspect pending background notices; keeping their logs:", error);
+      }
+    }
+    const pending = stores.get(profile);
+    return pending === null || pending!.has(basename(outputPath, ".log"));
+  } catch (error) {
+    console.warn("Could not inspect background output ownership; keeping log:", error);
+    return true;
+  }
+}
+
+async function removeOutput(path: string): Promise<void> {
+  try {
+    await rm(path, { force: true });
+    await rm(path + ".profile", { force: true });
+  } catch {
+    // Keep ownership metadata if the log cannot be removed.
+  }
+}
+
 /**
  * Removes bg_*.log files left behind by crashed Pi processes. Crash paths
  * (uncaughtException, terminal EIO) kill detached children without firing
  * session_shutdown, so the extension's normal cleanup never runs. Files owned by
- * live tasks in this process are skipped; a task from another Pi process that
- * stays silent for over 24h can still be swept — accepted, since $TMPDIR cleanup
- * would eventually remove it too.
+ * live tasks in this process and logs with a task journal are skipped, including
+ * silent tasks still running in another process.
  */
 export function sweepOrphanLogs(): void {
   ensureOutputDir();
@@ -162,6 +198,7 @@ export function sweepOrphanLogs(): void {
   } catch {
     return; // No dir yet, or unreadable — nothing to sweep.
   }
+  const stores = new Map<string, Set<string> | null>();
   const live = new Set([
     ...manager.listAll().map((task) => task.outputPath),
     ...(manager.retiredOutputs?.() ?? []),
@@ -171,11 +208,22 @@ export function sweepOrphanLogs(): void {
   );
   const cutoff = Date.now() - ORPHAN_MAX_AGE_MS;
   for (const entry of entries) {
+    if (entry.startsWith("bg_") && entry.endsWith(".log.profile")) {
+      const marker = join(OUTPUT_DIR, entry);
+      try {
+        if (!lstatSync(marker.slice(0, -".profile".length), { throwIfNoEntry: false }) && lstatSync(marker).mtimeMs < cutoff) rmSync(marker, { force: true });
+      } catch {}
+      continue;
+    }
     if (!entry.startsWith("bg_") || !entry.endsWith(".log")) continue;
     const path = join(OUTPUT_DIR, entry);
-    if (live.has(path) || journaled.has(entry.slice(0, -".log".length))) continue;
+    const taskId = entry.slice(0, -".log".length);
+    if (live.has(path) || journaled.has(taskId)) continue;
     try {
-      if (statSync(path).mtimeMs < cutoff) rmSync(path, { force: true });
+      if (statSync(path).mtimeMs < cutoff && !outputHasPendingNotice(path, stores)) {
+        rmSync(path, { force: true });
+        rmSync(path + ".profile", { force: true });
+      }
     } catch {
       // A single unreadable/unremovable file must not abort the sweep.
     }
@@ -187,15 +235,28 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-/** The shell writes its own pid and start time before running the user command.
- *  `$$` survives `exec`, so the reaper can verify the pid was not reused. */
+const WINDOWS_SYSTEM_DIR = join(process.env.SystemRoot || "C:\\Windows", "System32");
+const WINDOWS_POWERSHELL = join(WINDOWS_SYSTEM_DIR, "WindowsPowerShell", "v1.0", "powershell.exe");
+const POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-Command"];
+
+function windowsStartCommand(pid: number | string): string {
+  return "(Get-Process -Id " + pid + " -ErrorAction Stop).StartTime.ToUniversalTime().Ticks";
+}
+
+/** Record the process identity before the prefix or user command can run. */
 function wrapCommand(command: string, pidPath: string, startPath: string, taskId: string): string {
+  const windows = process.platform === "win32";
+  const start = windows
+    ? shellQuote(WINDOWS_POWERSHELL.replaceAll("\\", "/")) + ' -NoProfile -NonInteractive -Command "' + windowsStartCommand("$__pi_bg_pid") + '"'
+    : 'ps -p "$__pi_bg_pid" -o lstart=';
   return [
-    `__pi_bg_pid=$$`,
-    `printf '%s\\n' "$__pi_bg_pid" > ${shellQuote(pidPath)}`,
-    `ps -p "$__pi_bg_pid" -o lstart= > ${shellQuote(startPath)} 2>/dev/null || true`,
-    `# pi-bg:${taskId}`,
-    command,
+    // MSYS/Cygwin PIDs differ from the native PIDs used by Node and taskkill.
+    windows ? '__pi_bg_pid=$(cat /proc/$$/winpid 2>/dev/null)' : '__pi_bg_pid=$$',
+    'printf \'%s\\n\' "$__pi_bg_pid" > ' + shellQuote(pidPath),
+    start + " > " + shellQuote(startPath) + " 2>/dev/null || true",
+    "# pi-bg:" + taskId,
+    // Keep the native Windows parent alive even when the command uses exec.
+    windows ? '(\n' + command + '\n)\n__pi_bg_exit=$?\nexit "$__pi_bg_exit"' : command,
   ].join("\n");
 }
 
@@ -212,6 +273,7 @@ function cleanupTaskMeta(task: { pidPath: string; startPath: string; journalPath
 interface JournalRecord {
   taskId: string;
   ownerPid: number;
+  ownerStart?: string;
   command: string;
   outputPath: string;
   pidPath: string;
@@ -224,54 +286,75 @@ function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // A denied probe does not prove the process is gone.
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
-function processStart(pid: number): string {
+function execFileAsync(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL", windowsHide: true }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+async function processStart(pid: number): Promise<string> {
   try {
-    return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    const stdout = await execFileAsync(
+      process.platform === "win32" ? WINDOWS_POWERSHELL : "ps",
+      process.platform === "win32" ? [...POWERSHELL_ARGS, windowsStartCommand(pid)] : ["-p", String(pid), "-o", "lstart="],
+    );
+    return stdout.trim();
   } catch {
     return "";
   }
 }
 
-function commandMatches(taskId: string, pid: number): boolean {
+// Cache the in-flight query too: concurrent task starts share the same OS probe.
+let cachedOwnerStart: Promise<string> | undefined;
+
+async function processCommand(pid: number): Promise<string> {
   try {
-    const command = execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return command.includes(`pi-bg:${taskId}`);
+    const stdout = await execFileAsync(
+      process.platform === "win32" ? WINDOWS_POWERSHELL : "ps",
+      process.platform === "win32"
+        ? [...POWERSHELL_ARGS, "(Get-CimInstance Win32_Process -Filter 'ProcessId = " + pid + "').CommandLine"]
+        : ["-p", String(pid), "-o", "command="],
+    );
+    return stdout;
   } catch {
-    return false;
+    return "";
   }
 }
 
-function killTaskTree(pid: number): void {
+async function killTaskTree(pid: number): Promise<boolean> {
   if (process.platform === "win32") {
     try {
-      execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
-    } catch {}
-    return;
+      await execFileAsync(join(WINDOWS_SYSTEM_DIR, "taskkill.exe"), ["/PID", String(pid), "/T", "/F"]);
+      return true;
+    } catch {
+      return !isProcessAlive(pid);
+    }
   }
   if (process.platform === "darwin") {
-    // Match Pi's backend: pausing the group keeps a dying child from waking its
-    // shell into the next command before the shell itself is killed.
+    // Stop the group before a dying child can wake its shell into the next command.
     try {
       process.kill(-pid, "SIGSTOP");
     } catch {}
   }
   try {
     process.kill(-pid, "SIGKILL");
+    return true;
   } catch {
     try {
       process.kill(pid, "SIGKILL");
-    } catch {}
+      return true;
+    } catch {
+      return !isProcessAlive(pid);
+    }
   }
 }
 
@@ -284,20 +367,42 @@ function orphanPaths(taskId: string): { journalPath: string; pidPath: string; st
   };
 }
 
-function cleanupOrphan(record: Pick<JournalRecord, "taskId" | "journalPath" | "pidPath" | "startPath" | "outputPath">): void {
+function cleanupOrphan(record: Pick<JournalRecord, "taskId" | "journalPath" | "pidPath" | "startPath" | "outputPath">, stores: Map<string, Set<string> | null>): void {
   rmSync(record.journalPath, { force: true });
   rmSync(record.pidPath, { force: true });
   rmSync(record.startPath, { force: true });
-  rmSync(record.outputPath, { force: true });
+  if (!outputHasPendingNotice(record.outputPath, stores)) {
+    rmSync(record.outputPath, { force: true });
+    rmSync(record.outputPath + ".profile", { force: true });
+  }
 }
+
+let reaping: Promise<void> | undefined;
 
 /**
  * Kill tasks left behind by a Pi process that was SIGKILLed or crashed. The
- * owner pid and the task's start time are checked first, so a reused pid is
- * never killed. A task that cannot be verified is left for a later load.
+ * owner PID/start pair is checked before verifying the child identity. Legacy
+ * records and unknown owner identities retain the conservative PID-only check.
  */
-export function reapOrphans(): void {
+export function reapOrphans(): Promise<void> {
+  if (reaping) return reaping;
   ensureOutputDir();
+  reaping = reapOrphanPass().finally(() => { reaping = undefined; });
+  return reaping;
+}
+
+async function reapOrphanPass(): Promise<void> {
+  const stores = new Map<string, Set<string> | null>();
+  // Reuse identities only within this pass; a later pass must detect PID reuse.
+  const processes = new Map<number, { alive: boolean; start?: Promise<string>; command?: Promise<string>; killed?: Promise<boolean> }>();
+  const probe = (pid: number) => {
+    let entry = processes.get(pid);
+    if (!entry) {
+      entry = { alive: isProcessAlive(pid) };
+      processes.set(pid, entry);
+    }
+    return entry;
+  };
   let names: string[];
   try {
     names = readdirSync(OUTPUT_DIR);
@@ -316,6 +421,7 @@ export function reapOrphans(): void {
       const record: JournalRecord = {
         taskId: id,
         ownerPid: parsed.ownerPid!,
+        ownerStart: typeof parsed.ownerStart === "string" ? parsed.ownerStart.trim() : "",
         command: typeof parsed.command === "string" ? parsed.command : "",
         outputPath: paths.outputPath,
         pidPath: paths.pidPath,
@@ -323,7 +429,12 @@ export function reapOrphans(): void {
         journalPath,
         startedAt: typeof parsed.startedAt === "number" && Number.isFinite(parsed.startedAt) ? parsed.startedAt : 0,
       };
-      if (isProcessAlive(record.ownerPid)) continue;
+      const owner = probe(record.ownerPid);
+      if (owner.alive) {
+        if (!record.ownerStart) continue;
+        const currentOwnerStart = await (owner.start ??= processStart(record.ownerPid));
+        if (!currentOwnerStart || currentOwnerStart === record.ownerStart) continue;
+      }
 
       let pid = 0;
       try {
@@ -333,8 +444,8 @@ export function reapOrphans(): void {
       }
       const hasPid = Number.isInteger(pid) && pid > 0;
       if (!hasPid && record.startedAt > 0 && Date.now() - record.startedAt < ORPHAN_STARTUP_GRACE_MS) continue;
-      if (!hasPid || !isProcessAlive(pid)) {
-        cleanupOrphan(record);
+      if (!hasPid || !probe(pid).alive) {
+        cleanupOrphan(record, stores);
         continue;
       }
 
@@ -344,19 +455,13 @@ export function reapOrphans(): void {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
       }
-      const currentStart = processStart(pid);
+      const child = probe(pid);
+      const currentStart = await (child.start ??= processStart(pid));
       const verified = recordedStart !== "" && currentStart !== ""
         ? currentStart === recordedStart
-        : commandMatches(id, pid);
-      if (!verified) {
-        // A reused PID or an unreadable start marker: never kill it. Drop the
-        // journal only after the grace period so a later load can retry.
-        if (record.startedAt > 0 && Date.now() - record.startedAt > ORPHAN_MAX_AGE_MS) cleanupOrphan(record);
-        continue;
-      }
-
-      killTaskTree(pid);
-      cleanupOrphan(record);
+        : (await (child.command ??= processCommand(pid))).includes(`pi-bg:${id}`);
+      // Keep unverifiable or unkillable tasks journaled so a later load can retry.
+      if (verified && await (child.killed ??= killTaskTree(pid))) cleanupOrphan(record, stores);
     } catch {
       // Corrupt journal or a filesystem race: leave it for the next load.
     }
@@ -393,6 +498,12 @@ export class BackgroundManager {
     // Create the file synchronously so callers can rely on it existing the moment start() returns;
     // createWriteStream opens asynchronously and would otherwise race the caller.
     writeFileSync(outputPath, "", { flag: "wx", mode: 0o600 });
+    try {
+      writeFileSync(outputPath + ".profile", resolve(getAgentDir(), "completion-notices"), { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      rmSync(outputPath, { force: true });
+      throw error;
+    }
     const fileStream = createWriteStream(outputPath, { flags: "a" });
     const controller = new AbortController();
     const decoder = new StringDecoder("utf8");
@@ -424,6 +535,7 @@ export class BackgroundManager {
     // error, which Node promotes to an uncaught exception that takes down the whole Pi process.
     fileStream.on("error", (error) => {
       task.error = `output file write failed: ${error instanceof Error ? error.message : String(error)}`;
+      controller.abort();
     });
     // Output-file cap: a pathological producer (`yes`) can otherwise write tens of GB.
     // Past the cap the file stops growing and a marker line records what was dropped;
@@ -431,53 +543,57 @@ export class BackgroundManager {
     let fileBytes = 0;
     let fileCapped = false;
 
-    const ops = options?.operations ?? createLocalBashOperations();
+    const ops = options?.operations ?? createBackgroundBashOperations(killTaskTree);
     const outputClosed = finished(fileStream, { cleanup: true }).catch(() => {});
     // The journal lets the next extension load kill a task whose owner Pi was
     // SIGKILLed or crashed (session_shutdown cannot run on those paths).
-    writeFileSync(
-      journalPath,
-      JSON.stringify({
-        taskId: id,
-        ownerPid: process.pid,
-        command,
-        outputPath,
-        pidPath,
-        startPath,
-        startedAt: Date.now(),
-      }),
-      { flag: "wx", mode: 0o600 },
-    );
-    const wrapped = wrapCommand(command, pidPath, startPath, id);
-    const execution = ops
-      .exec(options?.commandPrefix ? `${options.commandPrefix}\n${wrapped}` : wrapped, cwd, {
+    const execution = (async () => {
+      const ownerStart = await (cachedOwnerStart ??= processStart(process.pid));
+      controller.signal.throwIfAborted();
+      writeFileSync(
+        journalPath,
+        JSON.stringify({
+          taskId: id,
+          ownerPid: process.pid,
+          ownerStart,
+          command,
+          outputPath,
+          pidPath,
+          startPath,
+          startedAt: Date.now(),
+        }),
+        { flag: "wx", mode: 0o600 },
+      );
+      const wrapped = wrapCommand(options?.commandPrefix ? options.commandPrefix + "\n" + command : command, pidPath, startPath, id);
+      return ops.exec(wrapped, cwd, {
         signal: controller.signal,
         env: options?.env,
-        // ops.exec owns the explicit lifetime: it kills the process tree and rejects
-        // with `timeout:<seconds>`. `undefined` and `0` both mean no timeout.
+        // The backend owns the explicit lifetime and kills the process tree on timeout.
         timeout: options?.timeoutSeconds && options.timeoutSeconds > 0 ? options.timeoutSeconds : undefined,
         onData: (chunk) => {
-          // StringDecoder holds an incomplete multi-byte character until the rest of it arrives,
-          // instead of corrupting the preview at chunk boundaries.
           this.appendTail(task, decoder.write(chunk));
           if (fileCapped) return;
-          fileBytes += chunk.length;
-          if (fileBytes > OUTPUT_FILE_CAP_BYTES) {
+          if (task.error) throw new Error(task.error);
+          const remaining = OUTPUT_FILE_CAP_BYTES - fileBytes;
+          const kept = chunk.subarray(0, remaining);
+          let ready = kept.length === 0 || fileStream.write(kept);
+          fileBytes += kept.length;
+          if (chunk.length > remaining) {
             fileCapped = true;
-            // ponytail: ignores write() backpressure. Only matters if a chatty command outpaces the
-            // disk; add a pause/resume shim if that ever shows up in practice.
-            fileStream.write(`\n[output truncated: ${fileBytes - OUTPUT_FILE_CAP_BYTES} bytes dropped, producer kept running]\n`);
-            return;
+            ready = fileStream.write("\n[output truncated at " + OUTPUT_FILE_CAP_BYTES + " bytes; further bytes dropped, producer kept running]\n") && ready;
           }
-          fileStream.write(chunk);
+          if (!ready) return once(fileStream, "drain").then(() => {});
         },
-      })
+      });
+    })()
       .then(({ exitCode }) => {
-        task.status = "exited";
+        task.status = task.error ? "failed" : "exited";
         task.exitCode = exitCode;
       })
       .catch((error) => {
-        if (error instanceof Error && error.message.startsWith("timeout:")) {
+        if (task.error) {
+          task.status = "failed";
+        } else if (error instanceof Error && error.message.startsWith("timeout:")) {
           task.status = "timed_out";
         } else if (controller.signal.aborted) {
           task.status = "killed";
@@ -489,10 +605,12 @@ export class BackgroundManager {
 
     task.done = execution
       .then(() => {
+        this.appendTail(task, decoder.end());
         fileStream.end();
         return outputClosed;
       })
       .then(() => {
+        if (task.error) task.status = "failed";
         task.settledAt = Date.now();
         cleanupTaskMeta(task);
         this.emitChange();
@@ -579,7 +697,7 @@ export class BackgroundManager {
     }
   }
 
-  async clearSession(parentSessionId: string): Promise<void> {
+  async clearSession(parentSessionId: string, preservePending = false): Promise<void> {
     const tasks = Array.from(this.tasks.values()).filter((task) => task.parentSessionId === parentSessionId);
     const retiredOutputs = this.retiredOutputPaths.get(parentSessionId) ?? new Set<string>();
     this.retiredOutputPaths.delete(parentSessionId);
@@ -596,9 +714,11 @@ export class BackgroundManager {
         // times out, the journal stays and the next-start reaper kills it.
         if (!(await waitForTask(task.done))) return;
         cleanupTaskMeta(task);
-        await rm(task.outputPath, { force: true }).catch(() => {});
+        if (!preservePending || !task.notificationPending) {
+          await removeOutput(task.outputPath);
+        }
       }),
-      ...Array.from(retiredOutputs, (path) => rm(path, { force: true }).catch(() => {})),
+      ...Array.from(retiredOutputs, removeOutput),
     ]);
   }
 
@@ -707,7 +827,7 @@ registerBackgroundWorkProvider("background-terminal", (sessionId) =>
 /**
  * `background_run` — a pure background executor. It never waits, never returns command
  * output inline; it starts the command and returns a task id immediately. The exit
- * (natural, failed, or an explicit lifetime expiry) wakes the agent with a follow-up.
+ * (natural, failed, or an explicit lifetime expiry) wakes the agent with a completion notice.
  *
  * opencode's background shell has no timeout by default and treats an explicit timeout
  * as the only lifetime bound; this tool does the same. Pi's session shutdown is the real
@@ -715,7 +835,7 @@ registerBackgroundWorkProvider("background-terminal", (sessionId) =>
  * "no default lifetime" cannot leave a process behind after Pi exits. A timed-out dev
  * server renews by restarting (the wake-up message says so).
  *
- * The exit notification (followUp + triggerTurn) fires exactly once per task.
+ * Exit notifications share one continuation per batch with subagent results.
  *
  * This being a pure background tool, print/json sessions (pi -p, subagent children)
  * need no special-casing: there is no wait to keep alive. The task runs while the
@@ -763,7 +883,7 @@ export function registerBackgroundRunTool(pi: ExtensionAPI): void {
       const timeoutSeconds = explicitTimeout(params.timeout);
       const task = manager.start(params.command, ctx.cwd, ctx.sessionManager.getSessionId(), {
         timeoutSeconds,
-        operations: createLocalBashOperations({ shellPath: cached.settings.shellPath }),
+        operations: createBackgroundBashOperations(killTaskTree, cached.settings.shellPath),
         env: sessionEnv(ctx),
         commandPrefix: cached.settings.commandPrefix,
       });
@@ -829,8 +949,7 @@ function sessionEnv(ctx: ExtensionContext): NodeJS.ProcessEnv {
   }
   if (ctx.thinkingLevel) env.PI_REASONING_LEVEL = ctx.thinkingLevel;
 
-  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-  const binDir = join(agentDir, "bin");
+  const binDir = join(getAgentDir(), "bin");
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
   const currentPath = env[pathKey] ?? "";
   if (currentPath.split(delimiter).filter(Boolean).includes(binDir)) {
@@ -910,14 +1029,7 @@ export function registerBackgroundKillTool(pi: ExtensionAPI): void {
         };
       }
 
-      // The task can finish between the get() above and here; report what actually happened.
-      if (!manager.kill(params.id, parentSessionId)) {
-        const settled = manager.get(params.id, parentSessionId) ?? task;
-        return {
-          content: [{ type: "text", text: `[${settled.id}] finished on its own (${settled.status}); nothing to stop.` }],
-          details: settled,
-        };
-      }
+      await manager.stopAndWait(params.id, parentSessionId);
 
       return {
         content: [{ type: "text", text: `Stopped ${task.id} (${task.command}).` }],
@@ -981,10 +1093,11 @@ async function runTaskMenu(ctx: ExtensionCommandContext, task: BackgroundTask, s
     if (action === KILL) {
       const confirmed = await ctx.ui.confirm("Stop this background command?", current.command);
       if (!confirmed) continue;
-      if (manager.kill(current.id, sessionId)) {
+      try {
+        await manager.stopAndWait(current.id, sessionId);
         ctx.ui.notify("Background command stopped.", "info");
-      } else {
-        ctx.ui.notify("That background command is no longer running.", "warning");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
       }
       return;
     }
@@ -992,15 +1105,13 @@ async function runTaskMenu(ctx: ExtensionCommandContext, task: BackgroundTask, s
 }
 
 async function showOutput(ctx: ExtensionCommandContext, task: BackgroundTask): Promise<void> {
-  let output: string;
-  try {
-    output = await readFile(task.outputPath, "utf8");
-  } catch (error) {
-    ctx.ui.notify(`Could not read background output: ${error instanceof Error ? error.message : String(error)}`, "error");
-    return;
-  }
-
-  await ctx.ui.editor(`Output — ${truncateLine(task.command.replace(/\s+/g, " ").trim(), 100).text}`, output || "(no output yet)");
+  const output = [
+    `Output file: ${task.outputPath}`,
+    "The log saves the first 50 MiB; any file truncation is marked in the log.",
+    `Recent output (last ${NOTIFICATION_TAIL_LINES} lines, up to ${TAIL_PREVIEW_CHARS} characters):`,
+    formatNotificationOutput(task),
+  ].join("\n\n");
+  await ctx.ui.editor(`Output preview — ${truncateLine(task.command.replace(/\s+/g, " ").trim(), 100).text}`, output);
 }
 
 function formatTaskOption(task: BackgroundTask): string {
@@ -1018,7 +1129,7 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
     const label = theme.bold(theme.fg("customMessageLabel", `[${message.customType}]`));
     const details = message.details as Partial<BackgroundTask> | Partial<BackgroundTask>[] | undefined;
     const detail = Array.isArray(details) ? undefined : details;
-    const state = detail?.status === "exited" ? "completed" : detail?.status;
+    const state = detail && notificationState(detail);
     const fallback = content.split("\n").find((line) => line.trim() && !line.trimStart().startsWith("<")) ?? "(no output)";
     const summary = truncateLine(
       detail?.id
@@ -1033,12 +1144,6 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
     box.addChild(new Text(text, 0, 0));
     return box;
   });
-  // A SIGKILLed/crashed Pi cannot run session_shutdown; kill the tasks its
-  // journal left behind before starting new work. Then sweep stale logs from
-  // sessions that predate the journal.
-  reapOrphans();
-  sweepOrphanLogs();
-
   let currentSessionId: string | null = null;
   let updateStatus: (() => void) | undefined;
   let agentBusy = false;
@@ -1049,38 +1154,50 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
     const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
     if (index >= 0) pendingExits[index] = task;
     else pendingExits.push(task);
+    try {
+      const completion = completionEntries([task])[0]!;
+      completion.message.details = summaryDetails(task);
+      delivery.persist(task.parentSessionId, completion);
+    } catch (error) {
+      console.warn(`Could not persist background completion ${task.id}: ${error}`);
+    }
   };
 
-  // Pi drains the followUp queue one message at a time by default, so one message per exit
-  // would wake the agent into a separate turn per task. Exits that land while the agent is
-  // busy are buffered and flushed as a single message when it settles; followUp messages are
-  // only delivered once the agent finishes anyway, so this changes no delivery timing.
-  const flushPendingExits = () => {
-    if (!currentSessionId) return;
-    const batch = pendingExits.filter((task) => task.parentSessionId === currentSessionId);
-    if (batch.length === 0) return;
-    for (const completion of formatCompletionBatches(batch)) {
+  const completionEntries = (batch: BackgroundTask[]): Completion[] => {
+    if (batch.length === 0) return [];
+    return formatCompletionBatches(batch).map((completion) => {
       const tasks = completion.tasks;
-      try {
-        pi.sendMessage(
-          {
-            customType: "background-exit",
-            content: completion.content,
-            display: true,
-            details: completion.summarized
-              ? tasks.length === 1 ? summaryDetails(tasks[0]!) : tasks.map(summaryDetails)
-              : tasks.length === 1 ? tasks[0] : tasks,
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
-      } catch {
-        break;
-      }
-      for (const task of tasks) {
-        manager.notificationDelivered(task.id);
-        const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
-        if (index >= 0) pendingExits.splice(index, 1);
-      }
+      return {
+        ids: tasks.map((task) => task.id),
+        message: {
+          customType: "background-exit",
+          content: completion.content,
+          display: true,
+          details: completion.summarized
+            ? tasks.length === 1 ? summaryDetails(tasks[0]!) : tasks.map(summaryDetails)
+            : tasks.length === 1 ? tasks[0] : tasks,
+        },
+        delivered: () => {
+          for (const task of tasks) {
+            manager.notificationDelivered(task.id);
+            const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
+            if (index >= 0) pendingExits.splice(index, 1);
+          }
+        },
+      };
+    });
+  };
+  const delivery = registerCompletionSource("background-terminal", {
+    storageDir: join(getAgentDir(), "completion-notices"),
+    sessionId: () => currentSessionId,
+    send: (message, options) => pi.sendMessage(message, options),
+    pending: (sessionId) => completionEntries(pendingExits.filter((task) => task.parentSessionId === sessionId)),
+  });
+  const flushPendingExits = (triggerTurn = true) => {
+    try {
+      delivery.flush(triggerTurn);
+    } catch (error) {
+      console.warn("Could not deliver background completions:", error);
     }
   };
 
@@ -1088,9 +1205,7 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
     (task) => {
       enqueueExit(task);
       if (!currentSessionId || task.parentSessionId !== currentSessionId) return;
-      // followUp + triggerTurn is what makes this hands-off: it wakes an idle agent into a new turn
-      // with the outcome, so nothing has to poll background_status to notice completion.
-      if (!agentBusy) flushPendingExits();
+      if (!agentBusy) delivery.schedule();
     },
     () => updateStatus?.(),
   );
@@ -1115,6 +1230,7 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
   registerBackgroundKillTool(pi);
 
   pi.on("agent_start", async () => {
+    delivery.cancel();
     agentBusy = true;
   });
 
@@ -1131,7 +1247,11 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    // Recover crashed owners before new work, without blocking timers or the UI.
+    await reapOrphans();
+    sweepOrphanLogs();
     const sessionId = ctx.sessionManager.getSessionId();
+    agentBusy = false;
     currentSessionId = sessionId;
     for (const task of manager.pendingNotifications(sessionId)) enqueueExit(task);
     updateStatus = () => {
@@ -1139,36 +1259,30 @@ export default function registerBackgroundTerminal(pi: ExtensionAPI): void {
       ctx.ui.setStatus("background-terminal", running === 0 ? undefined : `bg:${running}`);
     };
     updateStatus();
-    if (!agentBusy) flushPendingExits();
+    if (!agentBusy) delivery.schedule();
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    delivery.cancel();
     // "reload" re-fires session_shutdown/session_start on the SAME session (extensions and config
     // hot-reload), it does not end the session. Background tasks must survive a /reload.
     if (event.reason === "reload") {
       flushPendingExits();
+      currentSessionId = null;
+      updateStatus = undefined;
       return;
     }
 
     const sessionId = ctx.sessionManager.getSessionId();
     ctx.ui.setStatus("background-terminal", undefined);
     updateStatus = undefined;
-    for (let index = pendingExits.length - 1; index >= 0; index--) {
-      if (pendingExits[index]?.parentSessionId === sessionId) pendingExits.splice(index, 1);
-    }
     if (currentSessionId === sessionId) currentSessionId = null;
-    await manager.clearSession(sessionId);
+    await manager.clearSession(sessionId, true);
   });
 }
 
-function notificationState(task: BackgroundTask): string {
-  return task.status === "exited" && !task.error
-    ? "completed"
-    : task.status === "failed" || task.status === "exited"
-      ? "failed"
-      : task.status === "timed_out"
-        ? "timed_out"
-        : "killed";
+function notificationState(task: Pick<Partial<BackgroundTask>, "status" | "error">): string | undefined {
+  return task.status === "exited" ? task.error ? "failed" : "completed" : task.status;
 }
 
 function formatExitMessage(task: BackgroundTask): string {
@@ -1245,16 +1359,15 @@ function summarizeCompletionBatches(batch: BackgroundTask[]): CompletionMessage[
 }
 
 const NOTIFICATION_TAIL_LINES = 50;
-const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 const CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 
 /** Strip terminal control sequences from model-facing output; the raw stream
  * stays in the output file for `read`. */
 function stripTerminal(text: string): string {
-  return text.replace(ANSI_PATTERN, "").replace(CONTROL_PATTERN, "");
+  return stripVTControlCharacters(text).replace(CONTROL_PATTERN, "");
 }
 
-/** Bounded tail for the completion notice. The full stream stays in the file. */
+/** Bounded tail for completion notices and the output menu; the log is capped separately. */
 function formatNotificationOutput(task: BackgroundTask): string {
   const raw = stripTerminal(task.tail).replace(/\s+$/, "");
   if (!raw) return "(no output)";

@@ -15,15 +15,55 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        pi: [locked, "1.5.0"]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           cache: npm
-      # Distribution gate: every pi-*/ directory is listed in the root pi manifest.
+      # Distribution gate: every extension directory has an entry in the root pi manifest.
       - run: node scripts/check-manifest.mjs
       - run: npm ci
+      # Exercise the peer floor even after the lockfile moves to a newer Pi.
+      - if: matrix.pi != 'locked'
+        run: npm install --no-save --package-lock=false @earendil-works/pi-coding-agent@${{ matrix.pi }} @earendil-works/pi-tui@${{ matrix.pi }}
+      - name: Load the git package through Pi
+        shell: bash
+        env:
+          EXPECTED_PI_VERSION: ${{ matrix.pi }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+          import { tmpdir } from 'node:os';
+          import { join, resolve } from 'node:path';
+
+          const root = process.cwd();
+          const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
+          const version = JSON.parse(readFileSync('node_modules/@earendil-works/pi-coding-agent/package.json', 'utf8')).version;
+          if (process.env.EXPECTED_PI_VERSION !== 'locked') assert.equal(version, process.env.EXPECTED_PI_VERSION);
+          const scratch = mkdtempSync(join(tmpdir(), 'pi-compat-'));
+          process.env.PI_CODING_AGENT_DIR = join(scratch, 'agent');
+          delete process.env.PI_SUBAGENT_CHILD;
+          try {
+            const { discoverAndLoadExtensions } = await import('@earendil-works/pi-coding-agent');
+            const { extensions, errors } = await discoverAndLoadExtensions([root], scratch, process.env.PI_CODING_AGENT_DIR);
+            assert.deepEqual(errors, []);
+            assert.deepEqual(extensions.map(e => e.resolvedPath).sort(), manifest.pi.extensions.map(p => resolve(root, p)).sort());
+            assert.deepEqual(extensions.flatMap(e => [...e.tools.keys()]).sort(), [
+              'ask_user', 'background_kill', 'background_run', 'background_status',
+              'goal_done', 'subagent', 'subagent_status', 'subagent_stop',
+            ]);
+            assert.deepEqual(extensions.flatMap(e => [...e.commands.keys()]).sort(), ['background', 'goal', 'subagent']);
+            console.log(version + ': loaded ' + extensions.length + ' extensions');
+          } finally {
+            rmSync(scratch, { recursive: true, force: true });
+          }
+          JS
       # Type-check any workspace that defines a `typecheck` script.
       - run: npm run typecheck --workspaces --if-present
       # Run every workspace's test suite (vitest).

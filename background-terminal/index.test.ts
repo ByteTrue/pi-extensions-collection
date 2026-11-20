@@ -1,8 +1,8 @@
-import { existsSync, readFileSync, utimesSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, MessageRenderer } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -12,7 +12,14 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 import * as fs from "node:fs";
-import registerBackgroundTerminal, { manager, sweepOrphanLogs, type BackgroundTask } from "./background-terminal.js";
+import registerBackgroundTerminal, { manager, sweepOrphanLogs } from "./background-terminal.js";
+
+const agentDir = mkdtempSync(join(tmpdir(), "background-notices-"));
+beforeAll(() => vi.stubEnv("PI_CODING_AGENT_DIR", agentDir));
+afterAll(() => {
+  vi.unstubAllEnvs();
+  rmSync(agentDir, { recursive: true, force: true });
+});
 
 type Handler = (event: unknown, ctx: unknown) => Promise<void>;
 
@@ -100,11 +107,13 @@ describe("background-terminal extension", () => {
     const concise = renderer(structured, options, theme)!.render(120).join("\n");
     expect(concise).toContain("bg_test completed — npm test");
     expect(concise).not.toContain("<shell");
+    const failed = renderer({ ...structured, details: { id: "bg_test", status: "exited", error: "ENOSPC", command: "npm test" } }, options, theme)!.render(120).join("\n");
+    expect(failed).toContain("bg_test failed — npm test");
     const expanded = renderer(message, { ...options, expanded: true }, theme)!.render(120).join("\n");
     expect(expanded).toContain("SECOND_LINE");
   });
 
-  it("wakes the agent on completion with followUp + triggerTurn, which is what replaces polling", async () => {
+  it("wakes the agent on completion with steer + triggerTurn, which is what replaces polling", async () => {
     const { sent, handlers } = harness();
     const sessionId = "notify-session";
     await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctxFor(sessionId));
@@ -112,7 +121,7 @@ describe("background-terminal extension", () => {
     manager.start('node -e "console.log(\'notify-payload\')"', process.cwd(), sessionId);
     await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 8000 });
 
-    expect(sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[0]?.options).toEqual({ deliverAs: "steer", triggerTurn: true });
     expect(sent[0]?.message.customType).toBe("background-exit");
     expect(sent[0]?.message.content).toContain('state="completed"');
     expect(sent[0]?.message.content).toContain("Exit code: 0");
@@ -196,7 +205,7 @@ describe("background-terminal extension", () => {
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(sent[0]?.options).toEqual({ deliverAs: "steer", triggerTurn: true });
     expect(sent[0]?.message.customType).toBe("background-exit");
     expect(sent[0]?.message.content).toContain("2 background tasks finished");
     expect(sent[0]?.message.content).toContain("batch-one");
@@ -248,12 +257,12 @@ describe("background-terminal extension", () => {
     await manager.clearSession(sessionId);
   });
 
-  it("requeues a completion that lands between reload shutdown and the new session_start", async () => {
+  it.each([false, true])("requeues a completion during reload when busy=%s", async (busy) => {
     const oldRuntime = harness();
     const sessionId = "reload-handoff-session";
     const ctx = ctxFor(sessionId);
     await oldRuntime.handlers.session_start?.({ type: "session_start", reason: "startup" }, ctx);
-    await oldRuntime.handlers.agent_start?.({ type: "agent_start" }, ctx);
+    if (busy) await oldRuntime.handlers.agent_start?.({ type: "agent_start" }, ctx);
     let finish!: (result: { exitCode: number }) => void;
     const completion = new Promise<{ exitCode: number }>((resolve) => { finish = resolve; });
     const task = manager.start('node -e ""', process.cwd(), sessionId, {
@@ -261,15 +270,17 @@ describe("background-terminal extension", () => {
     });
 
     await oldRuntime.handlers.session_shutdown?.({ type: "session_shutdown", reason: "reload" }, ctx);
+    ctx.ui.setStatus.mockClear();
     finish({ exitCode: 0 });
     await vi.waitFor(() => expect(manager.get(task.id, sessionId)?.status).toBe("exited"));
     await settle();
     expect(oldRuntime.sent).toEqual([]);
+    expect(ctx.ui.setStatus).not.toHaveBeenCalled();
 
     const newRuntime = harness();
     await newRuntime.handlers.session_start?.({ type: "session_start", reason: "reload" }, ctx);
 
-    expect(newRuntime.sent).toHaveLength(1);
+    await vi.waitFor(() => expect(newRuntime.sent).toHaveLength(1));
     expect(newRuntime.sent[0]?.message.content).toContain(task.id);
     await manager.clearSession(sessionId);
   });
@@ -294,24 +305,24 @@ describe("background-terminal extension", () => {
     await manager.clearSession(sessionId);
   });
 
-  it("reports an output write failure even when the command exits zero", async () => {
+  it("stops a command and reports an output write failure", async () => {
     const { sent, handlers } = harness();
     const sessionId = "write-error-notice-session";
     await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctxFor(sessionId));
-    const task = manager.start('node -e "setTimeout(() => {}, 200)"', process.cwd(), sessionId);
+    manager.start('node -e "setTimeout(() => {}, 200)"', process.cwd(), sessionId);
     const stream = vi.mocked(fs.createWriteStream).mock.results.at(-1)?.value as ReturnType<typeof fs.createWriteStream>;
 
-    stream.emit("error", new Error("ENOSPC: simulated disk full"));
+    stream.destroy(new Error("ENOSPC: simulated disk full"));
 
     await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 8000 });
     const content = sent[0]?.message.content ?? "";
     expect(content).toContain('state="failed"');
     expect(content).toContain("Error: output file write failed: ENOSPC: simulated disk full");
-    expect(content).toContain("Exit code: 0");
+    expect(content).not.toContain("Exit code: 0");
     await manager.clearSession(sessionId);
   });
 
-  it("drops buffered notifications when the session really ends", async () => {
+  it("restores a pending completion and its log after a process restart", async () => {
     const { sent, handlers } = harness();
     const sessionId = "drop-session";
     const ctx = ctxFor(sessionId);
@@ -326,6 +337,25 @@ describe("background-terminal extension", () => {
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
 
     expect(sent).toEqual([]);
+    expect(existsSync(task.outputPath)).toBe(true);
+    // Simulate a fresh process: the manager was cleared on quit and the memory queue is gone.
+    const state = globalThis as unknown as Record<symbol, unknown>;
+    delete state[Symbol.for("@bytetrue/pi-background-terminal.pending-exits.v2")];
+    const old = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    utimesSync(task.outputPath, old / 1000, old / 1000);
+    const restored = harness();
+    await restored.handlers.session_start?.({}, ctxFor("another-session"));
+    await settle();
+    expect(restored.sent).toEqual([]);
+    expect(existsSync(task.outputPath)).toBe(true);
+    await restored.handlers.session_start?.({}, ctx);
+    await vi.waitFor(() => expect(restored.sent).toHaveLength(1));
+    expect(restored.sent[0]?.message.content).toContain(task.id);
+    expect(readFileSync(task.outputPath, "utf8")).toContain("drop");
+    await restored.handlers.turn_end?.({}, ctx);
+    expect(restored.sent).toHaveLength(1);
+    rmSync(task.outputPath, { force: true });
+    rmSync(task.outputPath + ".profile", { force: true });
   });
 
 
@@ -359,10 +389,7 @@ describe("background-terminal extension", () => {
     const running = manager.start('node -e "setInterval(() => {}, 1000)"', process.cwd(), sessionId);
     const finished = Array.from({ length: 101 }, () => manager.start('node -e ""', process.cwd(), sessionId, { operations }));
 
-    await vi.waitFor(() => {
-      expect(manager.list(sessionId).filter((task) => task.status !== "running")).toHaveLength(101);
-    }, { timeout: 8000 });
-    await settle();
+    await vi.waitFor(() => expect(manager.pendingNotifications(sessionId)).toHaveLength(101), { timeout: 8000 });
     expect(manager.get(finished[0]!.id, sessionId)).not.toBeNull();
 
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
@@ -396,10 +423,9 @@ describe("background-terminal extension", () => {
     const long = manager.start('node -e "long"', process.cwd(), sessionId, { operations: { exec: () => longCompletion } });
     const operations = { exec: async () => ({ exitCode: 0 }) };
     const shorts = Array.from({ length: 100 }, () => manager.start('node -e "short"', process.cwd(), sessionId, { operations }));
-    await vi.waitFor(() => expect(manager.list(sessionId).filter((task) => task.status !== "running")).toHaveLength(100));
+    await vi.waitFor(() => expect(manager.pendingNotifications(sessionId)).toHaveLength(100));
     finishLong({ exitCode: 0 });
-    await vi.waitFor(() => expect(manager.get(long.id, sessionId)?.status).toBe("exited"));
-    await settle();
+    await vi.waitFor(() => expect(manager.pendingNotifications(sessionId)).toHaveLength(101));
 
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
 
@@ -432,7 +458,7 @@ describe("background-terminal extension", () => {
       expect(content).toContain(task.outputPath);
     }
     await manager.clearSession(sessionId);
-  });
+  }, 30_000);
 
   it("bounds a summary details error as well as its visible content", async () => {
     const { sent, handlers } = harness();
@@ -491,6 +517,7 @@ describe("background-terminal extension", () => {
     await handlers.turn_end?.({ type: "turn_end" }, ctx);
     expect(sent).toHaveLength(1);
     expect(sent[0]?.message.content).toContain("turn-end");
+    expect(sent[0]?.options).toEqual({ deliverAs: "steer", triggerTurn: true });
 
     await manager.clearSession(sessionId);
   });
@@ -516,6 +543,27 @@ describe("background-terminal extension", () => {
     await manager.clearSession(sessionId);
   });
 
+
+  it("strips OSC hyperlinks and window titles from the notification", async () => {
+    const { sent, handlers } = harness();
+    const sessionId = "osc-notice-session";
+    await handlers.session_start?.({ type: "session_start", reason: "startup" }, ctxFor(sessionId));
+    const task = manager.start("unused", process.cwd(), sessionId, {
+      operations: { exec: async (_command, _cwd, { onData }) => {
+        onData(Buffer.from("\x1b]0;HIDDEN-TITLE\x07\x1b]8;;https://hidden.invalid\x07visible\x1b]8;;\x07"));
+        return { exitCode: 0 };
+      } },
+    });
+    try {
+      await vi.waitFor(() => expect(sent).toHaveLength(1));
+      expect(sent[0]?.message.content).toContain("visible");
+      expect(sent[0]?.message.content).not.toContain("HIDDEN-TITLE");
+      expect(sent[0]?.message.content).not.toContain("hidden.invalid");
+      expect(readFileSync(task.outputPath, "utf8")).toContain("HIDDEN-TITLE");
+    } finally {
+      await manager.clearSession(sessionId);
+    }
+  });
 
   it("reports a non-zero exit code and a timed-out lifetime in the notice", async () => {
     const { sent, handlers } = harness();

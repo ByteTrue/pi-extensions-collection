@@ -7,7 +7,7 @@
 - 保留 pi 超集能力，不回退成 opencode 的窄接口：`ask_user` 多问题回退，`subagent_status` / `subagent_stop` / `resume`，`background_status` / `background_kill`。工具名不变，改名破坏现有会话与配置。
 - 对齐落定的关键行为（2026-11-12/13 用户逐项确认，已实现）：`bash-timeout` 默认 120s、显式 `timeout: 0` 关闭、更大值不压回；`background_run` 默认无寿命上限，Pi 退出清理；`subagent` 的 `agent` 与 `description` 必填，内置角色只剩 `general` 与 `explore`，触发句与 explore prompt 从 opencode `packages/core/src/plugin/agent.ts` 原样复用；`resume` 只接受本扩展创建的 `sub_…` 会话；`goal` 的 objective 包 `<untrusted_objective>` 并转义、上限 4000 字符，50 轮、连续 3 次无工具调用暂停，重启后恢复为 paused。
 - 明确不做（用户 2026-11-12 拍板）：所有问题同屏分页（A9）、选项 description 必填（A13）、字段叫 `prompt`（D17）、续聊参数叫 `sessionID`（D18）、subagent 持久子会话与运行中 follow-up（D5）。「四项全删」：ask-user 批次复核页（A8）、结构化 `details.answers`（A12）、goal 30 分钟 shell 等待定时器（E19）、goal 会话命名与去引号（E12/E13）。
-- pi 侧没有对应设施、暂不推进：permission/deny 流程、job registry 跨进程恢复、LLM goal judge（扩展 API 没有生成入口）、运行中 subagent 接收 follow-up（`pi -p` 一个进程只处理一个 prompt）、可配置嵌套深度（用 `PI_SUBAGENT_CHILD` 硬防递归）。
+- 暂不推进：permission/deny 流程、job registry 跨进程恢复、LLM goal judge、运行中 subagent 接收 follow-up（`pi -p` 一个进程只处理一个 prompt）、可配置嵌套深度（用 `PI_SUBAGENT_CHILD` 硬防递归）。Pi 1.5 的 `ModelRegistry` 已有 `stream` / `streamSimple` / `complete` 生成入口；judge 仍维持暂缓决定，不再以缺少生成 API 为理由。
 
 ## 依据
 
@@ -18,4 +18,4 @@
 
 ## 重访条件
 
-opencode 参照版本升级、或 Pi 提供了 permission / 生成入口 / 子会话 follow-up 设施时，重列「不适用」各行。新的模型可见行为先对照 opencode 再自创。
+opencode 参照版本升级、Pi 提供 permission / 子会话 follow-up 设施，或形成明确的 judge 需求时，重列对应各行。新的模型可见行为先对照 opencode 再自创。

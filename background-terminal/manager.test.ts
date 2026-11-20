@@ -11,6 +11,7 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     createWriteStream: vi.fn((...args: Parameters<typeof actual.createWriteStream>) => actual.createWriteStream(...args)),
+    writeFileSync: vi.fn((...args: Parameters<typeof actual.writeFileSync>) => actual.writeFileSync(...args)),
     rmSync: vi.fn((...args: Parameters<typeof actual.rmSync>) => actual.rmSync(...args)),
   };
 });
@@ -71,6 +72,79 @@ describe("BackgroundManager", () => {
     const failed = manager.get(started.id, SESSION_A);
     expect(failed?.exitCode).toBeNull();
     expect(failed?.error).toBeTruthy();
+  });
+
+  it("records a synchronous backend failure and closes its output stream", async () => {
+    const manager = createManager();
+    const onExit = vi.fn();
+    manager.init(onExit);
+    const started = manager.start("unused", process.cwd(), SESSION_A, {
+      operations: { exec: () => { throw new Error("synchronous backend failure"); } },
+    });
+    const stream = vi.mocked(fs.createWriteStream).mock.results.at(-1)?.value as ReturnType<typeof fs.createWriteStream>;
+
+    await vi.waitFor(() => expect(onExit).toHaveBeenCalledOnce());
+    expect(manager.get(started.id, SESSION_A)).toMatchObject({ status: "failed", error: "synchronous backend failure" });
+    expect(stream.closed).toBe(true);
+    expect(existsSync(join(tmpdir(), "background-terminal", started.id + ".journal.json"))).toBe(false);
+  });
+
+  it("does not launch a command when its journal cannot be written", async () => {
+    const manager = createManager();
+    const onExit = vi.fn();
+    const exec = vi.fn(async () => ({ exitCode: 0 }));
+    manager.init(onExit);
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    vi.mocked(fs.writeFileSync).mockImplementation((...args) => {
+      if (String(args[0]).endsWith(".journal.json")) throw new Error("ENOSPC: journal full");
+      return actual.writeFileSync(...args);
+    });
+    try {
+      const started = manager.start("unused", process.cwd(), SESSION_A, { operations: { exec } });
+      await vi.waitFor(() => expect(onExit).toHaveBeenCalledOnce());
+      expect(exec).not.toHaveBeenCalled();
+      expect(manager.get(started.id, SESSION_A)).toMatchObject({ status: "failed", error: "ENOSPC: journal full" });
+      const stream = vi.mocked(fs.createWriteStream).mock.results.at(-1)?.value as ReturnType<typeof fs.createWriteStream>;
+      expect(stream.closed).toBe(true);
+    } finally {
+      vi.mocked(fs.writeFileSync).mockImplementation(actual.writeFileSync);
+    }
+  });
+
+  it("removes the unused log and never launches when its profile marker cannot be written", async () => {
+    const manager = createManager();
+    const exec = vi.fn(async () => ({ exitCode: 0 }));
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    let outputPath = "";
+    vi.mocked(fs.writeFileSync).mockImplementation((...args) => {
+      if (String(args[0]).endsWith(".log")) outputPath = String(args[0]);
+      if (String(args[0]).endsWith(".profile")) throw new Error("ENOSPC: profile full");
+      return actual.writeFileSync(...args);
+    });
+    try {
+      expect(() => manager.start("unused", process.cwd(), SESSION_A, { operations: { exec } })).toThrow("ENOSPC: profile full");
+      expect(exec).not.toHaveBeenCalled();
+      expect(outputPath).not.toBe("");
+      expect(existsSync(outputPath)).toBe(false);
+      expect(manager.list(SESSION_A)).toEqual([]);
+    } finally {
+      vi.mocked(fs.writeFileSync).mockImplementation(actual.writeFileSync);
+    }
+  });
+
+  it("flushes an incomplete final UTF-8 character into the preview", async () => {
+    const manager = createManager();
+    const onExit = vi.fn();
+    manager.init(onExit);
+    const started = manager.start("unused", process.cwd(), SESSION_A, {
+      operations: { exec: async (_command, _cwd, { onData }) => {
+        onData(Buffer.from([0x61, 0xe2, 0x82]));
+        return { exitCode: 0 };
+      } },
+    });
+
+    await vi.waitFor(() => expect(onExit).toHaveBeenCalledOnce());
+    expect(manager.get(started.id, SESSION_A)?.tail).toBe(readFileSync(started.outputPath, "utf8"));
   });
 
   it("scopes get/list to the owning session", () => {
@@ -181,11 +255,11 @@ describe("BackgroundManager", () => {
     expect(stream.listenerCount("error")).toBeGreaterThan(0);
 
     // Would be an uncaught exception (killing all of Pi) if the listener were missing or a no-op.
-    stream.emit("error", new Error("ENOSPC: simulated disk full"));
+    stream.destroy(new Error("ENOSPC: simulated disk full"));
 
-    await vi.waitFor(() => expect(manager.get(started.id, SESSION_A)?.error).toMatch(/simulated disk full/), {
-      timeout: 8000,
-    });
+    await vi.waitFor(() => expect(manager.get(started.id, SESSION_A)).toMatchObject({
+      status: "failed", error: expect.stringContaining("simulated disk full"),
+    }), { timeout: 8000 });
   });
 
   it("survives Pi's /reload, which re-evaluates this module and would otherwise orphan tasks", async () => {
@@ -219,6 +293,26 @@ describe("BackgroundManager", () => {
     }
   });
 
+  it("keeps the bytes up to the cap when a chunk crosses it", async () => {
+    const manager = createManager();
+    const onExit = vi.fn();
+    manager.init(onExit);
+    const task = manager.start("unused", process.cwd(), SESSION_A, {
+      operations: { exec: async (_command, _cwd, { onData }) => {
+        await onData(Buffer.alloc(OUTPUT_FILE_CAP_BYTES - 3, 120));
+        await onData(Buffer.from("abcdef"));
+        await onData(Buffer.from("later output"));
+        return { exitCode: 0 };
+      } },
+    });
+
+    await vi.waitFor(() => expect(onExit).toHaveBeenCalledOnce());
+    const content = readFileSync(task.outputPath);
+    expect(content.subarray(OUTPUT_FILE_CAP_BYTES - 3, OUTPUT_FILE_CAP_BYTES).toString()).toBe("abc");
+    expect(content.indexOf("\n[output truncated")).toBe(OUTPUT_FILE_CAP_BYTES);
+    expect(manager.get(task.id, SESSION_A)?.tail).toContain("deflater output");
+  });
+
   it("stops writing the output file past the cap and records what was dropped", { timeout: 30_000 }, async () => {
     const manager = new BackgroundManager();
     managers.push(manager);
@@ -230,6 +324,7 @@ describe("BackgroundManager", () => {
     await vi.waitFor(() => expect(manager.get(task.id, SESSION_A)?.status).not.toBe("running"), { timeout: 25_000 });
     const settled = manager.get(task.id, SESSION_A)!;
     const content = readFileSync(task.outputPath, "utf8");
+    expect(content.indexOf("\n[output truncated")).toBe(OUTPUT_FILE_CAP_BYTES);
     expect(content).toContain("output truncated");
     expect(content).toContain("bytes dropped");
     expect(content).not.toContain("TAIL-MARK");

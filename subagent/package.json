@@ -2,7 +2,7 @@
   "name": "subagent",
   "version": "0.0.0",
   "private": true,
-  "description": "Pi extension: lightweight subagent runner with streaming execution, live TUI progress card, parallel/chain execution, and zero framework lock-in. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
+  "description": "Pi extension: background subagent runner with isolated child sessions, live progress, completion notifications, and resumable turn budgets. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -10,9 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=1.1.0",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-coding-agent": ">=1.5.0",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

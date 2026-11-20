@@ -53,6 +53,41 @@ function writeJournal(
 }
 
 describe("reapSubagentOrphans", () => {
+
+  it("recognizes a reused live owner PID by its recorded creation time", { timeout: 15_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-reused-owner-"));
+    const sessionId = "sub_owner_reused";
+    const child = spawnSleeper(sessionId);
+    const childPid = child.pid!;
+    const { journal } = writeJournal(sessionId, childPid, process.pid, dir, { ownerStart: "PREVIOUS_PROCESS_CREATION_TIME" });
+    try {
+      expect(subagentProcessStart(process.pid)).not.toBe("");
+      await reapSubagentOrphans(dir);
+      await vi.waitFor(() => expect(alive(childPid)).toBe(false), { timeout: 8000 });
+      expect(existsSync(journal)).toBe(false);
+    } finally {
+      killTree(childPid);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["owner", "child"])("retains journals when the %s liveness probe is inconclusive", async (kind) => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-uncertain-process-"));
+    const { journal } = writeJournal("sub_uncertain", 0, 999_999, dir, { childPid: 999_998, ownerStart: "recorded" });
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      throw Object.assign(new Error("probe failed"), { code: kind === "child" && pid === 999_999 ? "ESRCH" : "EPERM" });
+    });
+    try {
+      await reapSubagentOrphans(dir);
+      expect(existsSync(journal)).toBe(true);
+      expect(kill.mock.calls.every((call) => call[1] === 0)).toBe(true);
+    } finally {
+      kill.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+
   it("kills a child whose owner is gone and removes its journal", { timeout: 15_000 }, async () => {
     const sessionId = `sub_reap_${Date.now()}`;
     const child = spawnSleeper(sessionId);
@@ -60,7 +95,7 @@ describe("reapSubagentOrphans", () => {
     const { journal, start } = writeJournal(sessionId, childPid, 999_999);
     try {
       expect(alive(childPid)).toBe(true);
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       await vi.waitFor(() => expect(alive(childPid)).toBe(false), { timeout: 8000 });
       expect(existsSync(journal)).toBe(false);
       expect(existsSync(start)).toBe(false);
@@ -71,16 +106,14 @@ describe("reapSubagentOrphans", () => {
     }
   });
 
-  // Windows records no creation time and reaps by the command-line session marker,
-  // so a stale-start mismatch is a POSIX-only branch.
-  it.skipIf(isWindows)("does not kill a reused PID when the recorded start differs but the command session matches", async () => {
+  it("does not kill a reused PID when the recorded start differs but the command session matches", async () => {
     const sessionId = `sub_stale_${Date.now()}`;
-    const child = spawn(process.execPath, ["-e", `setInterval(() => {}, 1000) // --session ${sessionId}`], { detached: true, stdio: "ignore" });
+    const child = spawnSleeper(sessionId);
     const childPid = child.pid!;
     const { journal, start } = writeJournal(sessionId, childPid, 999_999);
     writeFileSync(start, "STALE_START_FROM_REUSED_PID");
     try {
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(alive(childPid)).toBe(true);
       expect(existsSync(journal)).toBe(true);
@@ -103,7 +136,7 @@ describe("reapSubagentOrphans", () => {
     rmSync(path);
     symlinkSync(target, path);
     try {
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       expect(alive(childPid)).toBe(true);
       expect(existsSync(paths.journal)).toBe(true);
     } finally {
@@ -120,7 +153,7 @@ describe("reapSubagentOrphans", () => {
     const childPid = child.pid!;
     const { journal, start } = writeJournal(sessionId, childPid, process.pid);
     try {
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       expect(alive(childPid)).toBe(true);
     } finally {
       killTree(childPid);
@@ -135,7 +168,7 @@ describe("reapSubagentOrphans", () => {
     const childPid = child.pid!;
     const { journal, start } = writeJournal(sessionId, childPid, 999_999, SUBAGENT_ORPHAN_DIR, { sessionId: undefined });
     try {
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       expect(alive(childPid)).toBe(true);
       expect(existsSync(journal)).toBe(true);
     } finally {
@@ -145,13 +178,13 @@ describe("reapSubagentOrphans", () => {
     }
   });
 
-  it("does not delete a startPath supplied by an invalid-PID journal", () => {
+  it("does not delete a startPath supplied by an invalid-PID journal", async () => {
     const sessionId = `sub_bad_pid_${Date.now()}`;
     const victim = join(SUBAGENT_ORPHAN_DIR, `${sessionId}-victim`);
     const { journal, start } = writeJournal(sessionId, -1, 999_999, SUBAGENT_ORPHAN_DIR, { startPath: victim });
     writeFileSync(victim, "do not delete");
     try {
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       expect(existsSync(victim)).toBe(true);
       expect(readFileSync(victim, "utf8")).toBe("do not delete");
     } finally {
@@ -167,7 +200,7 @@ describe("reapSubagentOrphans", () => {
     const { journal, start } = writeJournal(sessionId, childPid, 999_999, SUBAGENT_ORPHAN_DIR, { startPath: victim });
     writeFileSync(victim, "do not delete");
     try {
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       await vi.waitFor(() => expect(alive(childPid)).toBe(false), { timeout: 8000 });
       expect(existsSync(victim)).toBe(true);
       expect(existsSync(journal)).toBe(false);
@@ -178,14 +211,14 @@ describe("reapSubagentOrphans", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32")("refuses a directory owned by another user", () => {
+  it.skipIf(process.platform === "win32")("refuses a directory owned by another user", async () => {
     const sessionId = `sub_foreign_dir_${Date.now()}`;
     const victim = join(SUBAGENT_ORPHAN_DIR, `${sessionId}-victim`);
     const { journal, start } = writeJournal(sessionId, -1, 999_999, SUBAGENT_ORPHAN_DIR, { startPath: victim });
     writeFileSync(victim, "do not delete");
     const getuid = vi.spyOn(process, "getuid").mockReturnValue(statSync(SUBAGENT_ORPHAN_DIR).uid + 1);
     try {
-      reapSubagentOrphans();
+      await reapSubagentOrphans();
       expect(existsSync(victim)).toBe(true);
     } finally {
       getuid.mockRestore();
@@ -193,11 +226,11 @@ describe("reapSubagentOrphans", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32")("migrates an owned loose directory to private permissions", () => {
+  it.skipIf(process.platform === "win32")("migrates an owned loose directory to private permissions", async () => {
     const dir = mkdtempSync(join(tmpdir(), "subagent-orphan-mode-"));
     try {
       chmodSync(dir, 0o755);
-      reapSubagentOrphans(dir);
+      await reapSubagentOrphans(dir);
       expect(statSync(dir).mode & 0o777).toBe(0o700);
     } finally {
       chmodSync(dir, 0o700);

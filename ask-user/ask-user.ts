@@ -3,10 +3,8 @@
  * supporting single-select, multi-select, freeform answers, and back-navigation
  * across questions using Pi's built-in dialogs only.
  *
- * A small-extension: shipped as this single file (no npm package, no build
- * step), installed by scripts/install-small-extension.mjs into
- * ~/.pi/agent/extensions/. Zero runtime imports — jiti loads TypeScript
- * directly; type-only imports disappear at load time.
+ * Loaded from the root Pi package manifest with no build step. Zero runtime
+ * imports — jiti loads TypeScript directly; type-only imports disappear at load time.
  *
  * Why it exists: without it the model's questions arrive as free-form prose in
  * a different shape every session, and the user answers by typing
@@ -88,6 +86,8 @@ const askUserParameters = {
   properties: {
     questions: {
       type: "array",
+      minItems: 1,
+      maxItems: 4,
       description:
         "1-4 decision or clarification questions. Pass 1 item for a single question, or 2-4 items to batch independent decisions in one call.",
       items: {
@@ -106,7 +106,7 @@ const askUserParameters = {
               properties: {
                 label: {
                   type: "string",
-                  description: "Short answer text (1-5 words), e.g. 'Use vitest (Recommended)'",
+                  description: "Unique answer text (1-5 words), e.g. 'Use vitest (Recommended)'. Do not use generated Other/Back/Done row labels.",
                 },
                 description: {
                   type: "string",
@@ -150,12 +150,36 @@ function normalizeOptions(raw?: AskUserOption[]): AskUserOption[] {
     .filter((option) => option.label);
 }
 
+function optionIdentityError(questions: NormalizedQuestion[]): string | undefined {
+  for (const [questionIndex, question] of questions.entries()) {
+    const identities = new Map<string, number>();
+    for (const [optionIndex, option] of question.options.entries()) {
+      const row = option.description ? `${option.label} — ${option.description}` : option.label;
+      // Selectors also accept bare labels/rows, so every accepted spelling must be unambiguous.
+      const aliases = new Set([option.label, row, ...(question.multiple ? [`[ ] ${row}`, `[✓] ${row}`] : [])]);
+      for (const alias of aliases) {
+        const control = alias.replace(/^\[(?: |✓)\] /, "");
+        if (control === OTHER_LABEL || control === BACK_LABEL || /^✓ Done \(\d+ selected\)$/.test(control) ||
+          (question.multiple && control.startsWith("Other: "))) {
+          return `ask_user question ${questionIndex + 1}: option ${optionIndex + 1} (${JSON.stringify(option.label)}) conflicts with a generated Other/Back/Done row. Rename its label or description; these rows are added automatically.`;
+        }
+        const previous = identities.get(alias);
+        if (previous !== undefined && previous !== optionIndex) {
+          return `ask_user question ${questionIndex + 1}: options ${previous + 1} and ${optionIndex + 1} share the label or displayed row ${JSON.stringify(alias)}. Use unique labels and unambiguous descriptions; descriptions do not distinguish duplicate labels.`;
+        }
+        identities.set(alias, optionIndex);
+      }
+    }
+  }
+  return undefined;
+}
+
 function normalizeQuestions(
   params: AskUserParams,
 ): { questions: NormalizedQuestion[] } | { error: string } {
   if (Array.isArray(params?.questions)) {
-    if (params.questions.length === 0) {
-      return { error: "ask_user requires a non-empty 'questions' array." };
+    if (params.questions.length === 0 || params.questions.length > 4) {
+      return { error: "ask_user requires 1-4 items in the 'questions' array." };
     }
     const normalized: NormalizedQuestion[] = [];
     for (const item of params.questions) {
@@ -245,6 +269,7 @@ async function collectFreeform(
   prefill?: string,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
+  if (signal?.aborted) return undefined;
   const text = await withoutWorkingSpinner(ctx, () =>
     ctx.mode === "tui"
       ? prefill !== undefined
@@ -252,7 +277,7 @@ async function collectFreeform(
         : ctx.ui.editor(question)
       : ctx.ui.input(question, "Type your answer", { signal }),
   );
-  return text === undefined ? undefined : text.trim();
+  return signal?.aborted || text === undefined ? undefined : text.trim();
 }
 
 // ── Multi-select ──────────────────────────────────────────────────────
@@ -265,7 +290,6 @@ async function collectFreeform(
 // `✓ Done (N selected)` row instead.
 type MultiOutcome =
   | { kind: "submit"; values: string[] }
-  | { kind: "other" }
   | { kind: "back" };
 
 function multiSelectValues(
@@ -283,17 +307,15 @@ async function multiSelectDialog(
   ctx: ExtensionContext,
   title: string,
   options: AskUserOption[],
-  picked: Set<string>,
-  customText: string | undefined,
-  customChecked: boolean,
+  state: QuestionState,
   allowBack: boolean,
   signal?: AbortSignal,
 ): Promise<MultiOutcome | undefined> {
-  const selected = new Set(picked);
-  let custom = customText;
-  let customOn = customChecked && Boolean(customText);
-
+  // Keep drafts on the question itself so Back preserves picks and Other text.
+  const selected = state.pickedLabels;
   while (true) {
+    const custom = state.customText;
+    const customOn = state.customChecked && Boolean(custom);
     const optionRows = options.map((option) =>
       option.description ? `${option.label} — ${option.description}` : option.label,
     );
@@ -318,13 +340,13 @@ async function multiSelectDialog(
     }
     if (selectedRow === otherRow || selectedRow === `[ ] ${OTHER_LABEL}`) {
       if (custom && customOn) {
-        customOn = false;
+        state.customChecked = false;
         continue;
       }
       const text = await collectFreeform(title, ctx, custom, signal);
       if (text === undefined) return undefined;
-      custom = text || undefined;
-      customOn = Boolean(text);
+      state.customText = text || undefined;
+      state.customChecked = Boolean(text);
       continue;
     }
     const matched = options.find(
@@ -374,6 +396,8 @@ export async function askUserExecute(
   if ("error" in normalized) {
     return errorResult(normalized.error);
   }
+  const identityError = optionIdentityError(normalized.questions);
+  if (identityError) return errorResult(identityError);
   if (!ctx.hasUI) {
     return errorResult(
       "No interactive UI is available in this mode. Ask the question directly in your reply text instead of calling ask_user.",
@@ -415,7 +439,7 @@ export async function askUserExecute(
       }
       if (keepRow && selected === keepRow && state.customText) {
         state.answers = [state.customText];
-          index += 1;
+        index += 1;
         continue;
       }
       const text = await collectFreeform(title, ctx, state.customText, signal);
@@ -432,22 +456,13 @@ export async function askUserExecute(
         ctx,
         title,
         q.options,
-        state.pickedLabels,
-        state.customText,
-        state.customChecked,
+        state,
         index > 0,
         signal,
       );
       if (!outcome) return dismissedResult();
       if (outcome.kind === "back") {
         index -= 1;
-        continue;
-      }
-      if (outcome.kind === "other") {
-        const text = await collectFreeform(title, ctx, state.customText, signal);
-        if (text === undefined) return dismissedResult();
-        state.customText = text || undefined;
-        state.customChecked = Boolean(text);
         continue;
       }
       const labels = new Set(q.options.map((option) => option.label));
@@ -514,6 +529,13 @@ export default function askUserExtension(pi: ExtensionAPI): void {
       "Never ask what the context, the repo, or this session already answered — ask in prose only when you have no options to offer",
     ],
     parameters: askUserParameters as unknown as TSchema,
+    prepareArguments(args) {
+      const input = args as AskUserParams | null;
+      if (input && input.questions === undefined && typeof input.question === "string") {
+        return { questions: [{ question: input.question, options: input.options, multiple: input.multiple }] };
+      }
+      return args;
+    },
     // Same declaration as Pi's built-in read/bash/edit/write tools. With strict
     // JSON-schema sampling the provider itself constrains the argument text to a
     // valid object, so the whole class of "Invalid arguments: ... after JSON"

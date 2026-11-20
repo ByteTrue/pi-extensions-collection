@@ -18,7 +18,7 @@ afterEach(() => {
 });
 
 describe("background state directory boundary", () => {
-  it("does not follow journal paths outside the state directory", () => {
+  it("does not follow journal paths outside the state directory", async () => {
     mkdirSync(DIR, { recursive: true });
     const id = "bg_deadbeefdeadbeef";
     const journalPath = track(join(DIR, `${id}.journal.json`));
@@ -35,7 +35,7 @@ describe("background state directory boundary", () => {
       startedAt: Date.now(),
     }));
 
-    reapOrphans();
+    await reapOrphans();
 
     for (const path of [outputPath, pidPath, startPath]) {
       expect(existsSync(path)).toBe(true);
@@ -44,11 +44,11 @@ describe("background state directory boundary", () => {
   });
 
   // Windows reports POSIX mode bits as 0o666 regardless of chmod.
-  it.skipIf(process.platform === "win32")("tightens an owned loose directory before using it", () => {
+  it.skipIf(process.platform === "win32")("tightens an owned loose directory before using it", async () => {
     mkdirSync(DIR, { recursive: true });
     chmodSync(DIR, 0o755);
 
-    reapOrphans();
+    await reapOrphans();
 
     expect(statSync(DIR).mode & 0o777).toBe(0o700);
   });

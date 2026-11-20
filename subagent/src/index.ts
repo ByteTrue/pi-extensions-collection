@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { chmodSync, lstatSync, readdirSync, readFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { StringDecoder } from "node:string_decoder";
@@ -20,8 +21,9 @@ import {
   listBuiltinAgentNames,
   type AgentConfig,
 } from "./builtin-agents.js";
-import type { ExtensionAPI, ExtensionCommandContext, MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+import { registerCompletionSource, type Completion } from "../../shared/completion-delivery.js";
 
 export { BUILTIN_AGENTS_DIR, listBuiltinAgentNames, type AgentConfig };
 
@@ -35,6 +37,7 @@ export interface PiToolResult {
 }
 
 export interface PiExtensionContext {
+  cwd?: string;
   hasUI?: boolean;
   model?: {
     provider?: string;
@@ -89,6 +92,8 @@ export interface PiRunConfig {
   name?: string;
   sessionId?: string;
   resumeSession?: string;
+  /** Verified transcript path; only the extension entry may supply it. */
+  resumeSessionFile?: string;
   timeoutMs?: number;
   maxTurns?: number;
   /** Extra environment variables for the child process (settings `subagent.env`). */
@@ -781,7 +786,8 @@ export function resolvePiCli(): { command: string; args: string[] } {
 
 // ── Agent file parsing ────────────────────────────────────────────────
 function splitFM(c: string) {
-  const m = c.replace(/^\uFEFF/, "").match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  c = c.replace(/^\uFEFF/, "");
+  const m = c.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   return m
     ? { fm: m[1] ?? "", body: c.slice(m[0].length) }
     : { fm: "", body: c };
@@ -890,19 +896,13 @@ export function resolveAgentRole(
  * tintinweb's typeList: one line per role, the name plus the role document's
  * `description:` frontmatter — a trigger sentence written for the dispatching
  * model ("Use it to…"), not a property label. Documents without a description
- * and settings-only roles fall back to the bare name. Omitting `agent` picks
- * no role at all; the tool description states that separately, so there is no
- * hidden default entry to keep in sync here.
+ * and settings-only roles use the default trigger. The required `agent` field
+ * selects the role explicitly.
  */
-export function buildAgentRosterText(cwd: string): string {
-  return listDiscoveredAgentNames(cwd)
+export function buildAgentRosterText(cwd: string, projectTrusted = false): string {
+  return listDiscoveredAgentNames(cwd, projectTrusted)
     .map((name) => {
-      // Do not read a project agent document at load: its description would be
-      // injected into the tool description before project trust is resolved.
-      // Project-only roles are still listed by name (with the default trigger);
-      // their document is read only when the project is trusted and the role is
-      // actually called.
-      const description = findAgentDefinition(cwd, name, false).config.description?.trim();
+      const description = findAgentDefinition(cwd, name, projectTrusted).config.description?.trim();
       return `- ${name}: ${description ?? "This subagent should only be called when explicitly requested."}`;
     })
     .join("\n");
@@ -1045,7 +1045,7 @@ export function buildPiArgs(cfg: PiRunConfig): string[] {
     if (!SESSION_ID_PATTERN.test(cfg.resumeSession)) {
       throw new Error("Invalid resume session id: refusing to pass it to the child process.");
     }
-    args.push("--session", cfg.resumeSession);
+    args.push("--session", cfg.resumeSessionFile ?? cfg.resumeSession);
   } else if (cfg.sessionId) {
     if (!SESSION_ID_PATTERN.test(cfg.sessionId)) {
       throw new Error("Invalid session id: refusing to pass it to the child process.");
@@ -1158,19 +1158,16 @@ export function applyEvent(r: RunState, evt: JsonObject): boolean {
     r.usage.cacheWrite += num(u?.cacheWrite);
     r.usage.cost += num(cost?.total);
     r.usage.ctxTokens = num(u?.totalTokens);
-    const thinking = extractThinking(msg.content);
-    if (thinking) r.thinkingTail = appendTail("", thinking, MAX_TAIL);
-    const text = extractText(msg.content);
-    if (text) {
-      r.finalText = text;
-      r.textTail = appendTail("", text, MAX_TAIL);
-    }
+    r.thinkingTail = appendTail("", extractThinking(msg.content), MAX_TAIL);
+    r.finalText = extractText(msg.content);
+    r.textTail = appendTail("", r.finalText, MAX_TAIL);
     if (typeof msg.model === "string") {
       const parsed = splitModelThinking(msg.model, r.thinking);
       r.model = parsed.model;
       r.thinking = parsed.thinking;
     }
-    if (typeof msg.errorMessage === "string") r.errorMessage = msg.errorMessage;
+    r.errorMessage = str(msg.errorMessage) ??
+      (msg.stopReason === "error" || msg.stopReason === "aborted" ? `Assistant ${msg.stopReason}` : undefined);
     return true;
   }
   if (type === "tool_execution_start") {
@@ -1209,13 +1206,6 @@ export function applyEvent(r: RunState, evt: JsonObject): boolean {
     }
     return true;
   }
-  if (type === "agent_end") {
-    r.finishedAt = Date.now();
-    if (r.status === "running" || r.status === "pending") {
-      r.status = "succeeded";
-    }
-    return true;
-  }
   return false;
 }
 
@@ -1230,20 +1220,17 @@ function finalizeError(r: RunState, error: string): string {
 }
 
 function formatPiOutput(stdout: string, stderr: string): string {
-  let ft = "";
+  let ft: string | undefined;
   for (const line of stdout.split(/\r?\n/)) {
     const t = line.trim();
     if (!t) continue;
     try {
       const evt = JSON.parse(t) as JsonObject;
       const msg = isObj(evt.message) ? evt.message : null;
-      if (msg?.role === "assistant") {
-        const txt = extractText(msg.content);
-        if (txt) ft = txt;
-      }
+      if (evt.type === "message_end" && msg?.role === "assistant") ft = extractText(msg.content);
     } catch {}
   }
-  if (ft) return ft;
+  if (ft !== undefined) return ft;
   const raw = stdout || stderr;
   return raw.length > MAX_FALLBACK_OUTPUT_CHARS
     ? `[truncated output]\n${raw.slice(-MAX_FALLBACK_OUTPUT_CHARS)}`
@@ -1276,7 +1263,9 @@ const MAX_TIMER_MS = 2_147_483_647;
 
 interface SubagentJournal {
   sessionId: string;
+  sessionFile?: string;
   ownerPid: number;
+  ownerStart?: string;
   childPid: number;
   journalPath: string;
   startPath: string;
@@ -1300,59 +1289,80 @@ function ensureSubagentOrphanDir(dir: string): boolean {
   }
 }
 
-function readOwnedSubagentStateFile(path: string): string {
+function assertOwnedSubagentStateFile(path: string): void {
   const info = lstatSync(path);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error(`unsafe subagent state file: ${path}`);
   if (process.platform !== "win32") {
     const uid = process.getuid?.();
     if (uid === undefined || info.uid !== uid) throw new Error(`foreign subagent state file: ${path}`);
   }
+}
+
+function readOwnedSubagentStateFile(path: string): string {
+  assertOwnedSubagentStateFile(path);
   return readFileSync(path, "utf8");
 }
 
-function subagentAlive(pid: number): boolean {
+function subagentAlive(pid: number): boolean | undefined {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? false : undefined;
   }
 }
 
-/** Stable creation time of a live process, or "" when the platform cannot report one. */
+function subagentStartCommand(pid: number): [string, string[]] {
+  return process.platform === "win32"
+    ? ["powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`]]
+    : ["ps", ["-p", String(pid), "-o", "lstart="]];
+}
+
+/** Stable creation time used while recording a newly spawned child. */
 export function subagentProcessStart(pid: number): string {
-  // Windows has no portable creation-time query. Recording "" makes reaping fall
-  // back to the session marker in the command line (see subagentCommandMatches).
-  if (process.platform === "win32") return "";
   try {
-    return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
+    return execFileSync(...subagentStartCommand(pid), {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, windowsHide: true,
     }).trim();
-  } catch {
-    return "";
-  }
+  } catch { return ""; }
 }
 
-function subagentProcessCommandLine(pid: number): string {
+function subagentProcessOutput(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    execFile(command, args, { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL", windowsHide: true }, (error, stdout) => {
+      resolve(error ? "" : stdout.trim());
+    });
+  });
+}
+
+async function subagentProcessCommandLine(pid: number): Promise<string | string[]> {
+  if (process.platform === "linux") {
+    try { return (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0").slice(0, -1); }
+    catch { return []; }
+  }
   if (process.platform === "win32") {
-    // shortcut: PowerShell CIM costs ~0.7 s, so it runs only on the crash-reap path;
-    // add a native process query if orphan reaping ever becomes hot.
-    return execFileSync(
-      "powershell",
-      ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine`],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, windowsHide: true },
-    ).trim();
+    const output = await subagentProcessOutput("powershell",
+      ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine | ConvertTo-Json -Compress`]);
+    try { const command: unknown = JSON.parse(output); return typeof command === "string" ? command : ""; }
+    catch { return ""; }
   }
-  return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  }).trim();
+  return subagentProcessOutput("ps", ["-p", String(pid), "-o", "command="]);
 }
 
-function subagentCommandMatches(sessionId: string, pid: number): boolean {
+function subagentCommandMatches(sessionId: string, command: string | string[], sessionFile?: string): boolean {
+  if (sessionFile) {
+    try { assertOwnedSubagentStateFile(sessionFile); } catch { return false; }
+    if (typeof command === "string") {
+      // Only unambiguous Windows argv: quoted paths work; escaped/partial quotes fail closed.
+      if (process.platform !== "win32" || /\\"/.test(command) || !/^(?:"[^"]*"|[^ \t"]+)(?:[ \t]+(?:"[^"]*"|[^ \t"]+))*[ \t]*(?![\s\S])/.test(command)) return false;
+      command = (command.match(/"[^"]*"|[^ \t"]+/g) ?? []).map((arg) => arg.startsWith('"') ? arg.slice(1, -1) : arg);
+    }
+    return command.some((arg, index) => arg === "--session" && command[index + 1] === sessionFile);
+  }
+  if (Array.isArray(command)) {
+    return command.some((arg, index) => (arg === "--session" || arg === "--session-id") && command[index + 1] === sessionId);
+  }
   try {
-    const command = subagentProcessCommandLine(pid);
     // A token boundary, not whitespace: Windows quotes the -e script, so the id can be
     // followed by a closing quote.
     return new RegExp(`(?:^|\\s)--session(?:-id)?(?:=|\\s)${sessionId}(?![A-Za-z0-9_-])`).test(command);
@@ -1361,48 +1371,68 @@ function subagentCommandMatches(sessionId: string, pid: number): boolean {
   }
 }
 
-function killSubagentTree(pid: number): void {
+async function killSubagentTree(pid: number): Promise<boolean> {
   if (process.platform === "win32") {
-    try {
-      execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
-    } catch {}
-    return;
+    return new Promise((resolve) => {
+      execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { timeout: 5000, killSignal: "SIGKILL", windowsHide: true }, (error) => resolve(!error));
+    });
   }
   try {
     process.kill(-pid, "SIGKILL");
+    return true;
   } catch {
     try {
       process.kill(pid, "SIGKILL");
-    } catch {}
+      return true;
+    } catch { return false; }
   }
 }
 
-function writeSubagentJournal(sessionId: string, childPid: number): SubagentJournal | undefined {
+let subagentOwnerStart: string | undefined;
+
+function writeSubagentJournal(sessionId: string, childPid: number, sessionFile?: string): SubagentJournal | undefined {
   try {
     if (!ensureSubagentOrphanDir(SUBAGENT_ORPHAN_DIR)) return undefined;
     const id = `sub_${randomBytes(6).toString("hex")}`;
     const journalPath = join(SUBAGENT_ORPHAN_DIR, `${id}.journal.json`);
     const startPath = join(SUBAGENT_ORPHAN_DIR, `${id}.start`);
     const startedAt = Date.now();
+    const ownerStart = subagentOwnerStart ??= subagentProcessStart(process.pid);
     writeFileSync(startPath, subagentProcessStart(childPid), { flag: "wx", mode: 0o600 });
     writeFileSync(
       journalPath,
-      JSON.stringify({ sessionId, ownerPid: process.pid, childPid, startPath, startedAt }),
+      JSON.stringify({ sessionId, sessionFile, ownerPid: process.pid, ownerStart, childPid, startPath, startedAt }),
       { flag: "wx", mode: 0o600 },
     );
-    return { sessionId, ownerPid: process.pid, childPid, journalPath, startPath, startedAt };
+    return { sessionId, sessionFile, ownerPid: process.pid, ownerStart, childPid, journalPath, startPath, startedAt };
   } catch {
     return undefined;
   }
 }
 
 function cleanupSubagentJournal(journal: Pick<SubagentJournal, "journalPath" | "startPath">): void {
-  rmSync(journal.journalPath, { force: true });
-  rmSync(journal.startPath, { force: true });
+  for (const path of [journal.journalPath, journal.startPath]) {
+    try { rmSync(path, { force: true }); }
+    catch { /* Cleanup must not prevent the close handler from settling the task. */ }
+  }
 }
 
+const reapersKey = Symbol.for("pi-subagent.orphan-reapers");
+const reaperGlobals = globalThis as unknown as Record<symbol, Map<string, Promise<void>> | undefined>;
+const reapers = reaperGlobals[reapersKey] ??= new Map<string, Promise<void>>();
+
 /** Kill children left by a Pi process that was SIGKILLed or crashed. */
-export function reapSubagentOrphans(orphanDir = SUBAGENT_ORPHAN_DIR): void {
+export function reapSubagentOrphans(orphanDir = SUBAGENT_ORPHAN_DIR): Promise<void> {
+  const dir = resolve(orphanDir);
+  let active = reapers.get(dir);
+  if (!active) {
+    active = scanSubagentOrphans(dir).finally(() => reapers.delete(dir));
+    reapers.set(dir, active);
+  }
+  return active;
+}
+
+async function scanSubagentOrphans(orphanDir: string): Promise<void> {
   if (!ensureSubagentOrphanDir(orphanDir)) return;
   let names: string[];
   try {
@@ -1410,13 +1440,24 @@ export function reapSubagentOrphans(orphanDir = SUBAGENT_ORPHAN_DIR): void {
   } catch {
     return;
   }
+  const starts = new Map<number, Promise<string>>();
+  const terminated = new Set<number>();
+  const commands = new Map<number, Promise<string | string[]>>();
+  const processStart = (pid: number) => {
+    let value = starts.get(pid);
+    if (!value) {
+      value = subagentProcessOutput(...subagentStartCommand(pid));
+      starts.set(pid, value);
+    }
+    return value;
+  };
   for (const name of names) {
     const paseoOwner = /^paseo-([1-9][0-9]{0,9})-[A-Za-z0-9]{6}$/.exec(name);
     if (paseoOwner) {
       const path = join(orphanDir, name);
       try {
         const info = lstatSync(path);
-        if (info.isDirectory() && Date.now() - info.mtimeMs > 7 * 24 * 60 * 60 * 1000 && !subagentAlive(Number(paseoOwner[1]))) {
+        if (info.isDirectory() && Date.now() - info.mtimeMs > 7 * 24 * 60 * 60 * 1000 && subagentAlive(Number(paseoOwner[1])) === false) {
           // A resumed task's replay pointer must survive as long as its transcript.
           const aliasRoot = join(path, process.platform === "win32" ? "session" : "session.jsonl");
           const snapshot = (() => {
@@ -1443,19 +1484,30 @@ export function reapSubagentOrphans(orphanDir = SUBAGENT_ORPHAN_DIR): void {
       if (!id.startsWith("sub_") || !SESSION_ID_PATTERN.test(id)) continue;
       const parsed = JSON.parse(readOwnedSubagentStateFile(journalPath)) as Partial<SubagentJournal>;
       if (typeof parsed.sessionId !== "string" || !SESSION_ID_PATTERN.test(parsed.sessionId)) continue;
+      if (parsed.sessionFile !== undefined && (typeof parsed.sessionFile !== "string" || !isAbsolute(parsed.sessionFile) || !basename(parsed.sessionFile).endsWith(`_${parsed.sessionId}.jsonl`))) continue;
       if (typeof parsed.ownerPid !== "number" || !Number.isSafeInteger(parsed.ownerPid) || parsed.ownerPid <= 0) continue;
       if (typeof parsed.childPid !== "number" || !Number.isSafeInteger(parsed.childPid) || parsed.childPid <= 0) continue;
       if (typeof parsed.startedAt !== "number" || !Number.isFinite(parsed.startedAt) || parsed.startedAt <= 0) continue;
       const journal: SubagentJournal = {
         sessionId: parsed.sessionId,
+        sessionFile: parsed.sessionFile,
         ownerPid: parsed.ownerPid,
+        ownerStart: typeof parsed.ownerStart === "string" ? parsed.ownerStart : undefined,
         childPid: parsed.childPid,
         journalPath,
         startPath: join(orphanDir, `${id}.start`),
         startedAt: parsed.startedAt,
       };
-      if (subagentAlive(journal.ownerPid)) continue;
-      if (journal.childPid <= 0 || !subagentAlive(journal.childPid)) {
+      const ownerAlive = subagentAlive(journal.ownerPid);
+      if (ownerAlive !== false) {
+        if (ownerAlive === undefined || !journal.ownerStart) continue;
+        const ownerStart = await processStart(journal.ownerPid);
+        if (!ownerStart || ownerStart === journal.ownerStart) continue;
+      }
+      if (terminated.has(journal.childPid)) continue;
+      const childAlive = subagentAlive(journal.childPid);
+      if (childAlive === undefined) continue;
+      if (childAlive === false) {
         cleanupSubagentJournal(journal);
         continue;
       }
@@ -1465,18 +1517,27 @@ export function reapSubagentOrphans(orphanDir = SUBAGENT_ORPHAN_DIR): void {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
       }
-      const currentStart = subagentProcessStart(journal.childPid);
-      const verified = recordedStart !== "" && currentStart !== ""
-        ? recordedStart === currentStart
-        : subagentCommandMatches(journal.sessionId, journal.childPid);
+      const currentStart = await processStart(journal.childPid);
+      let verified = recordedStart !== "" && currentStart !== "" && recordedStart === currentStart;
+      if (!recordedStart || !currentStart) {
+        let command = commands.get(journal.childPid);
+        if (!command) {
+          command = subagentProcessCommandLine(journal.childPid);
+          commands.set(journal.childPid, command);
+        }
+        verified = subagentCommandMatches(journal.sessionId, await command, journal.sessionFile);
+      }
       if (!verified) {
-        if (journal.startedAt > 0 && Date.now() - journal.startedAt > 7 * 24 * 60 * 60 * 1000) {
+        // Unknown identity is not evidence that a live child's recovery record is stale.
+        if (recordedStart && currentStart && journal.startedAt > 0 && Date.now() - journal.startedAt > 7 * 24 * 60 * 60 * 1000) {
           cleanupSubagentJournal(journal);
         }
         continue;
       }
-      killSubagentTree(journal.childPid);
-      cleanupSubagentJournal(journal);
+      if (await killSubagentTree(journal.childPid)) {
+        terminated.add(journal.childPid);
+        cleanupSubagentJournal(journal);
+      }
     } catch {
       // Corrupt journal or a filesystem race: leave it for the next load.
     }
@@ -1516,7 +1577,7 @@ export function runPi(
       // through taskkill /T /F instead (see killTree).
       detached: !isWin,
     });
-    const journal = cli.pid === undefined ? undefined : writeSubagentJournal(state.sessionId, cli.pid);
+    const journal = cli.pid === undefined ? undefined : writeSubagentJournal(state.sessionId, cli.pid, cfg.resumeSessionFile);
     const cleanupJournal = () => {
       if (journal) cleanupSubagentJournal(journal);
     };
@@ -1529,6 +1590,7 @@ export function runPi(
     let buf = "";
     let settled = false;
     let aborted = false;
+    let streamError: string | undefined;
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     let verifyTimer: ReturnType<typeof setTimeout> | null = null;
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1542,6 +1604,12 @@ export function runPi(
     // child orphans that grandchild and the run keeps streaming. Kill the whole
     // tree: process group on POSIX, taskkill /T /F on Windows.
     const childDead = () => cli.exitCode !== null || cli.signalCode !== null;
+    const treeAlive = () => {
+      if (cli.pid === undefined) return false;
+      if (isWin) return !childDead();
+      try { process.kill(-cli.pid, 0); return true; }
+      catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+    };
     // Direct-kill fallbacks used to fail silently (taskkill spawn errors were
     // swallowed whole). Funnel them through one place that surfaces the failure
     // in stderrTail so a surviving child is at least visible.
@@ -1564,18 +1632,21 @@ export function runPi(
     };
     const killTree = (sig: "SIGTERM" | "SIGKILL" = "SIGTERM"): void => {
       const pid = cli.pid;
-      if (pid === undefined || childDead()) return;
+      if (pid === undefined || (isWin && childDead())) return;
       try {
         if (isWin) {
           spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
             stdio: "ignore",
             windowsHide: true,
-          }).on("error", (e) => killFallback(`taskkill: ${e.message}`));
+          }).on("error", (e) => killFallback(`taskkill: ${e.message}`))
+            .on("close", (code) => {
+              if (code !== 0 && !childDead()) killFallback(`taskkill exited ${code ?? "?"}`);
+            });
         } else {
           try {
             process.kill(-pid, sig); // negative pid: the whole process group
           } catch {
-            killFallback(`process.kill(-pid, ${sig})`);
+            if (!childDead()) killFallback(`process.kill(-pid, ${sig})`);
           }
         }
       } catch {
@@ -1589,10 +1660,10 @@ export function runPi(
     const killSequence = (): void => {
       killTree("SIGTERM");
       killTimer = setTimeout(() => {
-        if (childDead()) return;
+        if (!treeAlive()) return;
         killTree("SIGKILL");
         verifyTimer = setTimeout(() => {
-          if (childDead()) return;
+          if (!treeAlive()) return;
           killTree("SIGKILL");
           state.stderrTail = appendTail(
             state.stderrTail,
@@ -1694,6 +1765,11 @@ export function runPi(
 
     const processLine = (line: string) => {
       if (aborted) return;
+      if (line.length > MAX_LINE_BUFFER) {
+        streamError = `Subagent JSON event exceeds ${MAX_LINE_BUFFER} characters`;
+        abort();
+        return;
+      }
       const evt = parseJsonEvent(line);
       if (evt && applyEvent(state, evt)) {
         emit();
@@ -1711,11 +1787,15 @@ export function runPi(
 
     cli.stdout?.on("data", (d: Buffer) => {
       stdout.append(d);
+      if (aborted) return;
       buf += stdoutDecoder.write(d);
-      if (buf.length > MAX_LINE_BUFFER) buf = buf.slice(-MAX_LINE_BUFFER);
       const lines = buf.split(/\r?\n/);
       buf = lines.pop() ?? "";
       for (const l of lines) processLine(l);
+      if (buf.length > MAX_LINE_BUFFER) {
+        processLine(buf);
+        buf = "";
+      }
     });
 
     cli.stderr?.on("data", (d: Buffer) => {
@@ -1731,8 +1811,9 @@ export function runPi(
     });
 
     cli.stdin?.on("error", (e: Error & { code?: string }) => {
-      if (!aborted && e.code !== "EPIPE") {
-        done({ output: e.message, failed: true });
+      if (!settled && !aborted && e.code !== "EPIPE") {
+        streamError = e.message;
+        abort();
       }
     });
 
@@ -1745,6 +1826,8 @@ export function runPi(
     });
 
     cli.on("close", (code) => {
+      // A leader can exit before descendants that ignored SIGTERM or closed stdio.
+      if (aborted && !isWin) killTree("SIGKILL");
       if (killTimer) clearTimeout(killTimer);
       if (verifyTimer) clearTimeout(verifyTimer);
       if (settled) return;
@@ -1755,6 +1838,12 @@ export function runPi(
       state.stderrTail = appendTail("", stderrDecoder.end() || err, MAX_TAIL);
       state.finishedAt = Date.now();
 
+      if (streamError) {
+        state.status = "failed";
+        state.errorMessage = streamError;
+        done({ output: finalizeError(state, streamError), failed: true });
+        return;
+      }
       if (state.pauseReason) {
         state.status = "paused";
         done(pausedResult());
@@ -1765,6 +1854,12 @@ export function runPi(
         state.status = "cancelled";
         state.errorMessage = "cancelled";
         done({ output: finalize(state, "cancelled"), failed: true });
+        return;
+      }
+      // Print mode can exit zero after an assistant error; the final message is authoritative.
+      if (code === 0 && state.errorMessage) {
+        state.status = "failed";
+        done({ output: finalizeError(state, state.errorMessage), failed: true });
         return;
       }
       if (code === 0) {
@@ -1795,6 +1890,65 @@ export function buildSubagentPrompt(task: string, agentDef: AgentConfig): string
     return `${agentDef.systemPrompt}\n\n---\n## Assigned Task\n${task}`;
   }
   return task;
+}
+
+function resolveChildAgentDir(cwd: string, env?: Record<string, string>): string {
+  const agentDir = env?.PI_CODING_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR;
+  return resolve(cwd, (agentDir || join(homedir(), ".pi", "agent")).replace(/^~(?=$|[/\\])/, () => homedir()));
+}
+
+/** Persist parent ownership and serialize every writer of a child transcript. */
+export function acquireSubagentSession(
+  cwd: string,
+  agentDir: string,
+  sessionId: string,
+  parentSessionId: string,
+  resume: boolean,
+): { release: () => void; sessionFile?: string } {
+  assertSessionIdShape(sessionId, resume ? "resume" : "id");
+  const dir = join(agentDir, "subagent-sessions");
+  if (!ensureSubagentOrphanDir(dir)) throw new Error("Cannot create private subagent session state: " + dir);
+  const ownerPath = join(dir, sessionId + ".json");
+  const lockPath = join(dir, sessionId + ".lock");
+  const token = JSON.stringify({ pid: process.pid, token: randomBytes(16).toString("hex") });
+  try {
+    writeFileSync(lockPath, token, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // shortcut: crash locks require manual removal after confirming both processes exited; automatic reclamation needs an OS lock.
+    throw new Error("Subagent session is in use or has a crash lock. After confirming its parent and child have exited, remove: " + lockPath);
+  }
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      if (readOwnedSubagentStateFile(lockPath) === token) rmSync(lockPath);
+    } catch { /* Leave an unverifiable lock in place instead of deleting another writer's lock. */ }
+  };
+  try {
+    if (!resume) {
+      writeFileSync(ownerPath, JSON.stringify({ parentSessionId, cwd: resolve(cwd) }), { flag: "wx", mode: 0o600 });
+      return { release };
+    }
+    let owner: unknown;
+    try {
+      owner = JSON.parse(readOwnedSubagentStateFile(ownerPath));
+    } catch {
+      throw new Error("Cannot verify ownership of this child session. Older untracked sessions must be read as history; start a new child.");
+    }
+    if (!isObj(owner) || owner.parentSessionId !== parentSessionId) {
+      throw new Error("Cannot resume a child belonging to another parent session.");
+    }
+    if (owner.cwd !== resolve(cwd)) throw new Error("Resume must use the child's original cwd: " + String(owner.cwd));
+    const sessionFile = sessionLogPath({ cwd, sessionId, agentDir });
+    if (!sessionFile) throw new Error("The owned child session has no transcript to resume.");
+    assertOwnedSubagentStateFile(sessionFile);
+    return { release, sessionFile };
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 // ── Normalization Helper ──────────────────────────────────────────────
@@ -1833,12 +1987,10 @@ export function normalizeTask(input: SubagentInput): SubagentTaskItem {
   const resume = input.resume !== undefined ? (str(input.resume) ?? "") : "";
   if (resume) {
     assertSessionIdShape(resume, "resume");
-    // Only sessions this extension created may be resumed: `pi --session` accepts
-    // any session id, so without this a model could resume the parent session as a
-    // child (or an unrelated session) by passing its id.
+    // The entry also verifies parent ownership and holds a cross-process lock.
     if (!resume.startsWith("sub_"))
       throw new Error(
-        'Invalid "resume": only subagent sessions created by this extension (id starting with "sub_") can be resumed.',
+        'Invalid "resume": only subagent sessions (id starting with "sub_") can be resumed.',
       );
   }
   const id = input.id !== undefined ? (str(input.id) ?? "") : "";
@@ -2186,15 +2338,20 @@ export class SubagentTaskManager {
     // Do not hang Pi on a child that refuses to die; its journal stays for the
     // next-start reaper.
     await Promise.all(
-      sessionTasks.map((t) =>
-        Promise.race([
-          t.done?.catch(() => {}) ?? Promise.resolve(),
-          new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_WAIT_MS)),
-        ]),
-      ),
+      sessionTasks.map((t) => new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, SHUTDOWN_WAIT_MS);
+        timer.unref?.();
+        void (t.done ?? Promise.resolve()).catch(() => {}).then(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      })),
     );
     onDrained?.();
-    for (const t of sessionTasks) this.tasks.delete(t.id);
+    for (const t of sessionTasks) {
+      // Keep undrained children and failed sends available for completion/retry.
+      if (!onDrained || !t.notifyOnExit || t.notificationPending === false) this.tasks.delete(t.id);
+    }
     this.emitChange();
   }
 
@@ -2277,6 +2434,7 @@ export async function runSubagent(
   inheritedModel?: string,
   inheritCodemode?: boolean,
   projectTrusted: boolean = true,
+  resumeSessionFile?: string,
 ): Promise<{
   output: string;
   details: ProgressDetails;
@@ -2284,6 +2442,7 @@ export async function runSubagent(
   paused?: boolean;
 }> {
   const item = normalizeTask(input);
+  if (item.cwd) item.cwd = resolve(cwd, item.cwd);
 
   // Project-layer settings (env, role model overrides) only load when the
   // project is trusted; runSubagent is the tool's real entry, so the trust
@@ -2342,11 +2501,11 @@ export async function runSubagent(
       subagentSettings,
       inheritCodemode,
     );
+    runCfg.resumeSessionFile = resumeSessionFile;
     const run = newRun(role, role, item.task, sessionId);
     applyRunConfig(run, runCfg);
     run.cwd = runCfg.cwd || cwd;
-    const agentDir = buildChildEnv(runCfg).PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-    run.agentDir = resolve(run.cwd, agentDir.replace(/^~(?=$|[/\\])/, () => homedir()));
+    run.agentDir = resolveChildAgentDir(run.cwd, runCfg.env);
     details.runs.push(run);
     emit(true);
 
@@ -2423,7 +2582,6 @@ export default function subagentExtension(pi: {
   };
   pi.registerMessageRenderer?.("subagent-exit", renderExit);
   pi.registerMessageRenderer?.("subagent-notify", renderExit);
-  reapSubagentOrphans();
 
   let currentSessionId: string | null = null;
   let updateStatus: (() => void) | undefined;
@@ -2436,6 +2594,13 @@ export default function subagentExtension(pi: {
     const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
     if (index >= 0) pendingExits[index] = task;
     else pendingExits.push(task);
+    try {
+      const completion = completionEntries([task])[0]!;
+      completion.message.details = summaryDetails(task);
+      delivery.persist(task.parentSessionId, completion);
+    } catch (error) {
+      console.warn(`Could not persist subagent completion ${task.id}: ${error}`);
+    }
   };
   let statusTicker: ReturnType<typeof setInterval> | undefined;
   let activeParentModel: string | undefined = undefined;
@@ -2528,40 +2693,50 @@ export default function subagentExtension(pi: {
     return [{ content: full, tasks: batch, summarized: false }];
   };
 
-  const flushPendingExits = (triggerTurn = true) => {
-    if (!currentSessionId || !pi.sendMessage) return;
-    const batch = pendingExits.filter((task) => task.parentSessionId === currentSessionId);
-    if (batch.length === 0) return;
+  const completionEntries = (batch: BackgroundSubagentTask[]): Completion[] => {
     const compatible = batch.filter((task) => task.paseo);
     const messages = [
       ...formatCompletionBatches(batch.filter((task) => !task.paseo)),
       ...formatCompletionBatches(compatible.filter((task) => task.status === "succeeded")),
       ...compatible.filter((task) => task.status !== "succeeded").flatMap((task) => formatCompletionBatches([task])),
     ];
-    for (const completion of messages) {
+    return messages.map((completion) => {
       const tasks = completion.tasks;
       const first = tasks[0]!;
-      try {
-        pi.sendMessage(
-          {
-            customType: first.paseo ? "subagent-notify" : "subagent-exit",
-            content: first.paseo ? `${paseoNoticeHeader(first, tasks.length)}
-${completion.content}` : completion.content,
-            display: true,
-            details: completion.summarized
-              ? tasks.length === 1 ? summaryDetails(tasks[0]!) : tasks.map(summaryDetails)
-              : tasks.length === 1 ? toMessageDetails(tasks[0]!) : tasks.map(toMessageDetails),
-          },
-          { deliverAs: "followUp", triggerTurn },
-        );
-      } catch {
-        break;
-      }
-      for (const task of tasks) {
-        subagentManager.notificationDelivered?.(task.id);
-        const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
-        if (index >= 0) pendingExits.splice(index, 1);
-      }
+      return {
+        ids: tasks.map((task) => task.id),
+        message: {
+          customType: first.paseo ? "subagent-notify" : "subagent-exit",
+          content: first.paseo ? paseoNoticeHeader(first, tasks.length) + "\n" + completion.content : completion.content,
+          display: true,
+          details: completion.summarized
+            ? tasks.length === 1 ? summaryDetails(tasks[0]!) : tasks.map(summaryDetails)
+            : tasks.length === 1 ? toMessageDetails(tasks[0]!) : tasks.map(toMessageDetails),
+        },
+        delivered: () => {
+          for (const task of tasks) {
+            subagentManager.notificationDelivered?.(task.id);
+            const index = pendingExits.findIndex((pending) => pending.id === task.id && pending.parentSessionId === task.parentSessionId);
+            if (index >= 0) pendingExits.splice(index, 1);
+          }
+        },
+      };
+    });
+  };
+  const delivery = registerCompletionSource("subagent", {
+    storageDir: join(getAgentDir(), "completion-notices"),
+    sessionId: () => currentSessionId,
+    send: (message, options) => {
+      if (!pi.sendMessage) throw new Error("Completion delivery is unavailable");
+      pi.sendMessage(message, options);
+    },
+    pending: (sessionId) => completionEntries(pendingExits.filter((task) => task.parentSessionId === sessionId)),
+  });
+  const flushPendingExits = (triggerTurn = true) => {
+    try {
+      delivery.flush(triggerTurn);
+    } catch (error) {
+      console.warn("Could not deliver subagent completions:", error);
     }
   };
 
@@ -2571,7 +2746,7 @@ ${completion.content}` : completion.content,
       enqueueExit(task);
       if (!currentSessionId || task.parentSessionId !== currentSessionId)
         return;
-      if (!agentBusy) flushPendingExits();
+      if (!agentBusy) delivery.schedule();
     },
     (task) => {
       updateStatus?.();
@@ -2596,10 +2771,8 @@ ${completion.content}` : completion.content,
     },
   });
 
-  // Issue 102: the roster is baked into the description when the tool is
-  // registered; agent documents added mid-session need a /reload to appear
-  // here (role resolution itself always reads the files live).
-  const roster = buildAgentRosterText(process.cwd());
+  // Registration has no trusted session context; project roles join the prompt below.
+  const roster = buildAgentRosterText(process.cwd(), false);
   // Budget defaults are advertised from the global settings layer only, and
   // `loadSubagentSettings(cwd, false)` is exactly "global, project layer skipped"
   // — the project layer is applied per run through ctx trust, so the number shown
@@ -2640,16 +2813,16 @@ ${completion.content}` : completion.content,
           type: "array",
           items: { type: "string" },
           description:
-            "Optional tool allowlist. Restricts which tools the child agent can execute (nested in codemode when in codemode mode). Defaults to omitting this parameter to inherit the parent's full toolset.",
+            "Optional active tool selection. Omit to use role/default tools; [] disables tools. Codemode may reach registered codemode/deferred tools outside this selection, so this is not a security sandbox.",
         },
         cwd: {
           type: "string",
-          description: "Optional working directory.",
+          description: "Optional working directory, resolved relative to the parent session workspace.",
         },
         resume: {
           type: "string",
           description:
-            "Optional subagent session id (starts with 'sub_') to resume a previous child. Sessions not created by this extension are rejected.",
+            "Optional session id (starts with 'sub_') of a stopped child created by this parent session. Ownership and the original cwd are checked; concurrent use is rejected.",
         },
         timeoutMs: {
           type: "number",
@@ -2671,12 +2844,10 @@ ${completion.content}` : completion.content,
       _onUpdate?: (r: PiToolResult) => void,
       ctx?: PiExtensionContext,
     ) => {
-      const cwd = process.cwd();
+      const cwd = ctx?.cwd ?? process.cwd();
       const inheritedThinking = resolveInheritedThinking();
       const inheritedModel = resolveInheritedModel(ctx);
-      // Missing ctx (older pi) keeps the historical trusted default; the real
-      // entry must forward the decision so project-layer env is gated (BYTE-5 #1).
-      const projectTrusted = ctx?.isProjectTrusted?.() ?? true;
+      const projectTrusted = ctx?.isProjectTrusted?.() ?? false;
 
       // `id` is an internal field; the tool schema never advertises it. Strip a
       // model-supplied value so it cannot become `--session-id <parent-session>`
@@ -2687,7 +2858,8 @@ ${completion.content}` : completion.content,
       // Fail the tool call before any task is registered: an unknown role must
       // surface as an error the model can correct, not as a silently different
       // child (issue 097).
-      resolveAgentRole(cwd, item.agent, undefined, projectTrusted);
+      const settings = loadSubagentSettings(cwd, projectTrusted);
+      resolveAgentRole(cwd, item.agent, settings, projectTrusted);
 
       // Issue 115: pre-derive the child session id so the launch details can carry
       // the real pointer. runSubagent would otherwise generate its own random id
@@ -2699,14 +2871,18 @@ ${completion.content}` : completion.content,
         : { ...cleanInput, id: childSessionId };
       // Mirror runPi's cwd resolution: the launch details land in the transcript at
       // once, before the child process exists, so they cannot wait for spawn.
-      const launchCwd = item.cwd ? resolve(item.cwd) : cwd;
+      const launchCwd = item.cwd ? resolve(cwd, item.cwd) : cwd;
 
       // Pure background (issue 088): the call returns at once; progress streams into
       // the manager record (status bar + /subagent menu) and the result arrives as a
-      // followUp message via subagentManager.complete → onExit.
+      // Batched completion notice via subagentManager.complete → onExit.
       const taskId = `sub_${randomBytes(6).toString("hex")}`;
       const sessionId =
         ctx?.sessionManager?.getSessionId?.() ?? currentSessionId ?? "default";
+      if (item.resume && !ctx?.sessionManager?.getSessionId?.() && !currentSessionId) {
+        throw new Error("Cannot verify resume ownership without a parent session id.");
+      }
+      const lease = acquireSubagentSession(launchCwd, resolveChildAgentDir(launchCwd, settings.env), childSessionId, sessionId, Boolean(item.resume));
       const controller = new AbortController();
 
       const record: SubagentTaskRecord = {
@@ -2751,6 +2927,7 @@ ${completion.content}` : completion.content,
         inheritedModel,
         isCodemodeActive(pi),
         projectTrusted,
+        lease.sessionFile,
       )
         .then((res) => {
           subagentManager.complete(
@@ -2770,7 +2947,8 @@ ${completion.content}` : completion.content,
             true,
             controller.signal.aborted,
           );
-        });
+        })
+        .finally(lease.release);
 
       record.done = execution;
       if (record.paseo && !publishPaseoStatus(record)) {
@@ -2903,6 +3081,7 @@ ${completion.content}` : completion.content,
   });
 
   pi.on?.("agent_start", () => {
+    delivery.cancel();
     agentBusy = true;
   });
 
@@ -2919,6 +3098,7 @@ ${completion.content}` : completion.content,
   });
 
   pi.on?.("session_start", (_event, ctx) => {
+    agentBusy = false;
     trackSessionModel(ctx?.model);
     const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "default";
     currentSessionId = sessionId;
@@ -2939,11 +3119,17 @@ ${completion.content}` : completion.content,
       }
     };
     updateStatus();
-    if (!agentBusy) flushPendingExits();
+    if (!agentBusy) delivery.schedule();
+    return reapSubagentOrphans();
   });
 
-  pi.on?.("before_agent_start", (_event, ctx) => {
+  pi.on?.("before_agent_start", (event, ctx) => {
     trackSessionModel(ctx?.model);
+    if (!isObj(event) || typeof event.systemPrompt !== "string") return;
+    const activeRoster = buildAgentRosterText(ctx?.cwd ?? process.cwd(), ctx?.isProjectTrusted?.() ?? false);
+    if (activeRoster !== roster) {
+      return { systemPrompt: `${event.systemPrompt}\n\nAvailable subagent roles for this session (use this list over the static tool roster):\n${activeRoster}` };
+    }
   });
 
   pi.on?.("model_select", (event) => {
@@ -2957,6 +3143,7 @@ ${completion.content}` : completion.content,
   });
 
   pi.on?.("session_shutdown", async (event, ctx) => {
+    delivery.cancel();
     const reason = isObj(event) ? str(event.reason) : null;
     // /reload keeps tasks alive (global Map) and re-runs session_start, but the
     // old closure's teardown still applies: pending exit notifications must
@@ -2970,6 +3157,7 @@ ${completion.content}` : completion.content,
         statusTicker = undefined;
       }
       updateStatus = undefined;
+      currentSessionId = null;
       return;
     }
 
@@ -2983,9 +3171,6 @@ ${completion.content}` : completion.content,
     updateStatus = undefined;
     agentBusy = true;
     await subagentManager.clearSession(sessionId, () => flushPendingExits(false));
-    for (let index = pendingExits.length - 1; index >= 0; index--) {
-      if (pendingExits[index]?.parentSessionId === sessionId) pendingExits.splice(index, 1);
-    }
     if (currentSessionId === sessionId) currentSessionId = null;
   });
 }

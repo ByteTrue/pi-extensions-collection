@@ -5,13 +5,15 @@ import {
   updateSubagentSettings,
   describeSettingsPathForScope,
   listDiscoveredAgentNames,
+  isValidAgentName,
   parsePositiveInt,
   type SettingsScope,
-  type SubagentSettings,
 } from "./settings.js";
 import { promptFuzzySelect, type PickerItem } from "./tui-picker.js";
 import { subagentManager, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT_MS, type SubagentTaskRecord } from "./index.js";
 import { showProgressView } from "./progress-view.js";
+
+export const INHERIT = Symbol("inherit");
 
 const THINKING_CHOICES = [
   "off",
@@ -34,40 +36,37 @@ function trunc(s: string, w: number): string {
   return s.length <= w ? s : `${s.slice(0, w - 1)}…`;
 }
 
-// Preset tiers for the budget pickers. The package default is always reachable via
-// "Clear override", so the tiers do not need to list it.
+// Preset tiers for the budget pickers; inheritance follows the normal budget chain.
 const TURN_PRESETS = [50, 100, 150, 200];
 const TIMEOUT_PRESETS_MS = [20, 40, 60, 120].map((m) => m * 60000);
 
 /**
- * One picker for both budget numbers. Same shape as pickThinking: keep / clear /
- * custom / presets. `customScale` lets a timeout be typed in minutes while the
+ * One picker for both budget numbers. Same shape as pickThinking: keep / inherit /
+ * clear / custom / presets. `customScale` lets a timeout be typed in minutes while the
  * stored value stays milliseconds.
  */
 async function pickBudgetNumber(
   ctx: ExtensionCommandContext,
   title: string,
-  current: number | undefined,
+  current: number | null | undefined,
   presets: number[],
   format: (n: number) => string,
   customUnit: string,
   customScale: number,
-): Promise<number | null | undefined> {
+  allowClear = false,
+): Promise<number | null | undefined | typeof INHERIT> {
   const items: PickerItem[] = [];
 
   if (current !== undefined) {
     items.push({
       value: "__KEEP__",
-      label: `Keep current (${format(current)})`,
+      label: `Keep current (${current === null ? "role document/default" : format(current)})`,
       description: "retain existing budget",
     });
-    items.push({
-      value: "__CLEAR__",
-      label: "Clear override (use the package default)",
-      description: "unset this value",
-    });
-  } else {
-    items.push({ value: "__CLEAR__", label: "Inherit budget" });
+  }
+  items.push({ value: "__INHERIT__", label: "Inherit budget" });
+  if (allowClear) {
+    items.push({ value: "__CLEAR__", label: "Use role document/default", description: "bypass the global role budget" });
   }
 
   items.push({
@@ -87,6 +86,7 @@ async function pickBudgetNumber(
   if (!picked) return undefined;
 
   if (picked === "__KEEP__") return current;
+  if (picked === "__INHERIT__") return INHERIT;
   if (picked === "__CLEAR__") return null;
 
   if (picked === "__CUSTOM__") {
@@ -108,11 +108,11 @@ async function pickBudgetNumber(
 
 async function chooseScope(ctx: ExtensionCommandContext): Promise<SettingsScope | undefined> {
   const globalLabel = `Global — ${describeSettingsPathForScope(ctx.cwd, "global")}`;
-  const projectLabel = `Project — ${describeSettingsPathForScope(ctx.cwd, "project")}`;
+  const projectLabel = ctx.isProjectTrusted()
+    ? `Project — ${describeSettingsPathForScope(ctx.cwd, "project")}`
+    : undefined;
   const options = [globalLabel];
-  if (ctx.isProjectTrusted()) {
-    options.push(projectLabel);
-  }
+  if (projectLabel) options.push(projectLabel);
   options.push("🔙 Back");
 
   const selected = await ctx.ui.select("Where should subagent settings be saved?", options);
@@ -122,25 +122,23 @@ async function chooseScope(ctx: ExtensionCommandContext): Promise<SettingsScope 
 
 export async function pickModel(
   ctx: ExtensionCommandContext,
-  current?: string,
+  current?: string | null,
   hint?: string,
-): Promise<string | undefined | null> {
+  allowClear = false,
+): Promise<string | undefined | null | typeof INHERIT> {
   const available = ctx.modelRegistry.getAvailable();
   const items: PickerItem[] = [];
 
-  if (current) {
+  if (current !== undefined) {
     items.push({
       value: "__KEEP__",
-      label: `Keep current (${current})`,
+      label: `Keep current (${current ?? "role document/default"})`,
       description: "retain existing model",
     });
-    items.push({
-      value: "__CLEAR__",
-      label: "Clear model override",
-      description: "inherit model",
-    });
-  } else {
-    items.push({ value: "__CLEAR__", label: "Inherit model" });
+  }
+  items.push({ value: "__INHERIT__", label: "Inherit model" });
+  if (allowClear) {
+    items.push({ value: "__CLEAR__", label: "Use role document/default", description: "bypass the global role model" });
   }
 
   items.push({
@@ -167,6 +165,7 @@ export async function pickModel(
   if (!picked) return undefined;
 
   if (picked === "__KEEP__") return current;
+  if (picked === "__INHERIT__") return INHERIT;
   if (picked === "__CLEAR__") return null;
   if (picked === "__CUSTOM__") {
     const input = await ctx.ui.input(
@@ -181,23 +180,21 @@ export async function pickModel(
 
 export async function pickThinking(
   ctx: ExtensionCommandContext,
-  current?: string,
-): Promise<string | undefined | null> {
+  current?: string | null,
+  allowClear = false,
+): Promise<string | undefined | null | typeof INHERIT> {
   const items: PickerItem[] = [];
 
-  if (current) {
+  if (current !== undefined) {
     items.push({
       value: "__KEEP__",
-      label: `Keep current (${current})`,
+      label: `Keep current (${current ?? "role document/default"})`,
       description: "retain existing thinking level",
     });
-    items.push({
-      value: "__CLEAR__",
-      label: "Clear thinking override",
-      description: "inherit default thinking level",
-    });
-  } else {
-    items.push({ value: "__CLEAR__", label: "Inherit thinking level" });
+  }
+  items.push({ value: "__INHERIT__", label: "Inherit thinking level" });
+  if (allowClear) {
+    items.push({ value: "__CLEAR__", label: "Use role document/default", description: "bypass the global role thinking" });
   }
 
   for (const t of THINKING_CHOICES) {
@@ -215,13 +212,14 @@ export async function pickThinking(
   if (!picked) return undefined;
 
   if (picked === "__KEEP__") return current;
+  if (picked === "__INHERIT__") return INHERIT;
   if (picked === "__CLEAR__") return null;
   return picked;
 }
 
 function showConfig(ctx: ExtensionCommandContext): void {
   const settings = loadSubagentSettings(ctx.cwd, ctx.isProjectTrusted());
-  const discoveredRoles = listDiscoveredAgentNames(ctx.cwd);
+  const discoveredRoles = listDiscoveredAgentNames(ctx.cwd, ctx.isProjectTrusted());
 
   const lines = [
     "=== Subagent Configuration ===",
@@ -240,7 +238,7 @@ function showConfig(ctx: ExtensionCommandContext): void {
   } else {
     for (const [name, cfg] of configuredRoles) {
       lines.push(
-        `  • ${name}: model=${cfg.model ?? "default"}, thinking=${cfg.thinking ?? "default"}${cfg.tools?.length ? `, tools=[${cfg.tools.join(",")}]` : ""}${cfg.maxTurns !== undefined ? `, maxTurns=${cfg.maxTurns}` : ""}${cfg.timeoutMs !== undefined ? `, timeout=${fmtDur(cfg.timeoutMs)}` : ""}`,
+        `  • ${name}: model=${cfg.model ?? "document/default"}, thinking=${cfg.thinking ?? "document/default"}${cfg.tools !== undefined ? `, tools=${cfg.tools === null ? "document/default" : `[${cfg.tools.join(",")}]`}` : ""}${cfg.maxTurns !== undefined ? `, maxTurns=${cfg.maxTurns ?? "document/default"}` : ""}${cfg.timeoutMs !== undefined ? `, timeout=${cfg.timeoutMs === null ? "document/default" : fmtDur(cfg.timeoutMs)}` : ""}`,
       );
     }
   }
@@ -270,12 +268,12 @@ async function configureDefaultMenu(ctx: ExtensionCommandContext): Promise<void>
 
   const path = updateSubagentSettings(ctx.cwd, scope, (current) => ({
     ...current,
-    defaultModel: model === null ? undefined : model,
-    defaultThinking: thinking === null ? undefined : thinking,
+    defaultModel: typeof model === "string" ? model : undefined,
+    defaultThinking: typeof thinking === "string" ? thinking : undefined,
   }));
 
   ctx.ui.notify(
-    `Subagent default saved to ${path}\nModel: ${model ?? "(inherited)"}, Thinking: ${thinking ?? "(inherited)"}`,
+    `Subagent default saved to ${path}\nModel: ${typeof model === "string" ? model : "(inherited)"}, Thinking: ${typeof thinking === "string" ? thinking : "(inherited)"}`,
     "info",
   );
 }
@@ -288,7 +286,7 @@ async function configureBudgetMenu(ctx: ExtensionCommandContext): Promise<void> 
 
   const maxTurns = await pickBudgetNumber(
     ctx,
-    `Max Turns — global default (package default: ${DEFAULT_MAX_TURNS})`,
+    `Max Turns — ${scope} default (package default: ${DEFAULT_MAX_TURNS})`,
     currentSettings.defaultMaxTurns,
     TURN_PRESETS,
     (n) => `${n} turns`,
@@ -299,7 +297,7 @@ async function configureBudgetMenu(ctx: ExtensionCommandContext): Promise<void> 
 
   const timeoutMs = await pickBudgetNumber(
     ctx,
-    `Timeout — global default (package default: ${fmtDur(DEFAULT_TIMEOUT_MS)})`,
+    `Timeout — ${scope} default (package default: ${fmtDur(DEFAULT_TIMEOUT_MS)})`,
     currentSettings.defaultTimeoutMs,
     TIMEOUT_PRESETS_MS,
     (n) => fmtDur(n),
@@ -310,19 +308,19 @@ async function configureBudgetMenu(ctx: ExtensionCommandContext): Promise<void> 
 
   const path = updateSubagentSettings(ctx.cwd, scope, (current) => ({
     ...current,
-    defaultMaxTurns: maxTurns === null ? undefined : maxTurns,
-    defaultTimeoutMs: timeoutMs === null ? undefined : timeoutMs,
+    defaultMaxTurns: typeof maxTurns === "number" ? maxTurns : undefined,
+    defaultTimeoutMs: typeof timeoutMs === "number" ? timeoutMs : undefined,
   }));
 
   ctx.ui.notify(
-    `Subagent budget saved to ${path}\nMax Turns: ${maxTurns ?? DEFAULT_MAX_TURNS}, Timeout: ${timeoutMs === null ? fmtDur(DEFAULT_TIMEOUT_MS) : fmtDur(timeoutMs)}`,
+    `Subagent budget saved to ${path}\nMax Turns: ${typeof maxTurns === "number" ? maxTurns : "(inherited)"}, Timeout: ${typeof timeoutMs === "number" ? fmtDur(timeoutMs) : "(inherited)"}`,
     "info",
   );
 }
 
 async function configureRoleMenu(ctx: ExtensionCommandContext): Promise<void> {
   while (true) {
-    const discovered = listDiscoveredAgentNames(ctx.cwd);
+    const discovered = listDiscoveredAgentNames(ctx.cwd, ctx.isProjectTrusted());
     const customOption = "➕ Enter a new role name...";
     const choices = [...discovered, customOption, "🔙 Back"];
 
@@ -337,6 +335,10 @@ async function configureRoleMenu(ctx: ExtensionCommandContext): Promise<void> {
       );
       if (input === undefined || !input.trim()) continue;
       roleName = input.trim().toLowerCase();
+      if (!isValidAgentName(roleName)) {
+        ctx.ui.notify("Invalid role name: use at most 128 characters and no control or line-separator characters.", "error");
+        continue;
+      }
     }
 
     const scope = await chooseScope(ctx);
@@ -345,49 +347,51 @@ async function configureRoleMenu(ctx: ExtensionCommandContext): Promise<void> {
     const currentSettings = loadSubagentSettingsForScope(ctx.cwd, scope);
     const existingRole = currentSettings.agents?.[roleName] ?? {};
 
-    const model = await pickModel(ctx, existingRole.model);
+    const model = await pickModel(ctx, existingRole.model, undefined, true);
     if (model === undefined) continue;
 
-    const thinking = await pickThinking(ctx, existingRole.thinking);
+    const thinking = await pickThinking(ctx, existingRole.thinking, true);
     if (thinking === undefined) continue;
 
     const maxTurns = await pickBudgetNumber(
       ctx,
-      `Max Turns for "${roleName}" (the role document's own budget applies when unset)`,
+      `Max Turns for "${roleName}" (inherit global role, then document/default)`,
       existingRole.maxTurns,
       TURN_PRESETS,
       (n) => `${n} turns`,
       "turns",
       1,
+      true,
     );
     if (maxTurns === undefined) continue;
 
     const timeoutMs = await pickBudgetNumber(
       ctx,
-      `Timeout for "${roleName}" (the role document's own budget applies when unset)`,
+      `Timeout for "${roleName}" (inherit global role, then document/default)`,
       existingRole.timeoutMs,
       TIMEOUT_PRESETS_MS,
       (n) => fmtDur(n),
       "minutes",
       60000,
+      true,
     );
     if (timeoutMs === undefined) continue;
 
     const path = updateSubagentSettings(ctx.cwd, scope, (current) => {
-      const nextAgents = { ...(current.agents ?? {}) };
+      const nextAgents = Object.assign(Object.create(null) as NonNullable<typeof current.agents>, current.agents);
       const updatedRole = { ...(nextAgents[roleName] ?? {}) };
 
-      if (model === null) delete updatedRole.model;
+      if (model === INHERIT) delete updatedRole.model;
       else updatedRole.model = model;
 
-      if (thinking === null) delete updatedRole.thinking;
+      if (thinking === INHERIT) delete updatedRole.thinking;
       else updatedRole.thinking = thinking;
 
-      if (maxTurns === null) delete updatedRole.maxTurns;
-      else if (maxTurns !== undefined) updatedRole.maxTurns = maxTurns;
+      if (maxTurns === INHERIT) delete updatedRole.maxTurns;
+      else updatedRole.maxTurns = maxTurns;
 
-      if (timeoutMs === null) delete updatedRole.timeoutMs;
-      else if (timeoutMs !== undefined) updatedRole.timeoutMs = timeoutMs;
+      if (timeoutMs === INHERIT) delete updatedRole.timeoutMs;
+      else updatedRole.timeoutMs = timeoutMs;
 
       if (Object.keys(updatedRole).length > 0) {
         nextAgents[roleName] = updatedRole;
@@ -402,7 +406,7 @@ async function configureRoleMenu(ctx: ExtensionCommandContext): Promise<void> {
     });
 
     ctx.ui.notify(
-      `Role "${roleName}" configured in ${path}\nModel: ${model ?? "(default)"}, Thinking: ${thinking ?? "(default)"}, Max Turns: ${maxTurns ?? "(document default)"}, Timeout: ${timeoutMs === null || timeoutMs === undefined ? "(document default)" : fmtDur(timeoutMs)}`,
+      `Role "${roleName}" configured in ${path}\nModel: ${model === INHERIT ? "(inherited)" : model ?? "(document/default)"}, Thinking: ${thinking === INHERIT ? "(inherited)" : thinking ?? "(document/default)"}, Max Turns: ${maxTurns === INHERIT ? "(inherited)" : maxTurns ?? "(document/default)"}, Timeout: ${timeoutMs === INHERIT ? "(inherited)" : timeoutMs === null ? "(document/default)" : fmtDur(timeoutMs)}`,
       "info",
     );
     return;

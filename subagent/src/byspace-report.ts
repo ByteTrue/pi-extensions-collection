@@ -14,6 +14,11 @@ import type { SubagentTaskRecord } from "./index.js";
 const REPORT_ENV_URL = "BYSPACE_SUBAGENT_REPORT_URL";
 const REPORT_ENV_TOKEN = "BYSPACE_SUBAGENT_REPORT_TOKEN";
 
+// Reload keeps tasks alive, so their in-flight reports must share the same queue.
+const PENDING_KEY = Symbol.for("@bytetrue/pi-subagent.byspace-pending");
+const pendingGlobal = globalThis as unknown as Record<symbol, Map<string, Promise<void>> | undefined>;
+const pendingReports = (pendingGlobal[PENDING_KEY] ??= new Map<string, Promise<void>>());
+
 export interface ByspaceReportRecord {
   id: string;
   status: SubagentTaskRecord["status"];
@@ -26,14 +31,14 @@ export interface ByspaceReportRecord {
 function childSession(
   record: SubagentTaskRecord,
   resolveSessionFile:
-    | ((run: { sessionId: string; cwd?: string }) => string | undefined)
+    | ((run: { sessionId: string; cwd?: string; agentDir?: string }) => string | undefined)
     | undefined,
 ): { sessionId?: string; cwd?: string; sessionFile?: string } {
   const run = record.progress?.runs[0];
   const sessionId = run?.sessionId ?? record.sessionId;
   if (!sessionId) return {};
   const cwd = run?.cwd ?? record.cwd;
-  const sessionFile = run ? resolveSessionFile?.(run) : undefined;
+  const sessionFile = resolveSessionFile?.(run ?? { sessionId, cwd });
   return {
     sessionId,
     ...(cwd ? { cwd } : {}),
@@ -50,6 +55,7 @@ export function buildByspaceReportRecord(
   resolveSessionFile?: (run: {
     sessionId: string;
     cwd?: string;
+    agentDir?: string;
   }) => string | undefined,
 ): ByspaceReportRecord {
   return {
@@ -79,14 +85,18 @@ export class ByspaceReporter {
    */
   report(record: ByspaceReportRecord): void {
     if (!this.url || !this.token) return;
+    const key = JSON.stringify(record);
     if (record.status === "running") {
-      const key = JSON.stringify(record);
       if (this.lastRunning.get(record.id) === key) return;
       this.lastRunning.set(record.id, key);
     } else {
       this.lastRunning.delete(record.id);
     }
-    void (async () => {
+    // Keep a slow running report from arriving after the task has finished.
+    const queueKey = JSON.stringify([this.url, this.token, record.id]);
+    const previous = pendingReports.get(queueKey);
+    const pending = (async () => {
+      if (previous) await previous;
       const attempts = record.status === "running" ? 1 : 2;
       for (let attempt = 0; attempt < attempts; attempt++) {
         try {
@@ -103,7 +113,11 @@ export class ByspaceReporter {
         }
       }
       // A failed running snapshot must not suppress the next identical attempt.
-      this.lastRunning.delete(record.id);
-    })().catch(() => {})
+      if (this.lastRunning.get(record.id) === key) this.lastRunning.delete(record.id);
+    })().catch(() => {});
+    pendingReports.set(queueKey, pending);
+    void pending.then(() => {
+      if (pendingReports.get(queueKey) === pending) pendingReports.delete(queueKey);
+    });
   }
 }

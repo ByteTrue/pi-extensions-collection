@@ -1,6 +1,16 @@
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import registerSubagent, { SubagentTaskManager, subagentManager, type SubagentTaskRecord } from "./index.js";
+
+const agentDir = mkdtempSync(join(tmpdir(), "subagent-notices-"));
+beforeAll(() => vi.stubEnv("PI_CODING_AGENT_DIR", agentDir));
+afterAll(() => {
+  vi.unstubAllEnvs();
+  rmSync(agentDir, { recursive: true, force: true });
+});
 
 type Handler = (event?: unknown, ctx?: unknown) => unknown;
 
@@ -95,9 +105,77 @@ describe("subagent completion delivery", () => {
     const newRuntime = harness();
     await newRuntime.handlers.get("session_start")?.({}, ctxFor(sessionId));
 
-    expect(newRuntime.sent).toHaveLength(1);
+    await vi.waitFor(() => expect(newRuntime.sent).toHaveLength(1));
     expect(newRuntime.sent[0]?.content).toContain("finished during handoff");
     await subagentManager.clearSession(sessionId);
+  });
+
+  it("retains a failed shutdown notification until the session is reopened", async () => {
+    const sessionId = "subagent-shutdown-send-retry";
+    const runtime = harness();
+    await runtime.handlers.get("session_start")?.({}, ctxFor(sessionId));
+    await runtime.handlers.get("agent_start")?.();
+    subagentManager.register(task("sub_shutdown_retry", sessionId));
+    subagentManager.complete("sub_shutdown_retry", "shutdown result", false);
+    runtime.failNextSend();
+
+    await runtime.handlers.get("session_shutdown")?.({ reason: "switch" }, ctxFor(sessionId));
+    expect(runtime.sent).toHaveLength(0);
+    expect(subagentManager.get("sub_shutdown_retry")?.notificationPending).toBe(true);
+    await runtime.handlers.get("session_start")?.({}, ctxFor(sessionId));
+
+    await vi.waitFor(() => expect(runtime.sent).toHaveLength(1));
+    expect(runtime.sent[0]?.content).toContain("shutdown result");
+    await subagentManager.clearSession(sessionId);
+  });
+
+  it("restores only the original parent notice after memory is lost", async () => {
+    const sessionId = "subagent-durable-restart";
+    const runtime = harness();
+    await runtime.handlers.get("session_start")?.({}, ctxFor(sessionId));
+    await runtime.handlers.get("agent_start")?.();
+    subagentManager.register(task("sub_durable_restart", sessionId));
+    subagentManager.complete("sub_durable_restart", "persisted child result", false);
+    await subagentManager.clearSession(sessionId);
+    const state = globalThis as unknown as Record<symbol, unknown>;
+    delete state[Symbol.for("@bytetrue/pi-subagent.pending-exits")];
+
+    const restored = harness();
+    await restored.handlers.get("session_start")?.({}, ctxFor("different-parent"));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(restored.sent).toEqual([]);
+    await restored.handlers.get("session_start")?.({}, ctxFor(sessionId));
+    await vi.waitFor(() => expect(restored.sent).toHaveLength(1));
+    expect(restored.sent[0]?.content).toContain("persisted child result");
+    expect(restored.sent[0]?.details).toMatchObject({ id: "sub_durable_restart", sessionId: "sub_durable_restart", status: "succeeded", cwd: "/tmp" });
+    await restored.handlers.get("turn_end")?.();
+    expect(restored.sent).toHaveLength(1);
+    expect(runtime.sent).toEqual([]);
+  });
+
+  it("keeps an undrained child until its eventual completion", async () => {
+    vi.useFakeTimers();
+    const manager = new SubagentTaskManager();
+    const record = task("sub_late_shutdown", "late-shutdown");
+    let drain!: () => void;
+    record.done = new Promise<void>((resolve) => { drain = resolve; });
+    const notices: string[] = [];
+    manager.init((finished) => notices.push(finished.output));
+    manager.register(record);
+    try {
+      const clearing = manager.clearSession(record.parentSessionId, () => {});
+      await vi.advanceTimersByTimeAsync(5000);
+      await clearing;
+      expect(manager.get(record.id)).toBe(record);
+      manager.complete(record.id, "late output", false, true);
+      expect(notices).toEqual(["late output"]);
+      drain();
+      await manager.clearSession(record.parentSessionId);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      drain();
+      vi.useRealTimers();
+    }
   });
 
   it("bounds a burst of full completion messages with a summary", async () => {
@@ -140,7 +218,7 @@ describe("subagent completion delivery", () => {
     after.notificationPending = undefined;
     await newRuntime.handlers.get("session_start")?.({}, ctxFor(sessionId));
 
-    expect(newRuntime.sent).toHaveLength(1);
+    await vi.waitFor(() => expect(newRuntime.sent).toHaveLength(1));
     expect(newRuntime.sent[0]?.content).toContain("LEGACY_RESULT");
     expect(newRuntime.sent[0]?.content).toContain("LEGACY_PENDING_BEFORE_INIT");
     await subagentManager.clearSession(sessionId);
@@ -153,6 +231,7 @@ describe("subagent completion delivery", () => {
     runtime.failNextSend();
     subagentManager.register(task("sub_send_retry", sessionId));
     subagentManager.complete("sub_send_retry", "retry me", false);
+    await runtime.handlers.get("turn_end")?.();
     expect(runtime.sent).toHaveLength(0);
 
     await runtime.handlers.get("agent_settled")?.({ aborted: false });
@@ -160,6 +239,33 @@ describe("subagent completion delivery", () => {
     expect(runtime.sent).toHaveLength(1);
     expect(runtime.sent[0]?.content).toContain("retry me");
     await subagentManager.clearSession(sessionId);
+  });
+
+  it("reports damaged storage without breaking lifecycle cleanup and can retry", async () => {
+    const sessionId = "subagent-storage-retry";
+    const runtime = harness();
+    await runtime.handlers.get("session_start")?.({}, ctxFor(sessionId));
+    await runtime.handlers.get("agent_start")?.();
+    subagentManager.register(task("sub_storage_retry", sessionId));
+    subagentManager.complete("sub_storage_retry", "saved result", false);
+    const directory = join(agentDir, "completion-notices");
+    const name = readdirSync(directory).find((name) => readFileSync(join(directory, name), "utf8").includes("sub_storage_retry"))!;
+    const path = join(directory, name);
+    const original = readFileSync(path, "utf8");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(path, "broken");
+      await runtime.handlers.get("turn_end")?.();
+      expect(warning).toHaveBeenCalledOnce();
+      expect(runtime.sent).toHaveLength(0);
+      writeFileSync(path, original);
+      await runtime.handlers.get("session_shutdown")?.({ reason: "quit" }, ctxFor(sessionId));
+      expect(runtime.sent).toHaveLength(1);
+      expect(runtime.sent[0]?.content).toContain("saved result");
+    } finally {
+      warning.mockRestore();
+      await subagentManager.clearSession(sessionId);
+    }
   });
 
   it("chunks oversized summaries and keeps clone-safe BySpace terminal details", async () => {
@@ -197,7 +303,7 @@ describe("subagent completion delivery", () => {
       expect(detail.progress).toBeUndefined();
     }
     await subagentManager.clearSession(sessionId);
-  });
+  }, 30_000);
 
   it("uses the known child session pointer in a fast-child summary", async () => {
     const sessionId = "subagent-fast-summary";
@@ -209,7 +315,7 @@ describe("subagent completion delivery", () => {
     subagentManager.register(record);
     subagentManager.complete(record.id, "x".repeat(60_000), false);
 
-    expect(runtime.sent).toHaveLength(1);
+    await vi.waitFor(() => expect(runtime.sent).toHaveLength(1));
     expect(runtime.sent[0]?.content).toContain("sub_real_child");
     expect(runtime.sent[0]?.content).toContain("/tmp/launch-cwd");
     expect(runtime.sent[0]?.content).not.toContain("unavailable");

@@ -1,15 +1,21 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   buildPiArgs,
   normalizeTask,
   SubagentTaskManager,
-  type SubagentInput,
   type SubagentTaskRecord,
 } from "./index.js";
+
+const agentDir = mkdtempSync(join(tmpdir(), "subagent-byte6-"));
+beforeAll(() => vi.stubEnv("PI_CODING_AGENT_DIR", agentDir));
+afterAll(() => {
+  vi.unstubAllEnvs();
+  rmSync(agentDir, { recursive: true, force: true });
+});
 
 // The fake pi CLI logs its argv and exits with a chosen code after a delay, so
 // a real child process exercises the abort-vs-close race (BYTE-6 #17).

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import subagentExtension from "./index.js";
 import {
   parseJsonEvent,
@@ -7,6 +7,7 @@ import {
   isCodemodeActive,
   buildPiArgs,
   buildChildEnv,
+  acquireSubagentSession,
   parseAgentFile,
   findAgentDefinition,
   resolveAgentRole,
@@ -17,7 +18,6 @@ import {
   runPi,
   normalizeTask,
   SubagentTaskManager,
-  SubagentBackgroundManager,
   toMessageDetails,
   subagentManager,
   describeTask,
@@ -31,13 +31,11 @@ import {
   type RunState,
   type JsonObject,
   type SubagentInput,
-  type SubagentTaskItem,
   type SubagentTaskRecord,
 } from "./index.js";
 import {
   loadSubagentSettings,
   updateSubagentSettings,
-  listDiscoveredAgentNames,
 } from "./settings.js";
 import { buildByspaceReportRecord } from "./byspace-report.js";
 import { writeFileSync, unlinkSync, mkdirSync, existsSync, rmSync, readFileSync, mkdtempSync } from "node:fs";
@@ -154,10 +152,10 @@ describe("subagent unit tests", () => {
     expect(state.usage.cost).toBe(0.002);
     expect(state.usage.turns).toBe(1);
 
-    // agent_end
+    // agent_end can be followed by an automatic retry; only process close settles.
     applyEvent(state, { type: "agent_end" });
-    expect(state.status).toBe("succeeded");
-    expect(state.finishedAt).toBeDefined();
+    expect(state.status).toBe("running");
+    expect(state.finishedAt).toBeUndefined();
   });
 
   it("resolves user-configured agent model and thinking", () => {
@@ -385,8 +383,7 @@ describe("subagent unit tests", () => {
     expect(roster).not.toContain("- plan");
     expect(roster).not.toContain("- general-purpose");
 
-    // Project-only roles are listed by name but their document is not read at
-    // load, so an untrusted project description cannot enter the tool prompt.
+    // Registration skips the entire project layer; a trusted session gets it live.
     const dir = join(tmpdir(), `subagent-roster-${Date.now()}`);
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(
@@ -398,11 +395,10 @@ describe("subagent unit tests", () => {
       "---\n---\n\nBody only.\n",
     );
     try {
-      const custom = buildAgentRosterText(dir);
-      expect(custom).toContain(
-        "- db-sleuth: This subagent should only be called when explicitly requested.",
-      );
-      expect(custom).not.toContain("Database migration auditor");
+      expect(buildAgentRosterText(dir)).not.toContain("db-sleuth");
+      expect(buildAgentRosterText(dir)).not.toContain("bare-role");
+      const custom = buildAgentRosterText(dir, true);
+      expect(custom).toContain("- db-sleuth: Database migration auditor");
       expect(custom).toContain("- bare-role");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -790,12 +786,10 @@ describe("subagent unit tests", () => {
       );
 
       const trusted = loadSubagentSettings(testDir, true);
-      // Project wins on the shared key, the global timeout survives. Roles merge at
-      // role granularity (the existing spread), so a project role object replaces
-      // that role's global object rather than merging key by key.
+      // Project fields override; omitted fields keep the global role budget.
       expect(trusted.defaultMaxTurns).toBe(150);
       expect(trusted.defaultTimeoutMs).toBe(2400000);
-      expect(trusted.agents?.explore).toEqual({ timeoutMs: 3000000 });
+      expect(trusted.agents?.explore).toEqual({ maxTurns: 111, timeoutMs: 3000000 });
       expect(trusted.agents?.scout?.maxTurns).toBe(7);
       // A string budget is dropped, not coerced to 120.
       expect(trusted.agents?.text?.maxTurns).toBeUndefined();
@@ -815,7 +809,7 @@ describe("subagent unit tests", () => {
       const after = loadSubagentSettings(testDir, true);
       expect(after.defaultMaxTurns).toBe(150);
       expect(after.defaultTimeoutMs).toBe(2400000);
-      expect(after.agents?.explore).toEqual({ timeoutMs: 3000000 });
+      expect(after.agents?.explore).toEqual({ maxTurns: 111, timeoutMs: 3000000 });
     } finally {
       if (agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -886,6 +880,12 @@ You are an expert researcher. Read references carefully.
     } finally {
       if (existsSync(tmpFile)) unlinkSync(tmpFile);
     }
+  });
+
+  it("strips a BOM before slicing frontmatter without a trailing newline", () => {
+    const path = join(hermeticAgentDir, "bom-agent.md");
+    writeFileSync(path, "\uFEFF---\nmodel: vendor/model\n---");
+    expect(parseAgentFile(path)).toEqual({ model: "vendor/model", systemPrompt: undefined });
   });
 
   it("sanitizes agent name against path traversal in findAgentDefinition", () => {
@@ -1583,7 +1583,7 @@ You are an expert researcher. Read references carefully.
     subagentManager.complete("sub_w", "ok", false);
 
     // The notification went through the real flushPendingExits path.
-    expect(sent.length).toBe(1);
+    await vi.waitFor(() => expect(sent.length).toBe(1));
     expect(sent[0]?.customType).toBe("subagent-exit");
     const details = sent[0]?.details as Record<string, unknown>;
     expect(details).not.toHaveProperty("controller");
@@ -1750,15 +1750,20 @@ describe("subagent launch details session pointer (issue 115, fake pi cli)", () 
         onUpdate: undefined,
         ctx: Record<string, unknown>,
       ) => Promise<{ details?: Record<string, unknown> }>;
+      acquireSubagentSession(dir, hermeticAgentDir, "sub_resume_1", "sess-ptr", false).release();
+      const sessionDir = join(hermeticAgentDir, "sessions", `--${resolve(dir).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(join(sessionDir, "test_sub_resume_1.jsonl"), "{}\n");
       const result = await execute(
         "call_ptr2",
-        { task: "resume check", agent: "explore", description: "resume check", resume: "sub_resume_1" },
+        { task: "resume check", agent: "explore", description: "resume check", resume: "sub_resume_1", cwd: dir },
         undefined,
         undefined,
         { sessionManager: { getSessionId: () => "sess-ptr" } },
       );
       // resume wins: no injected id, and the advertised sessionId IS the resume value.
       expect(result.details?.sessionId).toBe("sub_resume_1");
+      await subagentManager.get(String(result.details?.id))?.done;
     } finally {
       if (prev === undefined) delete process.env.PI_CLI_JS;
       else process.env.PI_CLI_JS = prev;

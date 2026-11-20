@@ -65,13 +65,25 @@ describe("buildByspaceReportRecord", () => {
     });
   });
 
+  it("resolves the session log in the child profile", () => {
+    const task = makeTask({
+      progress: {
+        kind: "subagent-progress",
+        runs: [{ ...makeRun("child-session", "/repo"), agentDir: "/child-profile" }],
+      } as unknown as SubagentTaskRecord["progress"],
+    });
+    expect(buildByspaceReportRecord(task, (run) => `${run.agentDir ?? "/parent-profile"}/${run.sessionId}.jsonl`).sessionFile)
+      .toBe("/child-profile/child-session.jsonl");
+  });
+
   it("uses launch pointers when a fast child never emitted progress", () => {
     const task = makeTask({ sessionId: "launch-session", cwd: "/launch-cwd" });
-    expect(buildByspaceReportRecord(task)).toEqual({
+    expect(buildByspaceReportRecord(task, (run) => `/logs/${run.sessionId}.jsonl`)).toEqual({
       id: "sub_abc123",
       status: "running",
       sessionId: "launch-session",
       cwd: "/launch-cwd",
+      sessionFile: "/logs/launch-session.jsonl",
     });
   });
 
@@ -88,10 +100,11 @@ describe("ByspaceReporter", () => {
     Promise.resolve(new Response(null, { status: 204 })),
   );
 
-  afterEach(() => {
+  afterEach(async () => {
+    vi.useRealTimers();
+    await new Promise((resolve) => setImmediate(resolve));
     fetchMock.mockClear();
     vi.unstubAllGlobals();
-    vi.useRealTimers();
   });
 
   function reporterWith(env: NodeJS.ProcessEnv) {
@@ -125,7 +138,7 @@ describe("ByspaceReporter", () => {
     });
   });
 
-  it("throttles same-status repeats but always sends status changes", () => {
+  it("throttles same-status repeats but always sends status changes", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const reporter = reporterWith({
@@ -140,11 +153,64 @@ describe("ByspaceReporter", () => {
 
     vi.setSystemTime(400);
     reporter.report({ id: "sub_1", status: "succeeded" });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
     vi.setSystemTime(1200);
     reporter.report({ id: "sub_1", status: "succeeded" });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+  });
+
+  it("queues terminal state behind in-flight progress without blocking other tasks", async () => {
+    let release!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { release = resolve; }));
+    const reporter = reporterWith({
+      BYSPACE_SUBAGENT_REPORT_URL: "http://x/report",
+      BYSPACE_SUBAGENT_REPORT_TOKEN: "tok",
+    });
+    reporter.report({ id: "sub_1", status: "running" });
+    reporter.report({ id: "sub_1", status: "succeeded" });
+    reporter.report({ id: "sub_2", status: "running" });
+    const observations = () => fetchMock.mock.calls.map((args) =>
+      JSON.parse(String((args as unknown as [string, RequestInit])[1].body)).observations[0],
+    );
+    expect(observations()).toEqual([
+      { id: "sub_1", status: "running" },
+      { id: "sub_2", status: "running" },
+    ]);
+    release(new Response(null, { status: 204 }));
+    await vi.waitFor(() => expect(observations().at(-1)).toEqual({ id: "sub_1", status: "succeeded" }));
+  });
+
+  it("keeps report ordering across a reload", async () => {
+    let release!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { release = resolve; }));
+    const env = { BYSPACE_SUBAGENT_REPORT_URL: "http://x/reload", BYSPACE_SUBAGENT_REPORT_TOKEN: "tok" };
+    reporterWith(env).report({ id: "sub_reload", status: "running" });
+    vi.resetModules();
+    const { ByspaceReporter: ReloadedReporter } = await import("./byspace-report.js");
+    new ReloadedReporter(env).report({ id: "sub_reload", status: "succeeded" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    release(new Response(null, { status: 204 }));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(String((fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body)).observations[0].status)
+      .toBe("succeeded");
+  });
+
+  it("does not let an older failure clear the latest running snapshot", async () => {
+    let reject!: (error: Error) => void;
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((_resolve, rejectPromise) => { reject = rejectPromise; }));
+    const reporter = reporterWith({
+      BYSPACE_SUBAGENT_REPORT_URL: "http://x/report",
+      BYSPACE_SUBAGENT_REPORT_TOKEN: "tok",
+    });
+    reporter.report({ id: "sub_1", status: "running" });
+    const latest = { id: "sub_1", status: "running", sessionId: "child" } as const;
+    reporter.report(latest);
+    reject(new Error("offline"));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    reporter.report(latest);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("allows an identical running report after a rejected attempt", async () => {

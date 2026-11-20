@@ -1,4 +1,4 @@
-import { Key, matchesKey } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { renderProgressCard, type SubagentTaskRecord } from "./index.js";
 
@@ -13,7 +13,7 @@ const VIEWPORT_LINES = 16;
  */
 export async function showProgressView(ctx: ExtensionCommandContext, task: SubagentTaskRecord): Promise<void> {
   const rawUI = ctx.ui as unknown as Record<string, Function>;
-  if (typeof rawUI?.custom !== "function") {
+  if (ctx.mode !== "tui" || typeof rawUI?.custom !== "function") {
     const text = task.progress ? renderProgressCard(task.progress, 120).join("\n") : "(no progress yet)";
     ctx.ui.notify(text.slice(0, 500), "info");
     return;
@@ -30,13 +30,17 @@ export async function showProgressView(ctx: ExtensionCommandContext, task: Subag
         tui.requestRender();
       }, REFRESH_MS);
 
-      const finish = () => {
+      const dispose = () => {
         if (timer) clearInterval(timer);
         timer = undefined;
+      };
+      const finish = () => {
+        dispose();
         done(undefined);
       };
 
       return {
+        dispose,
         render(width: number): string[] {
           const body = task.progress ? renderProgressCard(task.progress, width) : ["(no progress yet)"];
           const viewport = Math.max(3, Math.min(VIEWPORT_LINES, tui.terminal.rows - 6));
@@ -52,7 +56,7 @@ export async function showProgressView(ctx: ExtensionCommandContext, task: Subag
             theme.bold(`Subagent ${task.id} [${task.status}]`) + live + theme.fg("dim", pos),
             ...shown,
             theme.fg("dim", "  ↑↓ / PgUp PgDn scroll · Esc back"),
-          ];
+          ].map((line) => truncateToWidth(line, width));
         },
         invalidate() {},
         handleInput(data: string) {

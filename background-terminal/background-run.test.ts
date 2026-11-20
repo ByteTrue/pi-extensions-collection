@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { manager, registerBackgroundRunTool, runningBackgroundWork } from "./background-terminal.js";
 import { call, registerOne } from "./test-helpers.js";
@@ -89,43 +90,34 @@ describe("background_run tool", () => {
     await manager.clearSession(SESSION);
   });
 
-  it("runs with the session environment the built-in tools promise (PI_SESSION_ID)", async () => {
-    const result = await call(tool(), { command: "echo $PI_SESSION_ID > /dev/null; echo ok" }, SESSION);
-    // The env is applied at spawn; assert through the exit notification's task record
-    // and a direct env check via the output file.
-    const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
-    await vi.waitFor(() => expect(manager.get(id!, SESSION)?.status).not.toBe("running"), { timeout: 5000 });
-    await manager.clearSession(SESSION);
+  it("passes the session ID to the command", async () => {
+    try {
+      const result = await call(tool(), { command: "echo $PI_SESSION_ID" }, SESSION);
+      const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
+      await vi.waitFor(() => expect(manager.get(id!, SESSION)?.status).not.toBe("running"), { timeout: 5000 });
+      expect(manager.get(id!, SESSION)?.tail.trim()).toBe(SESSION);
+    } finally {
+      await manager.clearSession(SESSION);
+    }
   });
 
-  it("prepends the agent bin dir to PATH like the built-in tool's getShellEnv", async () => {
-    const { homedir: home, tmpdir } = await import("node:os");
-    const probeFile = join(tmpdir(), "bt-path-check.txt");
-    // The spawned shell is POSIX-flavored even on Windows; give it a path it can redirect to.
-    const shellProbe = probeFile.replaceAll("\\", "/");
-    const bin = join(home(), ".pi", "agent", "bin");
-    const origPath = process.env.PATH;
-    const pathSep = process.platform === "win32" ? ";" : ":";
-    process.env.PATH = (origPath ?? "")
-      .split(pathSep)
-      .filter((entry) => entry !== bin)
-      .join(pathSep);
+  it.each([undefined, "~/pi-background-agent-test", ""])("prepends the resolved agent bin dir with PI_CODING_AGENT_DIR=%s", async (agentDir) => {
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const bin = join(getAgentDir(), "bin");
+    const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+    vi.stubEnv(pathKey, (process.env[pathKey] ?? "").split(delimiter).filter((entry) => entry !== bin).join(delimiter));
     try {
       const result = await call(tool(), {
-        command:
-          "node -e 'const p=require(\"path\"),h=require(\"os\").homedir();console.log(process.env.PATH.split(p.delimiter).includes(p.join(h,\".pi\",\"agent\",\"bin\")))' > " +
-          shellProbe,
+        command: 'node -e "console.log(JSON.stringify(process.env.PATH.split(require(\'path\').delimiter)))"',
       }, SESSION);
       const id = result.content[0]?.text.match(/(bg_[0-9a-f]+)/)?.[1];
       await vi.waitFor(() => expect(manager.get(id!, SESSION)?.status).not.toBe("running"), { timeout: 8000 });
-      const { readFileSync } = await import("node:fs");
-      expect(readFileSync(probeFile, "utf8").trim()).toBe("true");
+      expect(JSON.parse(manager.get(id!, SESSION)!.tail.trim())).toContain(bin);
     } finally {
-      process.env.PATH = origPath;
+      vi.unstubAllEnvs();
+      await manager.clearSession(SESSION);
     }
-    await manager.clearSession(SESSION);
   });
-
 
   it("publishes running shells to the shared background-work registry", async () => {
     const result = await call(tool(), { command: "sleep 30" }, SESSION);

@@ -39,8 +39,9 @@ It stops when the agent calls `goal_done`:
 { "summary": "p95 is 96 ms on the checkout benchmark", "evidence": "npm run bench → p95 96 ms; npm test → 214 passed" }
 ```
 
-`evidence` is required and shown to you on completion, so "done" means a check
-that was actually run, not a claim.
+`evidence` is required and shown to you on completion. The agent must describe
+the checks it ran; the extension validates nonempty text but does not independently
+verify those checks or judge whether the objective was achieved.
 
 | Command | What it does |
 | --- | --- |
@@ -58,8 +59,9 @@ Continuing is automatic, but it is not unconditional:
   makes no tool call increments a stall counter; three in a row pause the goal
   (opencode's `MAX_STALLS`). A run that uses a tool resets the counter. The check
   covers the whole run, not its last turn — every run ends with a text-only turn,
-  so a last-turn test would pause on every continuation. A user-started run that
-  answers in text is not held against the goal.
+  so a last-turn test would pause on every continuation. Automatic retries and
+  compaction keep the same continuation's tool-use and stall accounting. A
+  user-started run that answers in text is not held against the goal.
 - **50 continuations → pause.** The round budget matches opencode's
   `MAX_ROUNDS`; `/goal resume` counts the resume round as 1/50, so 49 more
   automatic rounds follow.
@@ -105,7 +107,7 @@ import disappears at load; tool parameters are hand-written JSON Schema):
 
 ```text
 goal.ts        command + tool + event hooks + default-export entry
-goal.test.ts   CI-only: the full test suite (never installed)
+goal.test.ts   test suite (not loaded as an extension)
 package.json      private, never published — exists only so workspace CI runs tests
 ```
 
@@ -117,7 +119,7 @@ package.json      private, never published — exists only so workspace CI runs 
 | `agent_before_settle` | The loop: while active, appends one hidden continuation message and returns `continue: true` |
 | `agent_start` / `tool_call` | Count whether the current segment did real work |
 | `session_start` / `session_tree` | Restore the goal from the transcript branch |
-| `agent_settled` | Releases the print/json-mode command handler once the run is over |
+| `agent_settled` | Pauses interrupted goals, withdraws a completed goal's tool, and releases the print/json-mode command handler |
 | footer status | `goal:active(N/50)` / `goal:paused` |
 
 Implementing the loop at `agent_before_settle` (rather than with timers, idle
@@ -127,3 +129,23 @@ documented contract is "append entries, request one more model request."
 
 In print and json modes (`pi -p "/goal …"`), the command handler holds the
 session open until the run settles; otherwise the process would exit mid-loop.
+Before an idle-session kickoff or resume, it checks for a selected model and
+configured or resolvable provider authentication. Missing model/auth, auth
+resolution errors, and synchronous dispatch failures pause the stored goal and
+report an error without waiting for settlement. Configure the model (`--model`)
+or provider credentials (`/login <provider>` where supported), then `/goal resume`.
+Configured keyless/virtual providers are accepted. TUI/RPC still return after
+dispatch, busy sessions still queue a follow-up, and there is no wall-clock timeout.
+
+Known host limitation: `pi.sendUserMessage()` has no awaitable dispatch result.
+If another extension consumes the input, or an asynchronous failure occurs before
+a run starts after these checks (for example, configuration changes or active
+compaction), no settled event may arrive and the headless command can remain
+pending. Provider auth resolution itself is host-owned and has no extension-level
+time bound. Full coverage needs a host dispatch outcome API; a global timeout
+would also interrupt legitimate long goals.
+
+`npm --workspace goal test` covers command controls, persistence and branch
+restoration, continuation/retry accounting, interrupted completion, malformed
+stored counters, background provider isolation, print/json startup failure and
+recovery, keyless/header-based auth, immediate settlement, and long headless waits.

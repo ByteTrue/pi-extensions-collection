@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, it, vi } from "vitest";
-import register, { reapSubagentOrphans, subagentManager } from "./index.js";
+import register, { acquireSubagentSession, reapSubagentOrphans, subagentManager } from "./index.js";
 
 it.each(["normal", "shutdown", "stop-on-shutdown", "resume"])("publishes a live pointer and replayable completion (%s)", async (mode) => {
   const stopping = mode === "stop-on-shutdown";
@@ -21,7 +21,8 @@ it.each(["normal", "shutdown", "stop-on-shutdown", "resume"])("publishes a live 
     'const fs = require("node:fs");',
     'const id = process.argv[process.argv.indexOf(process.argv.includes("--session") ? "--session" : "--session-id") + 1];',
     'if (process.env.PI_CODING_AGENT_DIR !== ' + JSON.stringify(childAgentDir) + ') process.exit(42);',
-    'fs.writeFileSync(' + JSON.stringify(sessionDir + '/') + ' + "test_" + id + ".jsonl", "{}\\n");',
+    'const file = process.argv.includes("--session") ? id : ' + JSON.stringify(sessionDir + '/') + ' + "test_" + id + ".jsonl";',
+    'fs.writeFileSync(file, "{}\\n");',
     'console.log(JSON.stringify({ type: "agent_start" }));',
     'const timer = setInterval(() => { if (!fs.existsSync(' + JSON.stringify(released) + ')) return; clearInterval(timer); console.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:"done"}]}})); }, 20);',
   ].join("\n"));
@@ -35,6 +36,10 @@ it.each(["normal", "shutdown", "stop-on-shutdown", "resume"])("publishes a live 
   const ctx = { sessionManager: { getSessionId: () => session } };
   let asyncDir: string | undefined;
   try {
+    if (resume) {
+      acquireSubagentSession(dir, childAgentDir, resume, session, false).release();
+      writeFileSync(join(sessionDir, `test_${resume}.jsonl`), "{}\n");
+    }
     register({
       registerTool: (tool) => tools.set(String(tool.name), tool),
       on: (event, handler) => handlers.set(event, handler as never),
@@ -67,6 +72,7 @@ it.each(["normal", "shutdown", "stop-on-shutdown", "resume"])("publishes a live 
       expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({ triggerTurn: false });
     }
     expect(status()).toMatchObject({ state: stopping ? "stopped" : "complete", steps: [{ sessionFile: pointer }] });
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
     const notice = sendMessage.mock.calls[0]?.[0];
     expect(notice).toMatchObject({ customType: "subagent-notify", details: { id: details.id, sessionId: details.sessionId } });
     expect(notice.content.split("\n").slice(0, 3)).toEqual([
@@ -86,7 +92,7 @@ it.each(["normal", "shutdown", "stop-on-shutdown", "resume"])("publishes a live 
   }
 });
 
-it("keeps an aged Paseo resume pointer only while its transcript exists", () => {
+it("keeps an aged Paseo resume pointer only while its transcript exists", async () => {
   const dir = mkdtempSync(join(tmpdir(), "subagent-paseo-reap-"));
   try {
     const transcript = join(dir, "child.jsonl");
@@ -100,10 +106,10 @@ it("keeps an aged Paseo resume pointer only while its transcript exists", () => 
     writeFileSync(join(run, "status.json"), JSON.stringify({ steps: [{ sessionFile }] }));
     const past = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
     utimesSync(run, past, past);
-    reapSubagentOrphans(dir);
+    await reapSubagentOrphans(dir);
     expect(readFileSync(sessionFile, "utf8")).toBe("history");
     rmSync(transcript);
-    reapSubagentOrphans(dir);
+    await reapSubagentOrphans(dir);
     expect(existsSync(run)).toBe(false);
   } finally {
     rmSync(dir, { recursive: true, force: true });

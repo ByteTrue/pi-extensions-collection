@@ -1,10 +1,8 @@
 /**
  * bash-timeout — opencode-style default timeout for Pi's built-in bash/powershell tools.
  *
- * A small-extension: shipped as this single file (no npm package, no build step) and
- * installed by scripts/install-small-extension.sh / .ps1 into ~/.pi/agent/extensions/.
- * Zero runtime imports — the installed artifact is exactly this file; jiti loads
- * TypeScript directly (type-only imports disappear at load time).
+ * Loaded from the root pi manifest as part of this repository’s git package.
+ * No build step or runtime imports; jiti loads TypeScript directly.
  *
  * Why it exists: Pi's built-in bash runs with no timeout unless the model passes one, so
  * a single runaway foreground command (`find /`) can wedge the agent for hours. opencode's
@@ -36,10 +34,7 @@ type ShellToolInput = {
 const PI_MAX_TIMEOUT_SECONDS = 2_147_483;
 
 export function registerBashDefaultTimeout(pi: ExtensionAPI): void {
-  // Narrowing by toolName equality instead of pi's isToolCallEventType helper: calling
-  // that helper would need a runtime import from the pi package, and this file must stay
-  // import-free to work as a dropped-in single file. The comparison is the same one the
-  // helper performs.
+  // Direct tool-name checks keep this hook free of runtime imports.
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash" && event.toolName !== "powershell") return;
     const input = event.input as ShellToolInput;

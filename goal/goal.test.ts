@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import piGoalExtension, {
   BOOT_ID,
   CONTINUE_MESSAGE,
@@ -65,6 +65,12 @@ function harness(entries: any[] = []) {
   } as unknown as ExtensionAPI;
 
   const ctx = {
+    mode: "tui",
+    model: { provider: "test-provider", id: "test-model" },
+    modelRegistry: {
+      hasConfiguredAuth: () => true,
+      getProviderAuth: async () => undefined,
+    },
     isIdle: () => true,
     hasPendingMessages: () => false,
     sessionManager: { getBranch: () => entries, getSessionId: () => "sess-test" },
@@ -80,6 +86,7 @@ function harness(entries: any[] = []) {
 
   piGoalExtension(pi);
   return {
+    pi,
     handlers,
     commands,
     tools,
@@ -223,6 +230,11 @@ describe("readGoalRecord", () => {
     expect(readGoalRecord(entries)).toBeNull();
   });
 
+  it.each([-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1])("resets invalid persisted counters (%s)", (counter) => {
+    const restored = readGoalRecord([{ type: "custom", customType: GOAL_ENTRY, data: goal({ runs: counter, stalls: counter }) }]);
+    expect(restored).toMatchObject({ runs: 0, stalls: 0 });
+  });
+
   it("ignores unrelated entries and malformed data", () => {
     expect(readGoalRecord([{ type: "custom", customType: "other", data: goal() }])).toBeNull();
     expect(readGoalRecord([{ type: "custom", customType: GOAL_ENTRY, data: { objective: "" } }])).toBeNull();
@@ -342,6 +354,40 @@ describe("continuation loop", () => {
     expect(h.activeTools()).toContain(GOAL_DONE_TOOL);
   });
 
+  it("keeps the no-progress budget across low-level retries and compaction runs", async () => {
+    const h = harness();
+    await command(h, "Do the thing");
+    runTurn(h, true);
+    await settle(h);
+
+    for (let stalls = 1; stalls <= 3; stalls += 1) {
+      continueRun(h, false);
+      // Pi starts another low-level run for a retry or compaction, without a new boundary continuation.
+      runTurn(h, false);
+      const result = await settle(h);
+      if (stalls < 3) {
+        expect(result).toMatchObject({ continue: true });
+        expect(lastGoalEntry(h.entries)?.stalls).toBe(stalls);
+      } else {
+        expect(result).toBeUndefined();
+        expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused" });
+      }
+    }
+  });
+
+  it("counts tools used before a low-level retry as progress in the same continuation", async () => {
+    const h = harness();
+    await command(h, "Do the thing");
+    runTurn(h, true);
+    await settle(h);
+    continueRun(h, false);
+    await settle(h);
+    continueRun(h, true);
+    runTurn(h, false);
+    expect(await settle(h)).toMatchObject({ continue: true });
+    expect(lastGoalEntry(h.entries)?.stalls).toBe(0);
+  });
+
   it("continues after the kickoff run even when it only answers in text", async () => {
     const h = harness();
     await command(h, "Explain the failing test");
@@ -406,6 +452,15 @@ describe("goal_done tool", () => {
     });
     expect(await settle(h)).toBeUndefined();
     expect(h.setStatusCalls.at(-1)).toBeUndefined();
+  });
+
+  it("withdraws goal_done when completion is followed by an aborted final response", async () => {
+    const h = harness();
+    await command(h, "Do the thing");
+    await h.tools[GOAL_DONE_TOOL]!.execute("c1", { summary: "done", evidence: "tests pass" }, undefined, undefined, h.ctx);
+    await h.handlers.agent_settled!({ type: "agent_settled", aborted: true }, h.ctx);
+    expect(lastGoalEntry(h.entries)).toMatchObject({ status: "done" });
+    expect(h.activeTools()).not.toContain(GOAL_DONE_TOOL);
   });
 
   it("allows a second goal after one completed", async () => {
@@ -633,6 +688,161 @@ describe("opencode alignment additions", () => {
     expect(lastGoalEntry(h.entries)).toMatchObject({ status: "active", runs: 1, stalls: 0 });
   });
 
+});
+
+describe("background work registry", () => {
+  it("holds for this session, tolerates a failed provider, and resumes when work finishes", async () => {
+    const key = Symbol.for("pi-extensions.background-work");
+    const globals = globalThis as unknown as Record<symbol, unknown>;
+    const previous = globals[key];
+    let running = true;
+    const sessions: string[] = [];
+    globals[key] = new Map([
+      ["broken", { running: () => { throw new Error("provider failed"); } }],
+      ["worker", { running: (sessionId: string) => {
+        sessions.push(sessionId);
+        return running && sessionId === "sess-test" ? [{ kind: "subagent", id: "sub-1", label: "audit" }] : [];
+      } }],
+    ]);
+    try {
+      const h = harness();
+      await command(h, "Do the thing");
+      runTurn(h, true);
+      expect(await settle(h)).toBeUndefined();
+      expect(lastGoalEntry(h.entries)?.runs).toBe(0);
+      running = false;
+      runTurn(h, false);
+      expect(await settle(h)).toMatchObject({ continue: true });
+      expect(sessions).toEqual(["sess-test", "sess-test"]);
+    } finally {
+      if (previous === undefined) delete globals[key];
+      else globals[key] = previous;
+    }
+  });
+});
+
+describe.each(["print", "json"] as const)("headless commands (%s)", (mode) => {
+  it("waits for the final settled event without a wall-clock limit", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.ctx.mode = mode;
+    let finished = false;
+    const pending = command(h, "Do the thing").then(() => { finished = true; });
+    try {
+      runTurn(h, true);
+      await settle(h);
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      expect(finished).toBe(false);
+      expect(lastGoalEntry(h.entries)?.status).toBe("active");
+    } finally {
+      await h.handlers.agent_settled!({ type: "agent_settled", aborted: true }, h.ctx);
+      await pending;
+      vi.useRealTimers();
+    }
+    expect(finished).toBe(true);
+    expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused" });
+  });
+
+  it("pauses and reports a missing model without dispatching or waiting", async () => {
+    const h = harness();
+    h.ctx.mode = mode;
+    h.ctx.model = undefined;
+    await expect(command(h, "Do the thing")).rejects.toThrow("No model selected; configure one with --model");
+    expect(h.sent).toEqual([]);
+    expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused", objective: "Do the thing" });
+    expect(lastGoalEntry(h.entries)?.reason).toContain("No model selected");
+  });
+
+  it("rejects missing auth on both kickoff and resume, then resumes after configuration", async () => {
+    const h = harness();
+    h.ctx.mode = mode;
+    const configured = vi.spyOn(h.ctx.modelRegistry, "hasConfiguredAuth").mockReturnValue(false);
+    for (const input of ["Do the thing", "resume"]) {
+      await expect(command(h, input)).rejects.toThrow("configure credentials or run /login test-provider");
+      expect(h.sent).toEqual([]);
+      expect(lastGoalEntry(h.entries)?.status).toBe("paused");
+    }
+    configured.mockReturnValue(true);
+    const pending = command(h, "resume");
+    expect(h.sent).toEqual([{ text: RESUME_MESSAGE, options: undefined }]);
+    await h.handlers.agent_settled!({ type: "agent_settled", aborted: false }, h.ctx);
+    await pending;
+    expect(lastGoalEntry(h.entries)?.status).toBe("active");
+  });
+
+  it("pauses and propagates a provider auth resolution failure without waiting", async () => {
+    const h = harness();
+    h.ctx.mode = mode;
+    vi.spyOn(h.ctx.modelRegistry, "hasConfiguredAuth").mockReturnValue(false);
+    vi.spyOn(h.ctx.modelRegistry, "getProviderAuth").mockRejectedValue(new Error("credential store unavailable"));
+    await expect(command(h, "Do the thing")).rejects.toThrow("credential store unavailable");
+    expect(h.sent).toEqual([]);
+    expect(lastGoalEntry(h.entries)).toMatchObject({ status: "paused" });
+    expect(lastGoalEntry(h.entries)?.reason).toContain("credential store unavailable");
+  });
+
+  it("allows configured keyless/virtual providers without requiring an API key", async () => {
+    const h = harness();
+    h.ctx.mode = mode;
+    const resolveAuth = vi.spyOn(h.ctx.modelRegistry, "getProviderAuth");
+    const pending = command(h, "Do the thing");
+    expect(resolveAuth).not.toHaveBeenCalled();
+    expect(h.sent).toHaveLength(1);
+    await h.handlers.agent_settled!({ type: "agent_settled", aborted: false }, h.ctx);
+    await pending;
+  });
+
+  it("accepts newly resolved provider auth without demanding an API key", async () => {
+    const h = harness();
+    h.ctx.mode = mode;
+    vi.spyOn(h.ctx.modelRegistry, "hasConfiguredAuth").mockReturnValue(false);
+    const resolveAuth = vi.spyOn(h.ctx.modelRegistry, "getProviderAuth").mockResolvedValue({
+      auth: { headers: { Authorization: "test-credential" } },
+    });
+    const pending = command(h, "Do the thing");
+    await Promise.resolve();
+    expect(resolveAuth).toHaveBeenCalledWith("test-provider");
+    expect(h.sent).toHaveLength(1);
+    await h.handlers.agent_settled!({ type: "agent_settled", aborted: false }, h.ctx);
+    await pending;
+  });
+
+  it("handles a synchronous dispatch failure and an immediate settlement on resume", async () => {
+    const h = harness();
+    h.ctx.mode = mode;
+    const dispatch = vi.spyOn(h.pi, "sendUserMessage").mockImplementationOnce(() => {
+      throw new Error("dispatch unavailable");
+    });
+    await expect(command(h, "Do the thing")).rejects.toThrow("dispatch unavailable");
+    expect(lastGoalEntry(h.entries)?.status).toBe("paused");
+    dispatch.mockImplementation(() => {
+      void h.handlers.agent_settled!({ type: "agent_settled", aborted: false }, h.ctx);
+    });
+    await command(h, "resume");
+    expect(lastGoalEntry(h.entries)?.status).toBe("active");
+  });
+
+  it("keeps busy-session follow-up dispatch semantics", async () => {
+    const h = harness();
+    h.ctx.mode = mode;
+    h.ctx.model = undefined;
+    h.ctx.isIdle = () => false;
+    const pending = command(h, "Do the thing");
+    expect(h.sent).toEqual([{ text: "Do the thing", options: { deliverAs: "followUp" } }]);
+    await h.handlers.agent_settled!({ type: "agent_settled", aborted: false }, h.ctx);
+    await pending;
+  });
+});
+
+it.each(["tui", "rpc"] as const)("keeps %s dispatch immediate and delegates model/auth handling to the host", async (mode) => {
+  const h = harness();
+  h.ctx.mode = mode;
+  h.ctx.model = undefined;
+  const configured = vi.spyOn(h.ctx.modelRegistry, "hasConfiguredAuth");
+  await command(h, "Do the thing");
+  expect(configured).not.toHaveBeenCalled();
+  expect(h.sent).toHaveLength(1);
+  expect(lastGoalEntry(h.entries)?.status).toBe("active");
 });
 
 describe("status text", () => {

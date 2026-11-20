@@ -19,15 +19,16 @@ async function executeWithFakePi(cwd: string, input: JsonObject, projectTrusted 
     'let input = "";',
     'process.stdin.on("data", (chunk) => { input += chunk; });',
     'process.stdin.on("end", () => {',
-    '  fs.writeFileSync(' + JSON.stringify(log) + ', JSON.stringify({ argv: process.argv, input }));',
+    '  fs.writeFileSync(' + JSON.stringify(log) + ', JSON.stringify({ argv: process.argv, input, cwd: process.cwd() }));',
     '  process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");',
     '  process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], usage: { input: 1, output: 1, cost: { total: 0 }, totalTokens: 2 } } }) + "\\n");',
     '  process.exit(0);',
     '});',
   ].join("\n"));
-  const previousCwd = process.cwd();
   const previousCli = process.env.PI_CLI_JS;
   const previousChild = process.env.PI_SUBAGENT_CHILD;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(cwd, "agent-home");
   const sessionId = `security-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const registered = new Map<string, JsonObject>();
   process.env.PI_CLI_JS = fake;
@@ -41,20 +42,21 @@ async function executeWithFakePi(cwd: string, input: JsonObject, projectTrusted 
       onUpdate: undefined,
       ctx: JsonObject,
     ) => Promise<{ details?: { id?: string } }>;
-    process.chdir(cwd);
     const result = await execute("security-call", input, undefined, undefined, {
+      cwd,
       sessionManager: { getSessionId: () => sessionId },
       isProjectTrusted: () => projectTrusted,
     });
     const id = result.details?.id;
     if (!id) throw new Error("subagent did not return a task id");
     await subagentManager.get(id)?.done;
-    return JSON.parse(readFileSync(log, "utf8")) as { argv: string[]; input: string };
+    return JSON.parse(readFileSync(log, "utf8")) as { argv: string[]; input: string; cwd: string };
   } finally {
-    process.chdir(previousCwd);
     if (previousCli === undefined) delete process.env.PI_CLI_JS;
     else process.env.PI_CLI_JS = previousCli;
     if (previousChild !== undefined) process.env.PI_SUBAGENT_CHILD = previousChild;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await subagentManager.clearSession(sessionId);
   }
 }
@@ -84,6 +86,21 @@ describe("subagent security boundaries", () => {
     }
   });
 
+  it("uses the SDK workspace for project config and relative child cwd", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagent-sdk-cwd-"));
+    try {
+      mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
+      mkdirSync(join(dir, "child"));
+      writeFileSync(join(dir, ".pi", "agents", "sdk-fixture.md"), "SDK_WORKSPACE_PROMPT");
+      const child = await executeWithFakePi(dir, { task: "review", agent: "sdk-fixture", description: "SDK workspace", cwd: "child" });
+
+      expect(child.input).toContain("SDK_WORKSPACE_PROMPT");
+      expect(child.cwd).toBe(join(dir, "child"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("filters prompt-injecting role names while preserving existing name shapes", () => {
     const dir = mkdtempSync(join(tmpdir(), "subagent-role-names-"));
     try {
@@ -101,7 +118,7 @@ describe("subagent security boundaries", () => {
         },
       }));
 
-      const roster = buildAgentRosterText(dir);
+      const roster = buildAgentRosterText(dir, true);
       expect(roster).not.toContain(injected);
       expect(roster).not.toContain(oversized);
       expect(roster).toContain("- db.sleuth:");
@@ -142,4 +159,36 @@ describe("subagent security boundaries", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+it("advertises project roles from the trusted session workspace and refreshes them each turn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "subagent-roster-context-"));
+  const handlers = new Map<string, (event: unknown, ctx?: import("./index.js").PiExtensionContext) => unknown>();
+  const registered = new Map<string, JsonObject>();
+  const previousChild = process.env.PI_SUBAGENT_CHILD;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(dir, "agent-home");
+  delete process.env.PI_SUBAGENT_CHILD;
+  try {
+    const roles = join(dir, ".pi", "agents");
+    mkdirSync(roles, { recursive: true });
+    writeFileSync(join(roles, "workspace-role.md"), "---\ndescription: TRUSTED_WORKSPACE_DESCRIPTION\n---\nBody");
+    subagentExtension({ registerTool: (tool) => registered.set(String(tool.name), tool), on: (event, handler) => handlers.set(event, handler) });
+    expect(registered.get("subagent")!.description).not.toContain("workspace-role");
+    const before = handlers.get("before_agent_start")!;
+    expect(before({ systemPrompt: "BASE" }, { cwd: dir, isProjectTrusted: () => false })).toBeUndefined();
+    expect(before({ systemPrompt: "BASE" }, { cwd: dir })).toBeUndefined();
+    const execute = registered.get("subagent")!.execute as (...args: unknown[]) => Promise<unknown>;
+    await expect(execute("untrusted", { agent: "workspace-role", description: "Trust check", task: "Read" }, undefined, undefined, { cwd: dir })).rejects.toThrow(/Unknown/);
+    const ctx = { cwd: dir, isProjectTrusted: () => true };
+    expect(before({ systemPrompt: "BASE" }, ctx)).toMatchObject({ systemPrompt: expect.stringContaining("workspace-role: TRUSTED_WORKSPACE_DESCRIPTION") });
+    writeFileSync(join(roles, "added-mid-session.md"), "---\ndescription: NEW_ROLE_DESCRIPTION\n---\nBody");
+    expect(before({ systemPrompt: "BASE" }, ctx)).toMatchObject({ systemPrompt: expect.stringContaining("added-mid-session: NEW_ROLE_DESCRIPTION") });
+    expect(before({ systemPrompt: "BASE" }, { ...ctx, cwd: join(dir, "other") })).toBeUndefined();
+  } finally {
+    if (previousChild !== undefined) process.env.PI_SUBAGENT_CHILD = previousChild;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -1,12 +1,27 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { manager, reapOrphans } from "./background-terminal.js";
+
+// Other test files run their own reapers; keep simulated owner deaths private.
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const { mkdtempSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const isolated = mkdtempSync(join(actual.tmpdir(), "pi-bg-reap-"));
+  return { ...actual, tmpdir: () => isolated };
+});
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, execFile: vi.fn(actual.execFile) };
+});
 
 const SESSION = "reap-test-session";
 const DIR = join(tmpdir(), "background-terminal");
+
+afterAll(() => rmSync(tmpdir(), { recursive: true, force: true }));
 
 function alive(pid: number): boolean {
   try {
@@ -18,33 +33,115 @@ function alive(pid: number): boolean {
 }
 
 describe("reapOrphans", () => {
-  it("kills a task whose owner Pi is gone and removes its journal and log", async () => {
-    const task = manager.start("sleep 30", process.cwd(), SESSION);
-    const journalPath = join(DIR, `${task.id}.journal.json`);
-    const outputPath = task.outputPath;
+  it.each(["", "exec "])("kills a real orphan process tree with prefix %s and removes its journal and log", async (prefix) => {
+    const task = manager.start(prefix + 'node -e "console.log(process.pid); setInterval(() => {}, 1000)"', process.cwd(), SESSION);
+    const journalPath = join(DIR, task.id + ".journal.json");
+    try {
+      await vi.waitFor(() => expect(manager.get(task.id, SESSION)?.tail.trim()).toMatch(/^\d+$/), { timeout: 8000 });
+      const childPid = Number(manager.get(task.id, SESSION)!.tail.trim());
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { pidPath: string; startPath: string };
+      const pid = Number(readFileSync(journal.pidPath, "utf8"));
+      expect(alive(pid)).toBe(true);
+      expect(alive(childPid)).toBe(true);
+      expect(readFileSync(journal.startPath, "utf8").trim()).not.toBe("");
 
-    await vi.waitFor(() => expect(existsSync(journalPath)).toBe(true), { timeout: 8000 });
-    const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
-      ownerPid: number;
-      pidPath: string;
-      startPath: string;
-    };
-    await vi.waitFor(() => expect(existsSync(journal.pidPath)).toBe(true), { timeout: 8000 });
-    const pid = Number(readFileSync(journal.pidPath, "utf8"));
-    expect(pid).toBeGreaterThan(0);
+      writeFileSync(journalPath, JSON.stringify({ ...journal, ownerPid: 999_999 }));
+      await reapOrphans();
 
-    // Pretend the Pi that started this task was SIGKILLed.
-    writeFileSync(journalPath, JSON.stringify({ ...journal, ownerPid: 999_999 }));
-    reapOrphans();
-
-    await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 8000 });
-    expect(existsSync(journalPath)).toBe(false);
-    expect(existsSync(outputPath)).toBe(false);
-
-    await manager.clearSession(SESSION);
+      await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 8000 });
+      await vi.waitFor(() => expect(alive(childPid)).toBe(false), { timeout: 8000 });
+      expect(existsSync(journalPath)).toBe(false);
+      expect(existsSync(task.outputPath)).toBe(false);
+    } finally {
+      await manager.clearSession(SESSION);
+    }
   });
 
-  it("keeps a fresh journal while the wrapper has not written its PID yet", () => {
+  it("records process identity before a long-running shell prefix", async () => {
+    const task = manager.start("echo unreachable", process.cwd(), SESSION, {
+      commandPrefix: 'node -e "console.log(process.pid); setInterval(() => {}, 1000)"',
+    });
+    try {
+      await vi.waitFor(() => expect(manager.get(task.id, SESSION)?.tail.trim()).toMatch(/^\d+$/), { timeout: 8000 });
+      expect(existsSync(join(DIR, task.id + ".pid"))).toBe(true);
+      expect(readFileSync(join(DIR, task.id + ".start"), "utf8").trim()).not.toBe("");
+    } finally {
+      await manager.clearSession(SESSION);
+    }
+  });
+
+  it.each(["owner", "task"])("retains a task when its %s process probe is denied", async (target) => {
+    const task = manager.start("sleep 30", process.cwd(), SESSION);
+    const journalPath = join(DIR, task.id + ".journal.json");
+    const startPath = join(DIR, task.id + ".start");
+    const originalKill = process.kill;
+    const kill = vi.spyOn(process, "kill");
+    try {
+      await vi.waitFor(() => expect(readFileSync(startPath, "utf8").trim()).not.toBe(""), { timeout: 8000 });
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { pidPath: string };
+      const pid = Number(readFileSync(journal.pidPath, "utf8"));
+      writeFileSync(journalPath, JSON.stringify({ ...journal, ownerPid: target === "owner" ? process.pid : 999_999 }));
+      kill.mockImplementation((candidate, signal) => {
+        if (candidate === (target === "owner" ? process.pid : pid) && signal === 0) {
+          throw Object.assign(new Error("EPERM: simulated process probe denial"), { code: "EPERM" });
+        }
+        if (target === "task" && Math.abs(candidate) === pid && signal !== 0) {
+          throw Object.assign(new Error("EPERM: simulated kill denial"), { code: "EPERM" });
+        }
+        return originalKill(candidate, signal);
+      });
+      const originalExec = vi.mocked(execFile).getMockImplementation()!;
+      vi.mocked(execFile).mockImplementation((file, ...args) => {
+        if (target === "task" && /taskkill(?:\.exe)?$/i.test(String(file))) throw new Error("EACCES: simulated kill denial");
+        return originalExec(file, ...args);
+      });
+      try {
+        await reapOrphans();
+        expect(existsSync(journalPath)).toBe(true);
+        expect(existsSync(task.outputPath)).toBe(true);
+      } finally {
+        vi.mocked(execFile).mockImplementation(originalExec);
+      }
+    } finally {
+      kill.mockRestore();
+      await manager.clearSession(SESSION);
+    }
+  });
+
+  it("retains metadata and output when the process cannot be killed", async () => {
+    const task = manager.start("sleep 30", process.cwd(), SESSION);
+    const journalPath = join(DIR, task.id + ".journal.json");
+    const startPath = join(DIR, task.id + ".start");
+    const originalExec = vi.mocked(execFile).getMockImplementation()!;
+    const originalKill = process.kill;
+    const kill = vi.spyOn(process, "kill");
+    try {
+      await vi.waitFor(() => expect(readFileSync(startPath, "utf8").trim()).not.toBe(""), { timeout: 8000 });
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { pidPath: string };
+      const pid = Number(readFileSync(journal.pidPath, "utf8"));
+      writeFileSync(journalPath, JSON.stringify({ ...journal, ownerPid: 999_999 }));
+      vi.mocked(execFile).mockImplementation((file, ...args) => {
+        if (/taskkill(?:\.exe)?$/i.test(String(file))) throw new Error("EACCES: simulated kill failure");
+        return originalExec(file, ...args);
+      });
+      kill.mockImplementation((target, signal) => {
+        if (Math.abs(target) === pid && signal !== 0) throw new Error("EPERM: simulated kill failure");
+        return originalKill(target, signal);
+      });
+
+      await reapOrphans();
+
+      expect(alive(pid)).toBe(true);
+      expect(existsSync(journalPath)).toBe(true);
+      expect(existsSync(task.outputPath)).toBe(true);
+    } finally {
+      kill.mockRestore();
+      vi.mocked(execFile).mockImplementation(originalExec);
+      await manager.clearSession(SESSION);
+    }
+  });
+
+  it("keeps a fresh journal while the wrapper has not written its PID yet", async () => {
     const id = "bg_0123456789abcdef";
     const journalPath = join(DIR, `${id}.journal.json`);
     const outputPath = join(DIR, `${id}.log`);
@@ -61,13 +158,13 @@ describe("reapOrphans", () => {
       writeFileSync(outputPath, "");
       writeFileSync(journalPath, JSON.stringify(journal));
 
-      reapOrphans();
+      await reapOrphans();
 
       expect(existsSync(journalPath)).toBe(true);
       expect(existsSync(outputPath)).toBe(true);
 
       writeFileSync(journalPath, JSON.stringify({ ...journal, startedAt: Date.now() - 11_000 }));
-      reapOrphans();
+      await reapOrphans();
       expect(existsSync(journalPath)).toBe(false);
       expect(existsSync(outputPath)).toBe(false);
     } finally {
@@ -86,7 +183,7 @@ describe("reapOrphans", () => {
     writeFileSync(journalPath, JSON.stringify({ ...journal, taskId: task.id, ownerPid: 999_999, startedAt: Date.now() }));
     const kill = vi.spyOn(process, "kill");
     try {
-      reapOrphans();
+      await reapOrphans();
       const groupSignals = kill.mock.calls.filter(([target, signal]) => target === -pid && signal !== 0);
       expect(groupSignals[0]).toEqual([-pid, "SIGSTOP"]);
       expect(groupSignals[1]).toEqual([-pid, "SIGKILL"]);
@@ -106,14 +203,14 @@ describe("reapOrphans", () => {
     const pid = child.pid!;
     writeFileSync(pidPath, String(pid));
     writeFileSync(startPath, "STALE_START_FROM_REUSED_PID");
-    writeFileSync(journalPath, JSON.stringify({ taskId: id, ownerPid: 999_999, command: "", outputPath, pidPath, startPath, startedAt: Date.now() }));
+    writeFileSync(journalPath, JSON.stringify({ taskId: id, ownerPid: 999_999, command: "", outputPath, pidPath, startPath, startedAt: Date.now() - 8 * 24 * 60 * 60 * 1000 }));
     try {
-      reapOrphans();
+      await reapOrphans();
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(alive(pid)).toBe(true);
       expect(existsSync(journalPath)).toBe(true);
     } finally {
-      try { process.kill(-pid, "SIGKILL"); } catch {}
+      try { process.kill(process.platform === "win32" ? pid : -pid, "SIGKILL"); } catch {}
       for (const path of [journalPath, pidPath, startPath, outputPath]) rmSync(path, { force: true });
     }
   });
@@ -135,7 +232,7 @@ describe("reapOrphans", () => {
     rmSync(path);
     symlinkSync(target, path);
     try {
-      reapOrphans();
+      await reapOrphans();
       expect(alive(pid)).toBe(true);
       expect(existsSync(journalPath)).toBe(true);
     } finally {
@@ -149,7 +246,7 @@ describe("reapOrphans", () => {
     const journalPath = join(DIR, `${task.id}.journal.json`);
     await vi.waitFor(() => expect(existsSync(journalPath)).toBe(true), { timeout: 8000 });
 
-    reapOrphans();
+    await reapOrphans();
     expect(manager.get(task.id, SESSION)?.status).toBe("running");
 
     await manager.clearSession(SESSION);
