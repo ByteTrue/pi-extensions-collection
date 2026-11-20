@@ -6,21 +6,17 @@
   "type": "module",
   "workspaces": [
     "ask-user",
-    "auto-compact",
     "background-terminal",
     "bash-timeout",
     "goal",
-    "hide-direct-tools",
     "subagent"
   ],
   "pi": {
     "extensions": [
       "./ask-user/ask-user.ts",
-      "./auto-compact/auto-compact.ts",
       "./background-terminal/background-terminal.ts",
       "./bash-timeout/bash-timeout.ts",
       "./goal/goal.ts",
-      "./hide-direct-tools/hide-direct-tools.ts",
       "./subagent/subagent.ts"
     ]
   },
