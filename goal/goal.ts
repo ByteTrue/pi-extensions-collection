@@ -108,7 +108,6 @@ export interface GoalRecord {
   summary?: string;
   /** Set by goal_done: the concrete checks that prove it. */
   evidence?: string;
-  updatedAt: number;
 }
 
 export interface GoalDoneParams {
@@ -139,10 +138,15 @@ export function parseGoalCommand(raw: string): GoalCommand {
 
 /** The instruction appended at every settle to start the next turn. Stable text so it
  * repeats verbatim in the transcript; the objective lives in the system section. */
+const COMPLETION_AUDIT =
+  "Before calling goal_done, audit every clause of the objective against the current worktree, tool results, or external state. " +
+  "Plans, intentions, and memory alone are not evidence.";
+
 export const CONTINUE_MESSAGE =
   "Continue the active goal: take the next concrete step now. Do not repeat work that is already done. " +
   "Do not stop to summarize progress or to ask whether to continue. " +
   "Before you end the turn, verify the result against the objective and show the evidence: command output, test results, or the relevant file contents. " +
+  `${COMPLETION_AUDIT} ` +
   "When the objective is verifiably true, call goal_done with the evidence; " +
   "if a decision only the user can make blocks you, stop and state the blocker.";
 
@@ -175,7 +179,8 @@ export function goalSection(goal: GoalRecord): string {
     "",
     "This is a durable objective for this thread, not a one-turn request. Pi continues the run automatically after each turn: do not stop to ask whether to continue, and do not treat intermediate progress as the final answer.",
     "",
-    "Work until the objective is verifiably true, then call goal_done with a summary and the evidence that proves it. " + evidence,
+    "Work until the objective is verifiably true, then call goal_done with a summary and the evidence that proves it. " +
+      evidence + " " + COMPLETION_AUDIT,
     "",
     "If a decision only the user can make blocks progress, ask it (ask_user when it offers options) and stop without further tool calls; repeated no-progress turns pause the goal.",
   ].join("\n");
@@ -222,7 +227,6 @@ function toGoalRecord(data: unknown): GoalRecord | null {
     ...(typeof record.reason === "string" ? { reason: record.reason } : {}),
     ...(typeof record.summary === "string" ? { summary: record.summary } : {}),
     ...(typeof record.evidence === "string" ? { evidence: record.evidence } : {}),
-    updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : 0,
   };
 }
 
@@ -368,7 +372,6 @@ export function registerGoal(pi: ExtensionAPI): void {
         reason: older
           ? "the goal was written by an older version; /goal resume to continue"
           : "the Pi process restarted while the goal was active",
-        updatedAt: Date.now(),
       };
       persist();
     }
@@ -401,7 +404,6 @@ export function registerGoal(pi: ExtensionAPI): void {
       runs: 0,
       stalls: 0,
       boot: BOOT_ID,
-      updatedAt: Date.now(),
     });
     ctx.ui.notify(`Goal active: ${objective}`, "info");
     return objective;
@@ -413,7 +415,6 @@ export function registerGoal(pi: ExtensionAPI): void {
       ...goal,
       status: "paused",
       reason,
-      updatedAt: Date.now(),
     });
     syncTool();
     ctx.ui.notify(`Goal paused: ${reason}. /goal resume to continue.`, "warning");
@@ -498,7 +499,6 @@ export function registerGoal(pi: ExtensionAPI): void {
             stalls: 0,
             boot: BOOT_ID,
             reason: undefined,
-            updatedAt: Date.now(),
           });
           syncTool();
           ctx.ui.notify("Goal resumed.", "info");
@@ -561,7 +561,6 @@ export function registerGoal(pi: ExtensionAPI): void {
         reason: undefined,
         summary,
         evidence,
-        updatedAt: Date.now(),
       });
       ctx.ui.notify(`Goal complete: ${summary}`, "info");
       return toolText(`Goal marked complete.\nSummary: ${summary}\nEvidence: ${evidence}`);
@@ -616,7 +615,6 @@ export function registerGoal(pi: ExtensionAPI): void {
           ...goal,
           status: "paused",
           reason: decision.reason,
-          updatedAt: Date.now(),
         });
       }
       syncTool();
@@ -628,7 +626,6 @@ export function registerGoal(pi: ExtensionAPI): void {
       ...goal,
       runs: goal.runs + 1,
       stalls: decision.stalls,
-      updatedAt: Date.now(),
     });
     continuationInjected = true;
     return {
@@ -637,7 +634,7 @@ export function registerGoal(pi: ExtensionAPI): void {
         {
           type: "custom_message",
           customType: GOAL_ENTRY,
-          content: `${objectiveBlock(goal.objective)}\n\n${CONTINUE_MESSAGE}`,
+          content: CONTINUE_MESSAGE,
           display: false,
         },
       ],

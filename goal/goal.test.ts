@@ -26,7 +26,6 @@ function goal(overrides: Partial<GoalRecord> = {}): GoalRecord {
     runs: 0,
     stalls: 0,
     boot: BOOT_ID,
-    updatedAt: 1,
     ...overrides,
   };
 }
@@ -235,6 +234,31 @@ describe("readGoalRecord", () => {
     expect(restored).toMatchObject({ runs: 0, stalls: 0 });
   });
 
+  it("restores a raw legacy entry while ignoring updatedAt", () => {
+    const restored = readGoalRecord([{
+      type: "custom",
+      customType: GOAL_ENTRY,
+      data: {
+        objective: " Legacy goal ",
+        status: "active",
+        runs: 7,
+        stalls: 2,
+        boot: BOOT_ID,
+        updatedAt: 123,
+      },
+    }]);
+
+    expect(restored).toEqual({
+      objective: "Legacy goal",
+      status: "active",
+      runs: 7,
+      stalls: 2,
+      boot: BOOT_ID,
+    });
+    expect(restored).not.toHaveProperty("updatedAt");
+    expect(statusText(restored)).toBe("goal:active(7/50)");
+  });
+
   it("ignores unrelated entries and malformed data", () => {
     expect(readGoalRecord([{ type: "custom", customType: "other", data: goal() }])).toBeNull();
     expect(readGoalRecord([{ type: "custom", customType: GOAL_ENTRY, data: { objective: "" } }])).toBeNull();
@@ -311,9 +335,9 @@ describe("continuation loop", () => {
       customType: GOAL_ENTRY,
       display: false,
     });
-    expect(result.entries[0].content).toContain("<untrusted_objective>");
-    expect(result.entries[0].content).toContain("Migrate the auth flow");
-    expect(result.entries[0].content).toContain(CONTINUE_MESSAGE);
+    expect(result.entries[0].content).toBe(CONTINUE_MESSAGE);
+    expect(result.entries[0].content).not.toContain("Migrate the auth flow");
+    expect(result.entries[0].content).not.toContain("<untrusted_objective>");
     expect(lastGoalEntry(h.entries)?.runs).toBe(1);
     expect(h.setStatusCalls.at(-1)).toBe("goal:active(1/50)");
   });
@@ -569,6 +593,24 @@ describe("session wiring", () => {
     expect(paused.sections.goal).not.toContain("continues the run automatically");
   });
 
+  it("reapplies the escaped objective on continuation, retry, and compaction runs", async () => {
+    const h = harness();
+    const objective = "Ship <safe> & verify the release";
+    await command(h, objective);
+    runTurn(h, true);
+    await settle(h);
+
+    const expected = goalSection(goal({ objective }));
+    for (const run of ["continuation", "retry", "compaction"]) {
+      const options: { sections: Record<string, string> } = { sections: {} };
+      await h.handlers.before_agent_start!({ type: "before_agent_start", run, systemPromptOptions: options }, h.ctx);
+      expect(options.sections.goal).toBe(expected);
+      expect(options.sections.goal).toContain("Ship &lt;safe&gt; &amp; verify the release");
+      expect(options.sections.goal).not.toContain(objective);
+      runTurn(h, false);
+    }
+  });
+
   it("drops the goal section once the goal is done", async () => {
     const h = harness([
       {
@@ -599,6 +641,16 @@ describe("session wiring", () => {
   });
 });
 
+
+describe("completion audit guidance", () => {
+  it("requires current, clause-by-clause evidence in both active prompts", () => {
+    for (const guidance of [goalSection(goal()), CONTINUE_MESSAGE]) {
+      expect(guidance).toContain("audit every clause of the objective");
+      expect(guidance).toContain("current worktree, tool results, or external state");
+      expect(guidance).toContain("Plans, intentions, and memory alone are not evidence");
+    }
+  });
+});
 
 describe("opencode alignment additions", () => {
   it("wraps the objective as untrusted data and escapes it", () => {

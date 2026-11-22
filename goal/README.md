@@ -30,8 +30,9 @@ Start a goal manually with `/goal <objective>`. The model cannot start one.
 
 The objective goes into the system prompt as a `<goal>` section, wrapped in
 `<untrusted_objective>` so the model treats it as the task, not as higher-priority
-instructions. The objective is capped at 4000 characters and restated in each
-continuation. At the end of a turn, an active goal asks Pi to continue.
+instructions. The objective is capped at 4000 characters and remains in that
+system section; each hidden continuation contains only next-step guidance. At
+the end of a turn, an active goal asks Pi to continue.
 
 It stops when the agent calls `goal_done`:
 
@@ -39,9 +40,12 @@ It stops when the agent calls `goal_done`:
 { "summary": "p95 is 96 ms on the checkout benchmark", "evidence": "npm run bench → p95 96 ms; npm test → 214 passed" }
 ```
 
-`evidence` is required and shown to you on completion. The agent must describe
-the checks it ran; the extension validates nonempty text but does not independently
-verify those checks or judge whether the objective was achieved.
+`evidence` is required and shown to you on completion. Before calling
+`goal_done`, the agent is instructed to audit every clause of the objective
+against the current worktree, tool results, or external state; plans, intentions,
+and memory alone are not evidence. The extension validates nonempty text but
+does not independently verify those checks or judge whether the objective was
+achieved.
 
 | Command | What it does |
 | --- | --- |
@@ -75,7 +79,8 @@ Continuing is automatic, but it is not unconditional:
   removed): a subagent's own timeout and a shell's `background_run` lifetime are
   the bounds. This uses the shared background-work registry in
   `background-terminal` and `subagent`; with neither loaded the goal behaves as
-  before.
+  before. A dev server or other permanent process reported as running therefore
+  holds the goal until that process exits.
 - **`/goal pause`, `/goal clear`, or `goal_done` → stop.** The extension never
   continues a goal that is not active.
 
