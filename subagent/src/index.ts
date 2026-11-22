@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { chmodSync, lstatSync, readdirSync, readFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
@@ -143,6 +143,7 @@ export const DEFAULT_TIMEOUT_MS = 40 * 60 * 1000; // 40 minutes
 export const DEFAULT_MAX_TURNS = 100; // 100 turns
 const SETTLED_HISTORY_LIMIT = 100;
 const EXIT_BATCH_CHAR_LIMIT = 50_000;
+const RESULT_FILE_CHAR_THRESHOLD = 40_000;
 
 /**
  * Package-level budget defaults, exported for the `/subagent` status lines.
@@ -1110,6 +1111,16 @@ class BBC {
 }
 
 // ── Event parsing ─────────────────────────────────────────────────────
+// Pi emits type first; classify oversized events without parsing their payload.
+function jsonEventTypePrefix(line: string): string | undefined {
+  return /^\s*\{\s*"type"\s*:\s*"([A-Za-z0-9_-]+)"/.exec(line.slice(0, 256))?.[1];
+}
+
+function isAssistantMessageEndPrefix(line: string): boolean {
+  return jsonEventTypePrefix(line) === "message_end" &&
+    /"message"\s*:\s*\{\s*"role"\s*:\s*"assistant"/.test(line.slice(0, 512));
+}
+
 export function parseJsonEvent(line: string): JsonObject | null {
   const t = line.trim();
   if (!t) return null;
@@ -1217,6 +1228,22 @@ function finalizeError(r: RunState, error: string): string {
   const reason = error.trim();
   const partial = r.finalText || r.textTail.trim();
   return partial && reason ? `${partial}\n\n${reason}` : partial || finalize(r, reason);
+}
+
+function deliverFinalResult(r: RunState, fallback: string): string {
+  const output = finalize(r, fallback);
+  if (r.finalText.length < RESULT_FILE_CHAR_THRESHOLD) return output;
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(join(tmpdir(), "pi-subagent-result-"));
+    chmodSync(dir, 0o700);
+    const file = join(dir, "result.md");
+    writeFileSync(file, output, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+    return `Complete subagent report (${output.length} characters): ${file}\nRead this file for the complete, untruncated result.`;
+  } catch (error) {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    throw new Error("Could not write complete subagent result file: " + (error instanceof Error ? error.message : String(error)));
+  }
 }
 
 function formatPiOutput(stdout: string, stderr: string): string {
@@ -1544,6 +1571,87 @@ async function scanSubagentOrphans(orphanDir: string): Promise<void> {
   }
 }
 
+const SESSION_RECOVERY_CHUNK_BYTES = 64 * 1024;
+const SESSION_RECOVERY_PREFIX_CHARS = 512;
+
+function persistedAssistantPrefix(line: string): boolean | undefined {
+  const prefix = line.slice(0, SESSION_RECOVERY_PREFIX_CHARS);
+  const type = jsonEventTypePrefix(prefix);
+  if (type !== "message") return type === undefined ? undefined : false;
+  const match = /^\s*\{\s*"type"\s*:\s*"message"\s*,[\s\S]*?"message"\s*:\s*\{\s*"role"\s*:\s*"([^"\\]+)"/.exec(prefix);
+  return match ? match[1] === "assistant" : undefined;
+}
+
+function recoverOversizedAssistantMessage(run: RunState): JsonObject {
+  const log = sessionLogPath(run);
+  if (!log) throw new Error("Oversized assistant message_end could not be recovered: session log not found");
+  let latestAssistant: JsonObject | undefined;
+  let fd: number | undefined;
+  try {
+    fd = openSync(log, "r");
+    const decoder = new StringDecoder("utf8");
+    const chunk = Buffer.allocUnsafe(SESSION_RECOVERY_CHUNK_BYTES);
+    let line = "";
+    let dropping = false;
+    let assistantCandidate: boolean | undefined;
+
+    const consumeLine = (complete: string) => {
+      if (dropping || complete.length === 0) return;
+      const evt = parseJsonEvent(complete.endsWith("\r") ? complete.slice(0, -1) : complete);
+      if (evt?.type === "message" && isObj(evt.message) && evt.message.role === "assistant") {
+        latestAssistant = evt.message;
+      } else if (assistantCandidate) {
+        latestAssistant = undefined;
+        throw new Error("the persisted assistant message is incomplete or invalid");
+      }
+    };
+    const consume = (text: string) => {
+      while (text.length > 0) {
+        const newline = text.indexOf("\n");
+        const part = newline === -1 ? text : text.slice(0, newline);
+        if (!dropping) {
+          line += part;
+          if (assistantCandidate === undefined && line.length >= SESSION_RECOVERY_PREFIX_CHARS) {
+            assistantCandidate = persistedAssistantPrefix(line);
+            if (assistantCandidate === undefined) {
+              throw new Error("could not identify a persisted session record within " + SESSION_RECOVERY_PREFIX_CHARS + " characters");
+            }
+            if (assistantCandidate) latestAssistant = undefined;
+            else {
+              dropping = true;
+              line = "";
+            }
+          }
+        }
+        if (newline === -1) break;
+        consumeLine(line);
+        line = "";
+        dropping = false;
+        assistantCandidate = undefined;
+        text = text.slice(newline + 1);
+      }
+    };
+
+    let bytes: number;
+    while ((bytes = readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+      consume(decoder.write(chunk.subarray(0, bytes)));
+    }
+    consume(decoder.end());
+    consumeLine(line);
+  } catch (error) {
+    throw new Error("Oversized assistant message_end could not be recovered from " + log + ": " + (error instanceof Error ? error.message : String(error)));
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  if (!latestAssistant) {
+    throw new Error("Oversized assistant message_end could not be recovered: no assistant message in " + log);
+  }
+  if (latestAssistant.stopReason !== "stop") {
+    throw new Error("Oversized assistant message_end recovery found stopReason " + String(latestAssistant.stopReason) + " instead of stop");
+  }
+  return { type: "message_end", message: latestAssistant };
+}
+
 // ── Subprocess runner ─────────────────────────────────────────────────
 export function runPi(
   cwd: string,
@@ -1591,6 +1699,9 @@ export function runPi(
     let settled = false;
     let aborted = false;
     let streamError: string | undefined;
+    let recoveryRequired = false;
+    let agentEndSeen = false;
+    let finalStop = false;
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     let verifyTimer: ReturnType<typeof setTimeout> | null = null;
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1766,12 +1877,36 @@ export function runPi(
     const processLine = (line: string) => {
       if (aborted) return;
       if (line.length > MAX_LINE_BUFFER) {
+        const type = jsonEventTypePrefix(line);
+        if (type === "agent_end") {
+          agentEndSeen = true;
+          return;
+        }
+        if (isAssistantMessageEndPrefix(line)) {
+          agentEndSeen = false;
+          finalStop = false;
+          recoveryRequired = true;
+          return;
+        }
         streamError = `Subagent JSON event exceeds ${MAX_LINE_BUFFER} characters`;
         abort();
         return;
       }
       const evt = parseJsonEvent(line);
+      if (evt?.type === "agent_end") {
+        agentEndSeen = true;
+      } else if (evt && [
+        "agent_start", "turn_start", "message_update", "message_end",
+        "tool_execution_start", "tool_execution_update", "tool_execution_end", "auto_retry_start",
+      ].includes(String(evt.type))) {
+        agentEndSeen = false;
+        finalStop = false;
+      }
+      if (evt?.type === "message_end" && isObj(evt.message) && evt.message.role === "assistant") {
+        finalStop = evt.message.stopReason === "stop";
+      }
       if (evt && applyEvent(state, evt)) {
+        if (evt.type === "message_end") recoveryRequired = false;
         emit();
         if (evt.type === "turn_start" && state.usage.turns >= maxTurns && !aborted) {
           abort("max_turns");
@@ -1785,17 +1920,40 @@ export function runPi(
       }
     };
 
+    let droppingOversizedLine = false;
+    const processStdout = (text: string) => {
+      let offset = 0;
+      while (offset < text.length) {
+        const newline = text.indexOf("\n", offset);
+        const end = newline < 0 ? text.length : newline;
+        if (droppingOversizedLine) {
+          if (newline < 0) return;
+          droppingOversizedLine = false;
+          offset = newline + 1;
+          continue;
+        }
+        const part = text.slice(offset, end);
+        const contentLength = buf.length + part.length - (newline >= 0 && part.endsWith("\r") ? 1 : 0);
+        if (contentLength > MAX_LINE_BUFFER) {
+          processLine(buf + part.slice(0, MAX_LINE_BUFFER + 1 - buf.length));
+          buf = "";
+          droppingOversizedLine = newline < 0;
+          if (newline < 0) return;
+          offset = newline + 1;
+          continue;
+        }
+        buf += part;
+        if (newline < 0) return;
+        processLine(buf.endsWith("\r") ? buf.slice(0, -1) : buf);
+        buf = "";
+        offset = newline + 1;
+      }
+    };
+
     cli.stdout?.on("data", (d: Buffer) => {
       stdout.append(d);
       if (aborted) return;
-      buf += stdoutDecoder.write(d);
-      const lines = buf.split(/\r?\n/);
-      buf = lines.pop() ?? "";
-      for (const l of lines) processLine(l);
-      if (buf.length > MAX_LINE_BUFFER) {
-        processLine(buf);
-        buf = "";
-      }
+      processStdout(stdoutDecoder.write(d));
     });
 
     cli.stderr?.on("data", (d: Buffer) => {
@@ -1831,8 +1989,9 @@ export function runPi(
       if (killTimer) clearTimeout(killTimer);
       if (verifyTimer) clearTimeout(verifyTimer);
       if (settled) return;
-      buf += stdoutDecoder.end();
-      if (buf.trim()) processLine(buf);
+      processStdout(stdoutDecoder.end());
+      if (!droppingOversizedLine && buf.trim()) processLine(buf);
+      buf = "";
       const out = stdout.toString();
       const err = stderr.toString();
       state.stderrTail = appendTail("", stderrDecoder.end() || err, MAX_TAIL);
@@ -1856,20 +2015,40 @@ export function runPi(
         done({ output: finalize(state, "cancelled"), failed: true });
         return;
       }
+      if (recoveryRequired) {
+        try {
+          applyEvent(state, recoverOversizedAssistantMessage(state));
+          recoveryRequired = false;
+          finalStop = true;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          state.status = "failed";
+          state.errorMessage = message;
+          done({ output: finalizeError(state, message), failed: true });
+          return;
+        }
+      }
       // Print mode can exit zero after an assistant error; the final message is authoritative.
-      if (code === 0 && state.errorMessage) {
+      if (state.errorMessage) {
         state.status = "failed";
         done({ output: finalizeError(state, state.errorMessage), failed: true });
         return;
       }
-      if (code === 0) {
+      if (code === 0 || (agentEndSeen && finalStop)) {
+        let output: string;
+        try {
+          output = deliverFinalResult(state, formatPiOutput(out, err));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          state.status = "failed";
+          state.errorMessage = message;
+          done({ output: message, failed: true });
+          return;
+        }
         if (state.status === "pending" || state.status === "running") {
           state.status = "succeeded";
         }
-        done({
-          output: finalize(state, formatPiOutput(out, err)),
-          failed: false,
-        });
+        done({ output, failed: false });
         return;
       }
       state.status = "failed";

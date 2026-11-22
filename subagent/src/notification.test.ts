@@ -199,6 +199,35 @@ describe("subagent completion delivery", () => {
     await subagentManager.clearSession(sessionId);
   });
 
+  it("delivers a large result by readable file pointer without summary omission", async () => {
+    const sessionId = "subagent-result-file-notice";
+    const runtime = harness();
+    await runtime.handlers.get("session_start")?.({}, ctxFor(sessionId));
+    await runtime.handlers.get("agent_start")?.();
+    const resultDir = mkdtempSync(join(tmpdir(), "pi-subagent-result-"));
+    const resultPath = join(resultDir, "result.md");
+    const report = "完整报告 🔐\n".repeat(10_000);
+    writeFileSync(resultPath, report, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    const pointer = `Complete subagent report (${report.length} characters): ${resultPath}\nRead this file for the complete, untruncated result.`;
+    const record = task("sub_result_file_notice", sessionId);
+    subagentManager.register(record);
+    subagentManager.complete(record.id, pointer, false);
+    try {
+      await runtime.handlers.get("agent_settled")?.({ aborted: false });
+
+      expect(runtime.sent).toHaveLength(1);
+      expect(runtime.sent[0]?.content).toContain(resultPath);
+      expect(runtime.sent[0]?.content).toContain("Read this file for the complete, untruncated result.");
+      expect(runtime.sent[0]?.content).not.toContain("full results omitted");
+      expect(runtime.sent[0]?.content).not.toContain(report.slice(0, 100));
+      expect(runtime.sent[0]?.content.length).toBeLessThanOrEqual(50_000);
+      expect(readFileSync(resultPath, "utf8")).toBe(report);
+    } finally {
+      await subagentManager.clearSession(sessionId);
+      rmSync(resultDir, { recursive: true, force: true });
+    }
+  });
+
   it("recovers a legacy completion queued before the new session_start", async () => {
     const sessionId = "subagent-legacy-handoff";
     const oldRuntime = harness();

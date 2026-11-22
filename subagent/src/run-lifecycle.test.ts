@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { runPi, type RunState } from "./index.js";
 
@@ -30,7 +30,9 @@ async function runScript(id: string, lines: string[], maxTurns = 100) {
   const fake = join(dir, "fake-pi.cjs");
   writeFileSync(fake, lines.join("\n"));
   const previous = process.env.PI_CLI_JS;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CLI_JS = fake;
+  process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
   const run = state(id);
   try {
     const result = await runPi(dir, "test", { maxTurns }, run, () => {});
@@ -38,6 +40,8 @@ async function runScript(id: string, lines: string[], maxTurns = 100) {
   } finally {
     if (previous === undefined) delete process.env.PI_CLI_JS;
     else process.env.PI_CLI_JS = previous;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     // Windows can briefly keep a directory locked after the child exits.
     rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
@@ -45,6 +49,34 @@ async function runScript(id: string, lines: string[], maxTurns = 100) {
 
 const message = (text: string, extra = "") =>
   `process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: ${JSON.stringify(text)} }${extra}], usage: { input: 1, output: 1, cost: { total: 0 }, totalTokens: 2 } } }) + "\\n");`;
+
+function persistSession(id: string, messages: Record<string, unknown>[], unreadable = false) {
+  const records = messages.map((message) => JSON.stringify({ type: "message", message })).join("\n") + "\n";
+  return [
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    'const safe = "--" + process.cwd().replace(/^[/\\\\]/, "").replace(/[/\\\\:]/g, "-") + "--";',
+    'const sessionDir = path.join(process.env.PI_CODING_AGENT_DIR, "sessions", safe);',
+    'fs.mkdirSync(sessionDir, { recursive: true });',
+    `const sessionFile = path.join(sessionDir, "2026-11-22T00-00-00-000Z_sub_${id}.jsonl");`,
+    unreadable ? "fs.mkdirSync(sessionFile);" : `fs.writeFileSync(sessionFile, ${JSON.stringify(records)});`,
+  ].join("\n");
+}
+
+const assistantMessage = (text: string, stopReason = "stop") => ({
+  role: "assistant",
+  content: [{ type: "text", text }],
+  stopReason,
+});
+
+const stoppedMessage = (text: string) =>
+  `process.stdout.write(${JSON.stringify(JSON.stringify({ type: "message_end", message: assistantMessage(text) }))} + "\\n");`;
+
+function deliveredResultPath(output: string): string {
+  const match = /^Complete subagent report \((\d+) characters\): (.+)\nRead this file for the complete, untruncated result\.$/.exec(output);
+  expect(match).not.toBeNull();
+  return match![2]!;
+}
 
 function mockChild() {
   return Object.assign(new EventEmitter(), {
@@ -59,7 +91,7 @@ function mockChild() {
 }
 
 describe("runPi lifecycle boundaries", () => {
-  it.each(["", "\n"])("reports oversized event lines instead of dropping them (ending %j)", async (ending) => {
+  it.each(["", "\n"])("reports unsupported oversized event lines instead of dropping them (ending %j)", async (ending) => {
     const child = mockChild();
     vi.spyOn(childProcess, "spawn").mockImplementation(() => child as unknown as childProcess.ChildProcess);
     vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -67,9 +99,7 @@ describe("runPi lifecycle boundaries", () => {
     try {
       const run = state("oversized-event");
       const result = runPi(process.cwd(), "test", {}, run, () => {});
-      child.stdout.write(Buffer.from(JSON.stringify({ type: "message_end", message: {
-        role: "assistant", content: [{ type: "text", text: "x".repeat(1024 * 1024) }], stopReason: "error",
-      } }) + ending));
+      child.stdout.write(Buffer.from(JSON.stringify({ type: "custom_event", payload: "x".repeat(1024 * 1024) }) + ending));
       child.emit("close", 0);
       expect(await result).toMatchObject({ failed: true });
       expect(run.status).toBe("failed");
@@ -78,6 +108,164 @@ describe("runPi lifecycle boundaries", () => {
       child.emit("close", 0);
       vi.restoreAllMocks();
       syncBuiltinESMExports();
+    }
+  });
+
+  it.each([0, 1])("delivers a small final result when agent_end is at the boundary plus %i", async (extra) => {
+    const event = { type: "agent_end", messages: [{ role: "toolResult", content: "redacted history" }], padding: "" };
+    const line = JSON.stringify({
+      ...event,
+      padding: "x".repeat(1024 * 1024 - JSON.stringify(event).length + extra),
+    });
+    expect(line.length).toBe(1024 * 1024 + extra);
+    const { result, run } = await runScript(`agent-end-boundary-${extra}`, [
+      message("done"),
+      `process.stdout.write(${JSON.stringify(line)} + "\\n");`,
+    ]);
+
+    expect(result).toMatchObject({ output: "done", failed: false });
+    expect(run.status).toBe("succeeded");
+  });
+
+  it.each([0, 1])("delivers a final assistant event at the boundary plus %i", async (extra) => {
+    const id = `assistant-event-boundary-${extra}`;
+    const emptyLine = JSON.stringify({ type: "message_end", message: assistantMessage("") });
+    const report = "x".repeat(1024 * 1024 - emptyLine.length + extra);
+    const line = JSON.stringify({ type: "message_end", message: assistantMessage(report) });
+    expect(line.length).toBe(1024 * 1024 + extra);
+    const { result, run } = await runScript(id, [
+      ...(extra === 1 ? [persistSession(id, [assistantMessage(report)])] : []),
+      `process.stdout.write(${JSON.stringify(line)} + "\\n");`,
+    ]);
+
+    expect(result.failed).toBe(false);
+    expect(run.status).toBe("succeeded");
+    const file = deliveredResultPath(result.output);
+    try {
+      expect(fs.readFileSync(file, "utf-8") === report).toBe(true);
+    } finally {
+      rmSync(dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it.each(["\n", ""])("recovers a final report over 1 MiB without duplicating history (ending %j)", async (ending) => {
+    const report = "完整最终报告 🚀\n" + "x".repeat(1024 * 1024);
+    const finalEvent = JSON.stringify({ type: "message_end", message: assistantMessage(report) });
+    const history = "HISTORY_SHOULD_NOT_BE_DELIVERED" + "h".repeat(1024 * 1024);
+    const { result, run } = await runScript("oversized-final-report", [
+      persistSession("oversized-final-report", [
+        assistantMessage("intermediate", "toolUse"),
+        { role: "toolResult", content: [{ type: "text", text: history }] },
+        assistantMessage(report),
+      ]),
+      message("intermediate"),
+      `process.stdout.write(${JSON.stringify(finalEvent)} + ${JSON.stringify(ending)});`,
+    ]);
+
+    expect(result.failed).toBe(false);
+    expect(run.status).toBe("succeeded");
+    expect(run.finalText === report).toBe(true);
+    const file = deliveredResultPath(result.output);
+    try {
+      const delivered = fs.readFileSync(file, "utf-8");
+      expect(delivered === report).toBe(true);
+      expect(delivered).not.toContain("intermediate");
+      expect(delivered).not.toContain("HISTORY_SHOULD_NOT_BE_DELIVERED");
+    } finally {
+      rmSync(dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it("fails explicitly when an oversized final report has no recoverable session log", async () => {
+    const { result, run } = await runScript("missing-recovery", [message("x".repeat(1024 * 1024))]);
+
+    expect(result.failed).toBe(true);
+    expect(run.status).toBe("failed");
+    expect(run.errorMessage).toContain("could not be recovered: session log not found");
+  });
+
+  it("rejects a recovered assistant message that did not stop successfully", async () => {
+    const report = "x".repeat(1024 * 1024);
+    const { result, run } = await runScript("mismatched-recovery", [
+      persistSession("mismatched-recovery", [assistantMessage(report, "toolUse")]),
+      message(report),
+    ]);
+
+    expect(result.failed).toBe(true);
+    expect(run.status).toBe("failed");
+    expect(run.errorMessage).toContain("stopReason toolUse instead of stop");
+  });
+
+  it("fails explicitly when the recovery session log is unreadable", async () => {
+    const report = "x".repeat(1024 * 1024);
+    const { result, run } = await runScript("unreadable-recovery", [
+      persistSession("unreadable-recovery", [assistantMessage(report)], true),
+      message(report),
+    ]);
+
+    expect(result.failed).toBe(true);
+    expect(run.status).toBe("failed");
+    expect(run.errorMessage).toContain("could not be recovered from");
+  });
+
+  it("keeps a result below the file threshold inline", async () => {
+    const report = "x".repeat(39_999);
+    const { result, run } = await runScript("small-inline-result", [message(report)]);
+
+    expect(result.failed).toBe(false);
+    expect(result.output === report).toBe(true);
+    expect(run.status).toBe("succeeded");
+  });
+
+  it("writes an exact-threshold Unicode report to a readable absolute result path", async () => {
+    const prefix = "完整结果🚀é";
+    const report = prefix + "x".repeat(40_000 - prefix.length);
+    expect(report.length).toBe(40_000);
+    const { result, run } = await runScript("unicode-file-result", [message(report)]);
+
+    expect(result.failed).toBe(false);
+    expect(run.status).toBe("succeeded");
+    const file = deliveredResultPath(result.output);
+    expect(isAbsolute(file)).toBe(true);
+    try {
+      expect(fs.readFileSync(file, "utf-8") === report).toBe(true);
+      expect(result.output).toContain("40,000".replace(",", "") + " characters");
+    } finally {
+      rmSync(dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it("fails without returning the large report when its result file cannot be written", async () => {
+    const child = mockChild();
+    const dir = mkdtempSync(join(tmpdir(), "subagent-result-write-failure-"));
+    const blockedTmp = join(dir, "not-a-directory");
+    writeFileSync(blockedTmp, "file");
+    const keys = ["TMPDIR", "TMP", "TEMP"] as const;
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
+    vi.spyOn(childProcess, "spawn").mockImplementation(() => child as unknown as childProcess.ChildProcess);
+    syncBuiltinESMExports();
+    try {
+      for (const key of keys) process.env[key] = blockedTmp;
+      const run = state("result-write-failure");
+      const result = runPi(process.cwd(), "test", {}, run, () => {});
+      const report = "x".repeat(40_000);
+      child.stdout.write(Buffer.from(JSON.stringify({ type: "message_end", message: assistantMessage(report) }) + "\n"));
+      child.emit("close", 0);
+      const settled = await result;
+      expect(settled.failed).toBe(true);
+      expect(settled.output.length).toBeLessThan(1000);
+      expect(settled.output).toContain("Could not write complete subagent result file");
+      expect(run.status).toBe("failed");
+    } finally {
+      child.emit("close", 0);
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      vi.restoreAllMocks();
+      syncBuiltinESMExports();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -259,6 +447,69 @@ describe("runPi lifecycle boundaries", () => {
     expect(result).toMatchObject({ output: "", failed: false });
     expect(run.finalText).toBe("");
     expect(run.textTail).toBe("");
+  });
+
+  it("preserves a fully delivered result when cleanup exits nonzero after an oversized agent_end", async () => {
+    const event = { type: "agent_end", messages: [], padding: "" };
+    const line = JSON.stringify({ ...event, padding: "x".repeat(1024 * 1024 - JSON.stringify(event).length + 1) });
+    const { result, run } = await runScript("cleanup-nonzero", [
+      stoppedMessage("complete answer"),
+      `process.stdout.write(${JSON.stringify(line)} + "\\n");`,
+      'setTimeout(() => process.exit(17), 50);',
+    ]);
+
+    expect(result).toMatchObject({ output: "complete answer", failed: false });
+    expect(run.status).toBe("succeeded");
+    expect(run.errorMessage).toBeUndefined();
+  });
+
+  it("does not treat a stopped assistant response without agent_end as a successful nonzero exit", async () => {
+    const { result, run } = await runScript("nonzero-without-agent-end", [
+      stoppedMessage("partial but stopped"),
+      'setTimeout(() => { process.stderr.write("REAL_EXECUTION_FAILURE"); process.exit(9); }, 50);',
+    ]);
+
+    expect(result.failed).toBe(true);
+    expect(result.output).toContain("partial but stopped");
+    expect(result.output).toContain("REAL_EXECUTION_FAILURE");
+    expect(run.status).toBe("failed");
+  });
+
+  it("keeps authentication failures failed even after agent_end", async () => {
+    const { result, run } = await runScript("authentication-failure", [
+      'console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "AUTH_FAILED" } }));',
+      'console.log(JSON.stringify({ type: "agent_end" }));',
+      'setTimeout(() => process.exit(1), 50);',
+    ]);
+
+    expect(result.failed).toBe(true);
+    expect(result.output).toContain("AUTH_FAILED");
+    expect(run.status).toBe("failed");
+  });
+
+  it("does not reuse pre-retry completion evidence after a new final response", async () => {
+    const { result, run } = await runScript("retry-missing-agent-end", [
+      'console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "TRANSIENT" } }));',
+      'console.log(JSON.stringify({ type: "agent_end" }));',
+      stoppedMessage("retry output"),
+      'setTimeout(() => process.exit(1), 50);',
+    ]);
+
+    expect(result.failed).toBe(true);
+    expect(run.status).toBe("failed");
+  });
+
+  it("accepts a retried final stop with its own agent_end before nonzero cleanup", async () => {
+    const { result, run } = await runScript("retry-with-agent-end", [
+      'console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "TRANSIENT" } }));',
+      'console.log(JSON.stringify({ type: "agent_end" }));',
+      stoppedMessage("retry complete"),
+      'console.log(JSON.stringify({ type: "agent_end" }));',
+      'setTimeout(() => process.exit(1), 50);',
+    ]);
+
+    expect(result).toMatchObject({ output: "retry complete", failed: false });
+    expect(run.status).toBe("succeeded");
   });
 
   it("keeps partial output and appends the fatal child error", async () => {
