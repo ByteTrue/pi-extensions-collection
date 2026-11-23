@@ -267,6 +267,29 @@ describe("askUserExecute — single-select option questions", () => {
     expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["mocha"]]));
   });
 
+  it.each(["tui", "rpc"] as const)("returns to the options when %s Other input is cancelled", async (mode) => {
+    const { ctx, calls } = ctxWithRecorder({
+      select: ["Other (type your answer)", "vitest — repo default"],
+      ...(mode === "tui" ? { editor: undefined } : { input: undefined }),
+    }, { mode });
+    const result = await askUserExecute(params, ctx);
+    expect(calls.map((call) => call.method)).toEqual(["select", mode === "tui" ? "editor" : "input", "select"]);
+    expect(calls[2]!.args).toEqual(calls[0]!.args);
+    expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["vitest"]]));
+  });
+
+  it("does not reopen the options when abort cancels Other input", async () => {
+    const { ctx, calls } = ctxWithRecorder({ select: ["Other (type your answer)", "vitest"] });
+    const controller = new AbortController();
+    ctx.ui.editor = async () => {
+      controller.abort();
+      return undefined;
+    };
+    const result = await askUserExecute(params, ctx, controller.signal);
+    expect(result.content[0]!.text).toContain("dismissed");
+    expect(calls.map((call) => call.method)).toEqual(["select"]);
+  });
+
   it("returns the fixed dismiss text when the dialog is cancelled", async () => {
     const { ctx } = ctxWithRecorder({ select: undefined });
     const result = (await askUserExecute(params, ctx)) as {
@@ -351,6 +374,39 @@ describe("askUserExecute — multi-select questions (multiple: true)", () => {
   });
 
 
+
+  it("preserves picked options and a saved custom draft when Other input is cancelled", async () => {
+    const { ctx, calls } = ctxWithRecorder({
+      select: [
+        "[ ] ESM — modern Node",
+        "[ ] Other (type your answer)",
+        "[✓] Other: Deno",
+        "[ ] Other: Deno",
+        "✓ Done (1 selected)",
+      ],
+      editor: ["Deno", undefined],
+    });
+    const result = await askUserExecute(multiParams, ctx);
+    const finalRows = calls.filter((call) => call.method === "select").at(-1)!.args[1] as string[];
+    expect(finalRows).toContain("[✓] ESM — modern Node");
+    expect(finalRows).toContain("[ ] Other: Deno");
+    expect(finalRows).toContain("✓ Done (1 selected)");
+    expect(calls.filter((call) => call.method === "editor")[1]!.args)
+      .toEqual(["Which targets? (select all that apply)", "Deno"]);
+    expect(result.content[0]!.text).toBe(answeredText(["Which targets?", ["ESM"]]));
+  });
+
+  it("does not reopen the checklist when abort cancels Other input", async () => {
+    const { ctx, calls } = ctxWithRecorder({ select: ["[ ] Other (type your answer)", "✓ Done (0 selected)"] });
+    const controller = new AbortController();
+    ctx.ui.editor = async () => {
+      controller.abort();
+      return undefined;
+    };
+    const result = await askUserExecute(multiParams, ctx, controller.signal);
+    expect(result.content[0]!.text).toContain("dismissed");
+    expect(calls.map((call) => call.method)).toEqual(["select"]);
+  });
 
   it("does not duplicate a custom answer that equals an option label after going back", async () => {
     const { ctx } = ctxWithRecorder({

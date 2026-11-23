@@ -344,7 +344,10 @@ async function multiSelectDialog(
         continue;
       }
       const text = await collectFreeform(title, ctx, custom, signal);
-      if (text === undefined) return undefined;
+      if (text === undefined) {
+        if (signal?.aborted) return undefined;
+        continue;
+      }
       state.customText = text || undefined;
       state.customChecked = Boolean(text);
       continue;
@@ -493,7 +496,10 @@ export async function askUserExecute(
     }
     if (selected === OTHER_LABEL) {
       const text = await collectFreeform(title, ctx, state.customText, signal);
-      if (text === undefined) return dismissedResult();
+      if (text === undefined) {
+        if (signal?.aborted) return dismissedResult();
+        continue;
+      }
       state.customText = text || undefined;
       state.answers = text ? [text] : [];
       index += 1;

@@ -39,8 +39,11 @@ Registers one tool:
     including changes made before pressing Done.
   - **Open question (no `options`)**: answered through the built-in multiline
     editor (TUI) or input dialog (RPC).
-  - **Dismiss (Esc)**: returns a fixed "dismissed" text so the model falls back
-    to plain prose instead of re-asking.
+  - **Dismiss (Esc)**: cancelling freeform input opened from **Other** returns
+    to the current options or checklist, preserving multi-select picks and saved
+    custom text. Dismissing an option list, checklist, or purely open question
+    still returns a fixed "dismissed" text so the model falls back to plain prose
+    instead of re-asking.
   - **No dialog-capable UI (print/JSON mode)**: explicit error — the tool never
     guesses an answer.
 
@@ -141,7 +144,7 @@ imports.
 `npm --workspace ask-user test` covers registration, single-select option
 composition, the multi-select checklist loop (toggle row by row, submit from
 `✓ Done`), custom
-`Other` merging and preservation across back-navigation, option identity and
+`Other` merging, cancellation recovery, and preservation across back-navigation, option identity and
 generated-row collision checks before UI, the 1–4 question limit,
 legacy arguments through the host validator, the freeform
 path (empty = `Unanswered`), dismiss semantics, mode guards,
