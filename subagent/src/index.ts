@@ -2,7 +2,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { chmodSync, closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { StringDecoder } from "node:string_decoder";
@@ -722,27 +722,6 @@ function toolBrief(t: ToolTrace): string {
 }
 
 // ── Pi CLI Resolution ─────────────────────────────────────────────────
-const PI_CLI_SEGMENTS = [
-  [
-    "node_modules",
-    "@earendil-works",
-    "pi-coding-agent",
-    "dist",
-    "bundle",
-    "cli.js",
-  ],
-  ["node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"],
-  [
-    "node_modules",
-    "@mariozechner",
-    "pi-coding-agent",
-    "dist",
-    "bundle",
-    "cli.js",
-  ],
-  ["node_modules", "@mariozechner", "pi-coding-agent", "dist", "cli.js"],
-];
-
 export function resolvePiCli(): { command: string; args: string[] } {
   const envCli = str(process.env.PI_CLI_JS);
   if (envCli) {
@@ -750,39 +729,21 @@ export function resolvePiCli(): { command: string; args: string[] } {
     if (!exists(p)) throw new Error(`PI_CLI_JS missing: ${p}`);
     return { command: process.execPath, args: [p] };
   }
-  const candidates: string[] = [];
-  for (const arg of process.argv) {
-    if (/pi-coding-agent[\\/]dist[\\/](?:bundle[\\/])?cli\.js$/i.test(arg)) {
-      candidates.push(resolve(arg));
-    }
+
+  const argvEntry = str(process.argv[1]);
+  const entry = argvEntry ? resolve(argvEntry) : undefined;
+  if (entry && /\.[cm]?js$/i.test(entry) && exists(entry)) {
+    return { command: process.execPath, args: [entry] };
   }
-  const prefix =
-    str(process.env.npm_config_prefix) ?? str(process.env.NPM_CONFIG_PREFIX);
-  const appData = str(process.env.APPDATA);
-  const pathVal = process.env.PATH ?? process.env.Path ?? "";
-  const addBase = (base: string) => {
-    for (const seg of PI_CLI_SEGMENTS) candidates.push(join(base, ...seg));
-  };
-  if (prefix) {
-    addBase(prefix);
-    addBase(join(prefix, "lib"));
-  }
-  if (appData) addBase(join(appData, "npm"));
-  for (const entry of pathVal.split(delimiter)) {
-    const e = entry.trim();
-    if (!e) continue;
-    addBase(e);
-    // Version managers put "<install>/node_modules/.bin" on PATH; the package
-    // tree lives one level up, so dirname(e) alone would double the
-    // "node_modules" segment and never hit.
-    if (/[\\/]\.bin$/i.test(e)) addBase(dirname(dirname(e)));
-    addBase(dirname(e));
-    addBase(join(dirname(e), "lib"));
-  }
-  for (const c of [...new Set(candidates)]) {
-    if (exists(c)) return { command: process.execPath, args: [c] };
-  }
-  return { command: "pi", args: [] };
+
+  const isSelfContained =
+    process.env.PI_CODING_AGENT === "true" &&
+    (entry === resolve(process.execPath) || Boolean(process.versions.bun));
+  if (isSelfContained) return { command: process.execPath, args: [] };
+
+  throw new Error(
+    "Cannot resolve Pi CLI entry from the current process; set PI_CLI_JS to the Pi cli.js path",
+  );
 }
 
 // ── Agent file parsing ────────────────────────────────────────────────
@@ -1710,10 +1671,9 @@ export function runPi(
     const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxTurns = cfg.maxTurns ?? DEFAULT_MAX_TURNS;
 
-    // The resolved command can be a bare "pi" that is really a version-manager
-    // shim, with the true node process one level down; killing only the direct
-    // child orphans that grandchild and the run keeps streaming. Kill the whole
-    // tree: process group on POSIX, taskkill /T /F on Windows.
+    // Pi and its tools can spawn descendants; killing only the direct child can
+    // orphan them and keep the run streaming. Kill the whole tree: process group
+    // on POSIX, taskkill /T /F on Windows.
     const childDead = () => cli.exitCode !== null || cli.signalCode !== null;
     const treeAlive = () => {
       if (cli.pid === undefined) return false;

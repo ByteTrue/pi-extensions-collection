@@ -1138,10 +1138,84 @@ You are an expert researcher. Read references carefully.
     expect(mgr.list("session_123").length).toBe(0);
   });
 
-  it("resolves pi cli executable cleanly", () => {
-    const cli = resolvePiCli();
-    expect(cli.command).toBeDefined();
-    expect(Array.isArray(cli.args)).toBe(true);
+  describe("resolvePiCli", () => {
+    const originalArgvEntry = process.argv[1];
+    const originalEnv = {
+      PI_CLI_JS: process.env.PI_CLI_JS,
+      PI_CODING_AGENT: process.env.PI_CODING_AGENT,
+      PATH: process.env.PATH,
+    };
+    const originalBunDescriptor = Object.getOwnPropertyDescriptor(process.versions, "bun");
+    let dir: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "subagent-cli-"));
+      process.argv[1] = join(dir, "missing.js");
+      delete process.env.PI_CLI_JS;
+      delete process.env.PI_CODING_AGENT;
+    });
+
+    afterEach(() => {
+      if (originalArgvEntry === undefined) process.argv.splice(1, 1);
+      else process.argv[1] = originalArgvEntry;
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (originalBunDescriptor) Object.defineProperty(process.versions, "bun", originalBunDescriptor);
+      else Reflect.deleteProperty(process.versions, "bun");
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    function makeEntry(...segments: string[]): string {
+      const path = join(dir, ...segments);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "");
+      return path;
+    }
+
+    it("resolves pi cli override first and rejects a missing override", () => {
+      process.argv[1] = makeEntry("resources", "pi-runtime", "dist", "cli.js");
+      const override = makeEntry("override", "cli.cjs");
+      process.env.PI_CLI_JS = override;
+      expect(resolvePiCli()).toEqual({ command: process.execPath, args: [override] });
+
+      const missing = join(dir, "missing-override.js");
+      process.env.PI_CLI_JS = missing;
+      expect(() => resolvePiCli()).toThrow(`PI_CLI_JS missing: ${missing}`);
+    });
+
+    it("resolves pi cli from embedded and npm layouts without using PATH", () => {
+      const globalBin = dirname(makeEntry("global-bin", "pi"));
+      process.env.PATH = globalBin;
+      const entries = [
+        makeEntry("resources", "pi-runtime", "dist", "cli.js"),
+        makeEntry("node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+      ];
+      for (const entry of entries) {
+        process.argv[1] = entry;
+        expect(resolvePiCli()).toEqual({ command: process.execPath, args: [entry] });
+      }
+    });
+
+    it("resolves pi cli from a self-contained executable", () => {
+      process.argv[1] = process.execPath;
+      process.env.PI_CODING_AGENT = "true";
+      expect(resolvePiCli()).toEqual({ command: process.execPath, args: [] });
+    });
+
+    it("resolves pi cli from a Bun compiled executable", () => {
+      Object.defineProperty(process.versions, "bun", { configurable: true, value: "1.0.0" });
+      process.env.PI_CODING_AGENT = "true";
+      expect(resolvePiCli()).toEqual({ command: process.execPath, args: [] });
+    });
+
+    it("resolves pi cli failure with an actionable error", () => {
+      process.argv[1] = makeEntry("entry-not-js");
+      expect(() => resolvePiCli()).toThrow(
+        "Cannot resolve Pi CLI entry from the current process; set PI_CLI_JS to the Pi cli.js path",
+      );
+    });
   });
 
   it("strips live objects from exit-message details so structuredClone cannot throw", () => {
@@ -1943,39 +2017,6 @@ describe("resolvePiCli resolution paths", () => {
     const cli = resolvePiCli();
     expect(cli.command).toBe(process.execPath);
     expect(cli.args).toEqual([resolve(cliPath)]);
-  });
-
-  it("resolves version-manager PATH entries ending in .bin (mise-style layouts)", () => {
-    const install = join(tmp, "installs", "npm-earendil-works-pi-coding-agent", "1.0.0");
-    const cliPath = join(install, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
-    mkdirSync(dirname(cliPath), { recursive: true });
-    writeFileSync(cliPath, "");
-    disableLookupEnv();
-    process.argv = [process.execPath, "vitest"];
-    process.env.PATH = join(install, "node_modules", ".bin");
-    const cli = resolvePiCli();
-    expect(cli.command).toBe(process.execPath);
-    expect(cli.args).toEqual([resolve(cliPath)]);
-  });
-
-  it("still resolves the legacy dist/cli.js segment via APPDATA/npm", () => {
-    const npmRoot = join(tmp, "npm");
-    const cliPath = join(npmRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
-    mkdirSync(dirname(cliPath), { recursive: true });
-    writeFileSync(cliPath, "");
-    disableLookupEnv();
-    process.argv = [process.execPath, "vitest"];
-    process.env.APPDATA = tmp;
-    const cli = resolvePiCli();
-    expect(cli.command).toBe(process.execPath);
-    expect(cli.args).toEqual([resolve(cliPath)]);
-  });
-
-  it("falls back to a bare pi command when nothing resolves", () => {
-    disableLookupEnv();
-    process.argv = [process.execPath, "vitest"];
-    const cli = resolvePiCli();
-    expect(cli).toEqual({ command: "pi", args: [] });
   });
 
   it("throws when PI_CLI_JS points at a missing file", () => {
