@@ -1082,6 +1082,17 @@ function isAssistantMessageEndPrefix(line: string): boolean {
     /"message"\s*:\s*\{\s*"role"\s*:\s*"assistant"/.test(line.slice(0, 512));
 }
 
+function isToolResultMessageEndPrefix(line: string): boolean {
+  return jsonEventTypePrefix(line) === "message_end" &&
+    /"message"\s*:\s*\{\s*"role"\s*:\s*"toolResult"/.test(line.slice(0, 512));
+}
+
+function recoverOversizedToolExecutionEnd(line: string): JsonObject | undefined {
+  const match = /^\s*\{\s*"type"\s*:\s*"tool_execution_end"\s*,\s*"toolCallId"\s*:\s*"([^"\\]*)"\s*,\s*"isError"\s*:\s*(true|false)\b/.exec(line.slice(0, 4096));
+  if (!match) return undefined;
+  return { type: "tool_execution_end", toolCallId: match[1], isError: match[2] === "true" };
+}
+
 export function parseJsonEvent(line: string): JsonObject | null {
   const t = line.trim();
   if (!t) return null;
@@ -1846,6 +1857,22 @@ export function runPi(
           agentEndSeen = false;
           finalStop = false;
           recoveryRequired = true;
+          return;
+        }
+        if (type === "tool_execution_update" || type === "tool_execution_end") {
+          agentEndSeen = false;
+          finalStop = false;
+          const evt = type === "tool_execution_end" ? recoverOversizedToolExecutionEnd(line) : undefined;
+          if (evt) {
+            applyEvent(state, evt);
+            emit();
+          }
+          return;
+        }
+        if (type === "turn_end") return;
+        if (isToolResultMessageEndPrefix(line)) {
+          agentEndSeen = false;
+          finalStop = false;
           return;
         }
         streamError = `Subagent JSON event exceeds ${MAX_LINE_BUFFER} characters`;

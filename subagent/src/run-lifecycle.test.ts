@@ -26,7 +26,7 @@ function state(id: string): RunState {
 }
 
 async function runScript(id: string, lines: string[], maxTurns = 100) {
-  const dir = mkdtempSync(join(tmpdir(), `subagent-${id}-`));
+  const dir = fs.realpathSync(mkdtempSync(join(tmpdir(), `subagent-${id}-`)));
   const fake = join(dir, "fake-pi.cjs");
   writeFileSync(fake, lines.join("\n"));
   const previous = process.env.PI_CLI_JS;
@@ -90,7 +90,108 @@ function mockChild() {
   });
 }
 
+async function runChunks(id: string, chunks: string[], exitCode = 0) {
+  const child = mockChild();
+  vi.spyOn(childProcess, "spawn").mockImplementation(() => child as unknown as childProcess.ChildProcess);
+  vi.spyOn(process, "kill").mockImplementation(() => true);
+  syncBuiltinESMExports();
+  try {
+    const run = state(id);
+    const result = runPi(process.cwd(), "test", {}, run, () => {});
+    for (const chunk of chunks) child.stdout.write(Buffer.from(chunk));
+    child.emit("close", exitCode);
+    return { result: await result, run };
+  } finally {
+    child.emit("close", 0);
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  }
+}
+
 describe("runPi lifecycle boundaries", () => {
+  it.each([
+    ["tool_execution_update", { type: "tool_execution_update", toolCallId: "read-1" }],
+    ["tool_execution_end", { type: "tool_execution_end", toolCallId: "read-1", isError: false }],
+    ["toolResult message_end", { type: "message_end", message: { role: "toolResult", content: [] } }],
+    ["turn_end", { type: "turn_end", toolResults: [] }],
+  ])("delivers the final report after an oversized %s", async (name, event) => {
+    const line = JSON.stringify({ ...event, padding: "x".repeat(1024 * 1024) });
+    const { result, run } = await runScript("oversized-" + name.replaceAll(" ", "-"), [
+      `process.stdout.write(${JSON.stringify(line)} + "\\n");`,
+      stoppedMessage("complete answer"),
+      'process.stdout.write(JSON.stringify({ type: "agent_end" }) + "\\n");',
+    ]);
+
+    expect(result).toMatchObject({ output: "complete answer", failed: false });
+    expect(run.status).toBe("succeeded");
+  });
+
+  it("delivers a completed report followed by an oversized turn_end", async () => {
+    const line = JSON.stringify({ type: "turn_end", toolResults: [], padding: "x".repeat(1024 * 1024) });
+    const { result, run } = await runScript("oversized-final-turn-end", [
+      stoppedMessage("complete answer"),
+      `process.stdout.write(${JSON.stringify(line)} + "\\n");`,
+      'process.stdout.write(JSON.stringify({ type: "agent_end" }) + "\\n");',
+    ]);
+
+    expect(result).toMatchObject({ output: "complete answer", failed: false });
+    expect(run.status).toBe("succeeded");
+  });
+
+  it.each([false, true])("settles a matching tool trace after an oversized end event (isError=%s)", async (isError) => {
+    const start = JSON.stringify({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: {} }) + "\n";
+    const end = JSON.stringify({ type: "tool_execution_end", toolCallId: "read-1", isError, padding: "x".repeat(1024 * 1024) }) + "\n";
+    const final = JSON.stringify({ type: "message_end", message: assistantMessage("complete answer") }) + "\n";
+    const { result, run } = await runChunks(`oversized-tool-end-${isError}`, [start, end, final]);
+
+    expect(result).toMatchObject({ output: "complete answer", failed: false });
+    expect(run.status).toBe("succeeded");
+    expect(run.tools).toHaveLength(1);
+    expect(run.tools[0]).toMatchObject({ id: "read-1", status: isError ? "failed" : "succeeded", finishedAt: expect.any(Number) });
+  });
+
+  it("does not reuse completion evidence after an oversized tool result", async () => {
+    const final = JSON.stringify({ type: "message_end", message: assistantMessage("stale answer") }) + "\n";
+    const agentEnd = JSON.stringify({ type: "agent_end" }) + "\n";
+    const toolResult = JSON.stringify({ type: "message_end", message: { role: "toolResult", content: [] }, padding: "x".repeat(1024 * 1024) }) + "\n";
+    const { result, run } = await runChunks("oversized-tool-result-retry", [final, agentEnd, toolResult], 1);
+
+    expect(result.failed).toBe(true);
+    expect(run.status).toBe("failed");
+    expect(run.finalText).toBe("stale answer");
+  });
+
+  it("leaves tool progress unchanged when oversized completion metadata is ambiguous", async () => {
+    const start = JSON.stringify({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: {} }) + "\n";
+    const end = JSON.stringify({ type: "tool_execution_end", toolCallId: "read-1", result: { isError: true }, isError: false, padding: "x".repeat(1024 * 1024) }) + "\n";
+    const final = JSON.stringify({ type: "message_end", message: assistantMessage("complete answer") }) + "\n";
+    const { result, run } = await runChunks("oversized-tool-end-nested-metadata", [start, end, final]);
+
+    expect(result).toMatchObject({ output: "complete answer", failed: false });
+    expect(run.tools[0]).toMatchObject({ id: "read-1", status: "running" });
+  });
+
+  it("drains a fragmented oversized event before a CRLF-delimited final report", async () => {
+    const oversized = JSON.stringify({ type: "turn_end", padding: "x".repeat(1024 * 1024) }) + "\r\n";
+    const final = JSON.stringify({ type: "message_end", message: assistantMessage("complete answer") }) + "\r\n";
+    const { result, run } = await runChunks("oversized-fragmented-crlf", [
+      oversized.slice(0, 700_000),
+      oversized.slice(700_000) + final,
+    ]);
+
+    expect(result).toMatchObject({ output: "complete answer", failed: false });
+    expect(run.status).toBe("succeeded");
+  });
+
+  it("discards an oversized skipped event that ends at EOF without a newline", async () => {
+    const final = JSON.stringify({ type: "message_end", message: assistantMessage("complete answer") }) + "\n";
+    const oversized = JSON.stringify({ type: "turn_end", padding: "x".repeat(1024 * 1024) });
+    const { result, run } = await runChunks("oversized-eof", [final, oversized]);
+
+    expect(result).toMatchObject({ output: "complete answer", failed: false });
+    expect(run.status).toBe("succeeded");
+  });
+
   it.each(["", "\n"])("reports unsupported oversized event lines instead of dropping them (ending %j)", async (ending) => {
     const child = mockChild();
     vi.spyOn(childProcess, "spawn").mockImplementation(() => child as unknown as childProcess.ChildProcess);
