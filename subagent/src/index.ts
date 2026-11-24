@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { chmodSync, closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -21,7 +21,7 @@ import {
   listBuiltinAgentNames,
   type AgentConfig,
 } from "./builtin-agents.js";
-import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getPackageDir, type ExtensionAPI, type ExtensionCommandContext, type MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { registerCompletionSource, type Completion } from "../../shared/completion-delivery.js";
 
@@ -722,6 +722,71 @@ function toolBrief(t: ToolTrace): string {
 }
 
 // ── Pi CLI Resolution ─────────────────────────────────────────────────
+const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+
+function resolvePiPackageCli(pkgRoot: string): string | undefined {
+  const pkgJsonPath = join(pkgRoot, "package.json");
+  if (exists(pkgJsonPath)) {
+    try {
+      const pkg = JSON.parse(readText(pkgJsonPath));
+      if (isObj(pkg)) {
+        const binField = pkg.bin;
+        const binRel =
+          typeof binField === "string"
+            ? str(binField)
+            : isObj(binField)
+              ? str(binField.pi) ?? str(Object.values(binField)[0])
+              : null;
+        if (binRel) {
+          const binCli = resolve(pkgRoot, binRel);
+          if (/\.[cm]?js$/i.test(binCli) && exists(binCli)) return binCli;
+        }
+      }
+    } catch {
+      // Fall back to standard dist paths below.
+    }
+  }
+  for (const rel of [
+    ["dist", "bundle", "cli.js"],
+    ["dist", "cli.js"],
+  ] as const) {
+    const candidate = join(pkgRoot, ...rel);
+    if (exists(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function findPiPackageRoot(entryPath: string): string | undefined {
+  let dir = dirname(entryPath);
+  for (;;) {
+    const pkgJsonPath = join(dir, "package.json");
+    if (exists(pkgJsonPath)) {
+      try {
+        const pkg = JSON.parse(readText(pkgJsonPath));
+        if (isObj(pkg) && pkg.name === PI_PACKAGE_NAME) return dir;
+      } catch {
+        // Ignore unreadable or malformed package.json while walking up.
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+function resolveArgvPiCli(candidate: string): string | undefined {
+  if (!exists(candidate)) return undefined;
+  const base = basename(candidate);
+  if (/^cli\.[cm]?js$/i.test(base)) return candidate;
+  if (/^(?:rpc-entry|cli-runtime)\.[cm]?js$/i.test(base)) {
+    const siblingCli = join(dirname(candidate), "cli.js");
+    if (exists(siblingCli)) return siblingCli;
+  }
+  const pkgRoot = findPiPackageRoot(candidate);
+  if (pkgRoot) return resolvePiPackageCli(pkgRoot);
+  return undefined;
+}
+
 export function resolvePiCli(): { command: string; args: string[] } {
   const envCli = str(process.env.PI_CLI_JS);
   if (envCli) {
@@ -732,14 +797,31 @@ export function resolvePiCli(): { command: string; args: string[] } {
 
   const argvEntry = str(process.argv[1]);
   const entry = argvEntry ? resolve(argvEntry) : undefined;
-  if (entry && /\.[cm]?js$/i.test(entry) && exists(entry)) {
-    return { command: process.execPath, args: [entry] };
+  if (entry) {
+    const direct = resolveArgvPiCli(entry);
+    if (direct) return { command: process.execPath, args: [direct] };
+    try {
+      const canonical = realpathSync(entry);
+      if (canonical !== entry) {
+        const resolved = resolveArgvPiCli(canonical);
+        if (resolved) return { command: process.execPath, args: [resolved] };
+      }
+    } catch {
+      // Ignore broken symlinks or virtual paths.
+    }
   }
 
   const isSelfContained =
     process.env.PI_CODING_AGENT === "true" &&
     (entry === resolve(process.execPath) || Boolean(process.versions.bun));
   if (isSelfContained) return { command: process.execPath, args: [] };
+
+  try {
+    const pkgCli = resolvePiPackageCli(getPackageDir());
+    if (pkgCli) return { command: process.execPath, args: [pkgCli] };
+  } catch {
+    // Fall through to actionable error when package root cannot be resolved.
+  }
 
   throw new Error(
     "Cannot resolve Pi CLI entry from the current process; set PI_CLI_JS to the Pi cli.js path",

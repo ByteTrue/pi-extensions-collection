@@ -38,7 +38,7 @@ import {
   updateSubagentSettings,
 } from "./settings.js";
 import { buildByspaceReportRecord } from "./byspace-report.js";
-import { writeFileSync, unlinkSync, mkdirSync, existsSync, rmSync, readFileSync, mkdtempSync } from "node:fs";
+import { writeFileSync, unlinkSync, mkdirSync, existsSync, rmSync, readFileSync, mkdtempSync, realpathSync, symlinkSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -1143,14 +1143,16 @@ You are an expert researcher. Read references carefully.
     const originalEnv = {
       PI_CLI_JS: process.env.PI_CLI_JS,
       PI_CODING_AGENT: process.env.PI_CODING_AGENT,
+      PI_PACKAGE_DIR: process.env.PI_PACKAGE_DIR,
       PATH: process.env.PATH,
     };
     const originalBunDescriptor = Object.getOwnPropertyDescriptor(process.versions, "bun");
     let dir: string;
 
     beforeEach(() => {
-      dir = mkdtempSync(join(tmpdir(), "subagent-cli-"));
+      dir = realpathSync(mkdtempSync(join(tmpdir(), "subagent-cli-")));
       process.argv[1] = join(dir, "missing.js");
+      process.env.PI_PACKAGE_DIR = join(dir, "empty-pi-package");
       delete process.env.PI_CLI_JS;
       delete process.env.PI_CODING_AGENT;
     });
@@ -1172,6 +1174,18 @@ You are an expert researcher. Read references carefully.
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, "");
       return path;
+    }
+
+    function makePiPackage(rootRel: string[], binRel = "dist/bundle/cli.js"): { pkgRoot: string; cliPath: string } {
+      const pkgRoot = join(dir, ...rootRel);
+      const cliPath = join(pkgRoot, binRel);
+      mkdirSync(dirname(cliPath), { recursive: true });
+      writeFileSync(cliPath, "");
+      writeFileSync(
+        join(pkgRoot, "package.json"),
+        JSON.stringify({ name: "@earendil-works/pi-coding-agent", bin: { pi: binRel } }),
+      );
+      return { pkgRoot, cliPath };
     }
 
     it("resolves pi cli override first and rejects a missing override", () => {
@@ -1196,6 +1210,35 @@ You are an expert researcher. Read references carefully.
         process.argv[1] = entry;
         expect(resolvePiCli()).toEqual({ command: process.execPath, args: [entry] });
       }
+    });
+
+    it("resolves pi cli when process.argv[1] is a .bin/pi symlink or rpc-entry.js", () => {
+      const { pkgRoot, cliPath } = makePiPackage(["release", "node_modules", "@earendil-works", "pi-coding-agent"]);
+      const binDir = join(dir, "release", "node_modules", ".bin");
+      mkdirSync(binDir, { recursive: true });
+      const binLink = join(binDir, "pi");
+      symlinkSync(cliPath, binLink);
+
+      process.argv[1] = binLink;
+      expect(resolvePiCli()).toEqual({ command: process.execPath, args: [cliPath] });
+
+      const rpcEntry = join(pkgRoot, "dist", "bundle", "rpc-entry.js");
+      writeFileSync(rpcEntry, "");
+      process.argv[1] = rpcEntry;
+      expect(resolvePiCli()).toEqual({ command: process.execPath, args: [cliPath] });
+    });
+
+    it("falls back to the loaded Pi SDK package in embedded SDK hosts", () => {
+      const { pkgRoot, cliPath } = makePiPackage(["sdk-host", "node_modules", "@earendil-works", "pi-coding-agent"]);
+      process.env.PI_PACKAGE_DIR = pkgRoot;
+
+      // Host process started via its own non-Pi JS script (e.g. Paseo daemon)
+      process.argv[1] = makeEntry("paseo", "daemon.js");
+      expect(resolvePiCli()).toEqual({ command: process.execPath, args: [cliPath] });
+
+      // Host process with no argv[1]
+      process.argv.splice(1, 1);
+      expect(resolvePiCli()).toEqual({ command: process.execPath, args: [cliPath] });
     });
 
     it("resolves pi cli from a self-contained executable", () => {
