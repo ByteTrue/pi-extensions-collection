@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -95,7 +95,7 @@ describe("subagent security boundaries", () => {
       const child = await executeWithFakePi(dir, { task: "review", agent: "sdk-fixture", description: "SDK workspace", cwd: "child" });
 
       expect(child.input).toContain("SDK_WORKSPACE_PROMPT");
-      expect(child.cwd).toBe(join(dir, "child"));
+      expect(child.cwd).toBe(realpathSync(join(dir, "child")));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

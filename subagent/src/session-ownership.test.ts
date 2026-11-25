@@ -1,12 +1,12 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import register, { acquireSubagentSession, subagentManager, SUBAGENT_ORPHAN_DIR, type JsonObject } from "./index.js";
 
 function fixture() {
-  const dir = mkdtempSync(join(tmpdir(), "subagent-owner-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "subagent-owner-")));
   const agentDir = join(dir, "agent");
   const id = "sub_owned";
   const sessionDir = join(agentDir, "sessions", "--" + resolve(dir).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-") + "--");

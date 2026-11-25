@@ -31,11 +31,14 @@ function assertPrivate(info: Stats, path: string, directory: boolean): void {
   }
 }
 
+// macOS ships /var and /tmp as root-owned symlinks; those are not a redirection of ours.
+const systemLink = (info: Stats): boolean => info.isSymbolicLink() && info.uid === 0 && (info.mode & 0o022) === 0;
+
 function storageDirectory(path: string, create: boolean): boolean {
   // Check ancestors before mkdir: a redirected profile must never receive a notice.
   for (let part = path; ; part = dirname(part)) {
     const info = lstatSync(part, { throwIfNoEntry: false });
-    if (info && (!info.isDirectory() || info.isSymbolicLink())) throw new Error("unsafe completion directory: " + part);
+    if (info && !(info.isDirectory() || (part !== path && systemLink(info)))) throw new Error("unsafe completion directory: " + part);
     if (part === path && info) assertPrivate(info, part, true);
     if (dirname(part) === part) break;
   }
