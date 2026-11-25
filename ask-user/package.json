@@ -2,7 +2,7 @@
   "name": "ask-user",
   "version": "0.0.0",
   "private": true,
-  "description": "Pi extension (never published to npm): an ask_user tool for 1–4 decision questions with single or multiple selections and back navigation. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
+  "description": "Pi extension (never published to npm): an ask_user tool for decision questions (2-8 options each) with single or multiple selections, a freeform answer row, and back navigation. Installed with the repo's git package through the root pi manifest; kept as a workspace only so CI typecheck/test cover it.",
   "type": "module",
   "scripts": {
     "test": "vitest run",

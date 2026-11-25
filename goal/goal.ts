@@ -182,7 +182,7 @@ export function goalSection(goal: GoalRecord): string {
     "Work until the objective is verifiably true, then call goal_done with a summary and the evidence that proves it. " +
       evidence + " " + COMPLETION_AUDIT,
     "",
-    "If a decision only the user can make blocks progress, ask it (ask_user when it offers options) and stop without further tool calls; repeated no-progress turns pause the goal.",
+    "If a decision only the user can make blocks progress, ask it with ask_user and stop without further tool calls; repeated no-progress turns pause the goal.",
   ].join("\n");
 }
 

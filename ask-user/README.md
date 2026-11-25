@@ -5,18 +5,18 @@ the model calls `ask_user` instead of writing a prose question, and you pick
 options with arrow keys + Enter instead of typing `第一个…第二个…` by hand.
 
 It exists because without a tool the model's question format drifts every
-session — one structured tool with `promptGuidelines` pins the format, and each
+session — one structured tool with a fixed schema pins the format, and each
 answer becomes a few keystrokes across both TUI and RPC (BySpace) modes.
 
 ## What it does
 
 Registers one tool:
 
-- **`ask_user(questions)`** — 1–4 decision or clarification questions per call.
-  - `questions`: array of `{question, options?, multiple?}` items (a single
-    question is simply a 1-item array; legacy top-level `{question, options?,
-    multiple?}` is converted before host schema validation). Calls outside the
-    1–4 question limit are rejected before any dialog opens. Option labels are
+- **`ask_user(questions)`** — decision or clarification questions per call.
+  - `questions`: array of `{question, options, multiple?}` items (a single
+    question is simply a 1-item array). `options` is required and takes 2-8
+    entries (soft cap: a longer list does not fit a picker); there is no bound on
+    the number of questions. Option labels are
     meant to be 1-5 words with a one-line description. Labels identify answers:
     they must be unique within each question after trimming, even when their
     descriptions differ. The entire batch is validated before any UI opens.
@@ -37,13 +37,20 @@ Registers one tool:
     **"← Back to previous question"** row so you can return to an earlier
     question and revise its answer. Picks and custom Other text are preserved,
     including changes made before pressing Done.
-  - **Open question (no `options`)**: answered through the built-in multiline
-    editor (TUI) or input dialog (RPC).
+  - **Freeform answers** exist only through **Other**: the built-in multiline
+    editor (TUI) or input dialog (RPC). There is no options-less question; the
+    model gets an explicit error instead. **Other is generated, never supplied**:
+    it is appended after the last option on every question, no matter how many
+    options there are, so the model never lists it and cannot shadow it (see the
+    collision checks above). Control rows stay below it — `✓ Done` in
+    multi-select, `← Back` from question 2 on.
   - **Dismiss (Esc)**: cancelling freeform input opened from **Other** returns
     to the current options or checklist, preserving multi-select picks and saved
-    custom text. Dismissing an option list, checklist, or purely open question
-    still returns a fixed "dismissed" text so the model falls back to plain prose
-    instead of re-asking.
+    custom text. Dismissing an option list or checklist keeps the answers already
+    given and reports only the remaining questions as dismissed, so a
+    half-finished batch is not thrown away; everything dismissed at once returns
+    a fixed "dismissed" text so the model falls back to plain prose instead of
+    re-asking.
   - **No dialog-capable UI (print/JSON mode)**: explicit error — the tool never
     guesses an answer.
 
@@ -96,29 +103,18 @@ failures — trailing text, a doubled closing brace, or duplicated stream deltas
 from a proxy. `prefer` means a provider without strict support still gets the
 tool, just unconstrained.
 
-### Where the model sees this (why the wording is trigger-first)
+### Where the model sees this (one sentence, no guidelines)
 
-The registration text is the only lever this extension has, and where it lands
-depends on the session:
+The registration text is the only lever this extension has, and it is
+deliberately one sentence: mechanics (batching, `multiple`, Other/Back/Done
+rows, no-re-ask) live in the schema and in the dialog itself, not in a prose
+blurb the model has to read on every session. Same shape as pstack's
+`ask_user_question`, minus its numeric limits.
 
-- **Direct mode** (a session that declares `ask_user`): `promptSnippet` goes
-  into `<tools>`, `promptGuidelines` into `<rules>`.
-- **`codemode.mode: "only"`**, and any other hidden declaration: Pi leaves
-  hidden tools out of `<tools>` *and* `<rules>`, so codemode inlines the
-  description plus guidelines into its own tool description — a ~3k-token
-  catalog of every callable tool. Nothing is lost, but the rule then sits deep
-  in a tool listing instead of in the rules section.
-
-So the description opens with the trigger condition ("when the next step
-depends on a decision only the user can make…") rather than a mechanics
-sentence, and the guidelines carry the batching, multi-select, recommendation,
-and do-not-ask rules.
-
-If asking still drifts under `codemode.mode: "only"`, the remaining lever is a
-`before_agent_start` handler appending one bullet to `sections.rules`
-(precedent: the since-removed `pi-codemode-only` extension). Considered
-and deliberately not taken — revisit only with evidence that the wording alone
-is not enough.
+Under `codemode.mode: "only"`, and any other mode that hides a tool
+declaration, Pi leaves the tool out of `<tools>` *and* `<rules>`, so
+codemode inlines that sentence into its own tool catalog. Nothing is lost —
+there is no `promptSnippet`/`promptGuidelines` text to trail behind it.
 
 ## Install
 
@@ -145,9 +141,9 @@ imports.
 composition, the multi-select checklist loop (toggle row by row, submit from
 `✓ Done`), custom
 `Other` merging, cancellation recovery, and preservation across back-navigation, option identity and
-generated-row collision checks before UI, the 1–4 question limit,
-legacy arguments through the host validator, the freeform
-path (empty = `Unanswered`), dismiss semantics, mode guards,
+generated-row collision checks before UI, the required-`options` rule,
+rejection of the legacy single-question shape, partial answers on dismiss,
+mode guards,
 schema shape (plain JSON Schema, no TypeBox runtime symbols, still convertible
 to the strict subset so `strict: "prefer"` can engage), and spinner suppression
 (hide/restore on every path, one symmetric pair per dialog, fully skipped

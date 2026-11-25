@@ -23,15 +23,16 @@ The system SHALL preserve the current question's picked options and saved custom
 - **AND** no answer is submitted until the user explicitly confirms or cancels the checklist
 
 ### Requirement: Existing dismissal boundaries remain intact
-The system SHALL preserve dismissal behavior for option lists and purely open questions, and SHALL treat tool abortion as termination rather than a request to reopen a dialog.
+The system SHALL preserve dismissal behavior for option lists, SHALL keep answers already given in a multi-question call, and SHALL treat tool abortion as termination rather than a request to reopen a dialog.
 
 #### Scenario: Cancel an option list
 - **WHEN** the user cancels the single-select option list or multi-select checklist itself
-- **THEN** the system dismisses the interaction using the existing unanswered result
+- **THEN** the system dismisses the interaction, returning the answers already given and reporting the remaining questions as dismissed
+- **AND** when no question was answered, it returns the fixed unanswered result instead
 
-#### Scenario: Cancel a purely open question
-- **WHEN** the user cancels freeform input for a question that has no options
-- **THEN** the system dismisses the interaction using the existing unanswered result
+#### Scenario: Every question requires options
+- **WHEN** a question arrives without options, or with fewer than two
+- **THEN** the system returns an error before opening any dialog; freeform answers are reachable only through Other
 
 #### Scenario: Abort while Other input is open
 - **WHEN** the tool's abort signal fires while Other input is open

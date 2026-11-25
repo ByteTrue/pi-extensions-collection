@@ -99,8 +99,6 @@ describe("registration", () => {
   it("registers ask_user with a plain JSON schema for questions[] (no runtime TypeBox symbols)", () => {
     const tool = harness();
     expect(tool.name).toBe("ask_user");
-    expect(tool.promptSnippet).toBeTruthy();
-    expect((tool.promptGuidelines ?? []).length).toBeGreaterThan(0);
     const parameters = tool.parameters as {
       required?: string[];
       properties?: {
@@ -113,7 +111,7 @@ describe("registration", () => {
     expect(parameters.required).toEqual(["questions"]);
     const itemProps = parameters.properties?.questions?.items?.properties ?? {};
     expect(Object.keys(itemProps)).toEqual(["question", "options", "multiple"]);
-    expect(parameters.properties?.questions?.items?.required).toEqual(["question"]);
+    expect(parameters.properties?.questions?.items?.required).toEqual(["question", "options"]);
   });
 
   it("declares strict JSON-schema sampling like Pi's built-in tools", () => {
@@ -140,30 +138,36 @@ describe("registration", () => {
         questions: { items: { required?: string[]; additionalProperties?: unknown } };
       }
     ).questions.items;
-    expect(items.required).toEqual(["question"]);
+    expect(items.required).toEqual(["question", "options"]);
     expect(items.additionalProperties).toBeUndefined();
   });
 
-  it("normalizes legacy arguments before host schema validation", async () => {
+  it("rejects the legacy single-question shape instead of rewriting it", async () => {
     const tool = harness();
     const legacy = { question: "Runner?", options: [{ label: "vitest" }, { label: "jest" }] };
-    const params = validateToolArguments(tool, {
+    expect(tool.prepareArguments).toBeUndefined();
+    expect(() => validateToolArguments(tool, {
       type: "toolCall", id: "call", name: tool.name,
-      arguments: (tool.prepareArguments?.(legacy) ?? legacy) as ToolCall["arguments"],
-    });
-    const { ctx } = ctxWithRecorder({ select: "vitest" });
-    const result = await tool.execute("call", params, new AbortController().signal, () => {}, ctx) as AskUserToolResult;
-    expect(result.content).toEqual([{ type: "text", text: answeredText(["Runner?", ["vitest"]]) }]);
+      arguments: legacy as ToolCall["arguments"],
+    })).toThrow();
+    const { ctx, calls } = ctxWithRecorder({ select: "vitest" });
+    const result = await tool.execute("call", legacy, new AbortController().signal, () => {}, ctx) as AskUserToolResult;
+    expect(result.isError).toBe(true);
+    expect(calls).toEqual([]);
   });
 
-  it("enforces the documented batch size at the host boundary", () => {
+  it("requires 1+ questions with 2+ options each, and no upper bound", () => {
     const tool = harness();
-    for (const length of [0, 5]) {
-      expect(() => validateToolArguments(tool, {
-        type: "toolCall", id: "call", name: tool.name,
-        arguments: { questions: Array.from({ length }, () => ({ question: "Q?" })) },
-      })).toThrow();
-    }
+    const validate = (questions: unknown) => () => validateToolArguments(tool, {
+      type: "toolCall", id: "call", name: tool.name,
+      arguments: { questions } as ToolCall["arguments"],
+    });
+    expect(validate([])).toThrow();
+    expect(validate([{ question: "Q?", options: [{ label: "A" }] }])).toThrow();
+    expect(validate([{ question: "Q?", options: Array.from({ length: 9 }, (_, i) => ({ label: `o${i}` })) }])).toThrow();
+    expect(validate(Array.from({ length: 5 }, () => ({
+      question: "Q?", options: [{ label: "A" }, { label: "B" }],
+    })))).not.toThrow();
   });
 
   it("executes sequentially so one dialog cannot restore the spinner for another", () => {
@@ -185,7 +189,7 @@ describe("registration", () => {
     };
     const pending = tool.execute(
       "call",
-      { questions: [{ question: "Runner?", options: [{ label: "vitest" }] }] },
+      { questions: [{ question: "Runner?", options: [{ label: "vitest" }, { label: "jest" }] }] },
       controller.signal,
       () => {},
       ctx,
@@ -204,21 +208,14 @@ describe("registration", () => {
     }
   });
 
-  it("leads with the trigger condition and includes batching + multi-select + do-not-ask rules", () => {
+  it("keeps the tool description to one sentence and ships no prompt guidance", () => {
     const tool = harness();
-    expect(
-      tool.description.startsWith("When the next step depends on a decision only the user can make"),
-    ).toBe(true);
-    expect(tool.description).toContain("instead of ending your turn with a prose question");
-    expect(tool.description).toContain("multiple: true");
-    expect(tool.promptGuidelines).toContain(
-      "Prefer ask_user over a prose question whenever your turn would otherwise end with a question only the user can answer",
+    expect(tool.description).toBe(
+      "Ask the user structured questions, each with options; the user can also type their own answer. Use it for genuine preference calls the user must make.",
     );
-    expect(tool.promptGuidelines?.some((g) => g.includes("Batch 2-4 independent questions"))).toBe(
-      true,
-    );
-    expect(tool.promptGuidelines?.some((g) => g.includes("multiple: true"))).toBe(true);
-    expect(tool.promptGuidelines?.some((g) => g.includes("Never ask what the context"))).toBe(true);
+    expect(tool.description).not.toMatch(/\d+-\d+/);
+    expect(tool.promptSnippet).toBeUndefined();
+    expect(tool.promptGuidelines).toBeUndefined();
   });
 });
 
@@ -245,16 +242,34 @@ describe("askUserExecute — single-select option questions", () => {
     expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["vitest"]]));
   });
 
-  it("accepts legacy top-level { question, options } parameters", async () => {
-    const { ctx } = ctxWithRecorder({ select: "jest" });
-    const result = (await askUserExecute(
+  it("appends the Other row after every option, however many there are", async () => {
+    const options = Array.from({ length: 8 }, (_, i) => ({ label: `option ${i + 1}` }));
+    const { ctx, calls } = ctxWithRecorder({ select: "option 8" });
+    const result = (await askUserExecute({ questions: [{ question: "Pick?", options }] }, ctx)) as {
+      content: { text: string }[];
+    };
+    const rows = calls[0]!.args[1] as string[];
+    expect(rows).toEqual([...options.map((o) => o.label), "Other (type your answer)"]);
+    expect(result.content[0]!.text).toBe(answeredText(["Pick?", ["option 8"]]));
+  });
+
+  it("keeps the Other row directly below the options when a Back row follows it", async () => {
+    const { ctx, calls } = ctxWithRecorder({ select: ["A", "← Back to previous question", "A"] });
+    await askUserExecute(
       {
-        question: "Which test runner?",
-        options: [{ label: "vitest" }, { label: "jest" }],
+        questions: [
+          { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+          { question: "Second?", options: [{ label: "C" }, { label: "D" }] },
+        ],
       },
       ctx,
-    )) as { content: { text: string }[] };
-    expect(result.content[0]!.text).toBe(answeredText(["Which test runner?", ["jest"]]));
+    );
+    expect(calls[1]!.args[1]).toEqual([
+      "C",
+      "D",
+      "Other (type your answer)",
+      "← Back to previous question",
+    ]);
   });
 
   it("routes the Other row to the freeform path", async () => {
@@ -546,59 +561,38 @@ describe("askUserExecute — batch questions and back-navigation", () => {
     );
   });
 
-  it("supports going back from an open Q2 to Q1", async () => {
-    const { ctx } = ctxWithRecorder({
-      select: [
-        "Node", // Q1
-        "← Back to previous question", // Q2 -> back to Q1
-        "Bun", // Q1 revised
-        "Other (type your answer)", // Q2 -> open editor
-      ],
-      editor: "custom-pkg",
-    });
-
+  it("keeps the answers already given when a later question is dismissed", async () => {
+    const { ctx } = ctxWithRecorder({ select: ["Bun", undefined] });
     const result = (await askUserExecute(
       {
         questions: [
           { question: "Runtime?", options: [{ label: "Node" }, { label: "Bun" }] },
-          { question: "Package name?" },
+          { question: "Package name?", options: [{ label: "core" }, { label: "plugin" }] },
         ],
       },
       ctx,
     )) as { content: { text: string }[] };
-
     expect(result.content[0]!.text).toBe(
-      answeredText(["Runtime?", ["Bun"]], ["Package name?", ["custom-pkg"]]),
+      `User has answered your questions: "Runtime?"="Bun". The user dismissed the remaining questions without answering.`,
     );
   });
 });
 
-describe("askUserExecute — open questions", () => {
-  it("uses the multiline editor in TUI mode", async () => {
-    const { ctx, calls } = ctxWithRecorder({ editor: "  do both, see notes  " });
-    const result = (await askUserExecute(
-      { questions: [{ question: "Anything to add?" }] },
+describe("askUserExecute — options are required", () => {
+  it.each([
+    { name: "no options at all", options: undefined },
+    { name: "a single option", options: [{ label: "only" }] },
+    { name: "labels that are all blank", options: [{ label: "  " }, { label: "" }] },
+    { name: "nine options", options: Array.from({ length: 9 }, (_, i) => ({ label: `o${i}` })) },
+  ])("rejects a question with $name before opening a dialog", async ({ options }) => {
+    const { ctx, calls } = ctxWithRecorder({ editor: "freeform" });
+    const result = await askUserExecute(
+      { questions: [{ question: "Q?", options } as never] },
       ctx,
-    )) as { content: { text: string }[] };
-    expect(calls.map((c) => c.method)).toEqual(["editor"]);
-    expect(result.content[0]!.text).toBe(answeredText(["Anything to add?", ["do both, see notes"]]));
-  });
-
-  it("uses the input dialog in RPC mode", async () => {
-    const { ctx, calls } = ctxWithRecorder({ input: "rpc answer" }, { mode: "rpc" });
-    const result = (await askUserExecute({ questions: [{ question: "Q?" }] }, ctx)) as {
-      content: { text: string }[];
-    };
-    expect(calls.map((c) => c.method)).toEqual(["input"]);
-    expect(result.content[0]!.text).toBe(answeredText(["Q?", ["rpc answer"]]));
-  });
-
-  it("records an empty freeform answer as Unanswered", async () => {
-    const { ctx } = ctxWithRecorder({ editor: "   " });
-    const result = (await askUserExecute({ questions: [{ question: "Q?" }] }, ctx)) as {
-      content: { text: string }[];
-    };
-    expect(result.content[0]!.text).toBe(answeredText(["Q?", []]));
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("needs 2-8 options");
+    expect(calls).toEqual([]);
   });
 });
 
@@ -611,7 +605,7 @@ describe.each([false, true])("askUserExecute — option identity (multiple=%s)",
   ])("rejects $name across the full batch before opening UI", async ({ options }) => {
     const { ctx, calls, working } = ctxWithRecorder({ select: "OK" });
     const result = await askUserExecute({ questions: [
-      { question: "First?", options: [{ label: "OK" }] },
+      { question: "First?", options: [{ label: "OK" }, { label: "Fine" }] },
       { question: "Second?", options, multiple },
     ] }, ctx);
     expect(result.isError).toBe(true);
@@ -628,18 +622,11 @@ describe.each([false, true])("askUserExecute — option identity (multiple=%s)",
   ])("rejects reserved label %s even with a description", async (label) => {
     const { ctx, calls } = ctxWithRecorder({});
     const result = await askUserExecute({ questions: [{
-      question: "Pick?", options: [{ label: ` ${label} `, description: "different description" }], multiple,
+      question: "Pick?", options: [{ label: ` ${label} `, description: "different description" }, { label: "Safe" }], multiple,
     }] }, ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toContain("generated Other/Back/Done row");
     expect(result.content[0]!.text).toContain("Rename");
-    expect(calls).toEqual([]);
-  });
-
-  it("validates legacy top-level options too", async () => {
-    const { ctx, calls } = ctxWithRecorder({});
-    const result = await askUserExecute({ question: "Pick?", options: [{ label: "A" }, { label: "A" }], multiple }, ctx);
-    expect(result.isError).toBe(true);
     expect(calls).toEqual([]);
   });
 
@@ -671,7 +658,7 @@ describe("askUserExecute — checklist row identity", () => {
   it.each(["Other: custom", "[ ] Other: custom", "[✓] Other: custom"])("rejects collisions with a future custom Other row: %s", async (label) => {
     const { ctx, calls } = ctxWithRecorder({});
     const result = await askUserExecute({ questions: [{
-      question: "Pick?", options: [{ label }], multiple: true,
+      question: "Pick?", options: [{ label }, { label: "B" }], multiple: true,
     }] }, ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0]!.text).toContain("generated Other/Back/Done row");
@@ -682,7 +669,10 @@ describe("askUserExecute — checklist row identity", () => {
 describe("askUserExecute — guard rails", () => {
   it("fails explicitly when no dialog-capable UI exists", async () => {
     const { ctx } = ctxWithRecorder({}, { hasUI: false });
-    const result = (await askUserExecute({ questions: [{ question: "Q?" }] }, ctx)) as {
+    const result = (await askUserExecute(
+      { questions: [{ question: "Q?", options: [{ label: "A" }, { label: "B" }] }] },
+      ctx,
+    )) as {
       content: { text: string }[];
       isError?: boolean;
     };
@@ -695,17 +685,10 @@ describe("askUserExecute — guard rails", () => {
     const emptyArr = (await askUserExecute({ questions: [] }, ctx)) as { isError?: boolean };
     expect(emptyArr.isError).toBe(true);
 
-    const blankQ = (await askUserExecute({ questions: [{ question: "  " }] }, ctx)) as {
+    const blankQ = (await askUserExecute({ questions: [{ question: "  ", options: [] }] }, ctx)) as {
       isError?: boolean;
     };
     expect(blankQ.isError).toBe(true);
-  });
-
-  it("rejects more than four questions before opening a dialog", async () => {
-    const { ctx, calls } = ctxWithRecorder({ editor: "answer" });
-    const result = await askUserExecute({ questions: Array.from({ length: 5 }, () => ({ question: "Q?" })) }, ctx);
-    expect(result.isError).toBe(true);
-    expect(calls).toHaveLength(0);
   });
 
   it("does not open the TUI editor when abort follows an Other selection", async () => {
@@ -721,24 +704,18 @@ describe("askUserExecute — guard rails", () => {
   });
 
   it("ignores a freeform answer submitted after the run was aborted", async () => {
-    const { ctx } = ctxWithRecorder({});
+    const { ctx } = ctxWithRecorder({ select: "Other (type your answer)" });
     const controller = new AbortController();
     ctx.ui.editor = async () => {
       controller.abort();
       return "late answer";
     };
-    const result = await askUserExecute({ questions: [{ question: "Q?" }] }, ctx, controller.signal);
-    expect(result.content[0]!.text).toContain("dismissed");
-  });
-
-  it("falls back to freeform when every option label is blank", async () => {
-    const { ctx, calls } = ctxWithRecorder({ editor: "freeform" });
-    const result = (await askUserExecute(
-      { questions: [{ question: "Q?", options: [{ label: "  " }, { label: "" }] }] },
+    const result = await askUserExecute(
+      { questions: [{ question: "Q?", options: [{ label: "A" }, { label: "B" }] }] },
       ctx,
-    )) as { content: { text: string }[] };
-    expect(calls.map((c) => c.method)).toEqual(["editor"]);
-    expect(result.content[0]!.text).toBe(answeredText(["Q?", ["freeform"]]));
+      controller.signal,
+    );
+    expect(result.content[0]!.text).toContain("dismissed");
   });
 });
 
@@ -765,12 +742,15 @@ describe("askUserExecute — working spinner suppression", () => {
   });
 
   it("hides the spinner around a freeform answer too", async () => {
-    const { ctx, working } = ctxWithRecorder({ editor: "both" });
-    const result = (await askUserExecute({ questions: [{ question: "Notes?" }] }, ctx)) as {
+    const { ctx, working } = ctxWithRecorder({ select: "Other (type your answer)", editor: "both" });
+    const result = (await askUserExecute(
+      { questions: [{ question: "Notes?", options: [{ label: "A" }, { label: "B" }] }] },
+      ctx,
+    )) as {
       content: { text: string }[];
     };
     expect(result.content[0]!.text).toBe(answeredText(["Notes?", ["both"]]));
-    expect(working).toEqual([false, true]);
+    expect(working).toEqual([false, true, false, true]);
   });
 
   it("still restores the spinner when the user dismisses the dialog", async () => {
@@ -802,9 +782,12 @@ describe("askUserExecute — working spinner suppression", () => {
     await askUserExecute(optionParams, select.ctx);
     expect(select.working).toEqual([]);
 
-    const freeform = ctxWithRecorder({ input: "rpc answer" }, { mode: "rpc" });
-    await askUserExecute({ questions: [{ question: "Q?" }] }, freeform.ctx);
-    expect(freeform.working).toEqual([]);
+    const other = ctxWithRecorder({ select: "Other (type your answer)", input: "rpc answer" }, { mode: "rpc" });
+    await askUserExecute(
+      { questions: [{ question: "Q?", options: [{ label: "A" }, { label: "B" }] }] },
+      other.ctx,
+    );
+    expect(other.working).toEqual([]);
   });
 
   it("restores the spinner when the dialog throws, and still propagates the error", async () => {

@@ -8,26 +8,25 @@
  *
  * Why it exists: without it the model's questions arrive as free-form prose in
  * a different shape every session, and the user answers by typing
- * "第一个…第二个…" by hand. One tool with a fixed schema plus promptGuidelines
- * makes the question format stable, and the built-in ctx.ui.select/input/
+ * "第一个…第二个…" by hand. One tool with a fixed schema makes the
+ * question format stable, and the built-in ctx.ui.select/input/
  * editor dialogs turn each answer into arrow keys + Enter across both TUI and
  * RPC (BySpace) modes.
  *
- * Surface: one ask_user tool taking `questions` (1–4 items, each with
- * `question`, optional `options [{label, description?}]`, and optional
- * `multiple: boolean`). Built-in dialogs only:
+ * Surface: one ask_user tool taking `questions`, each with `question`, a
+ * required `options [{label, description?}]` list of at least two entries, and
+ * optional `multiple: boolean`. Built-in dialogs only:
  * - Single-select question: `ctx.ui.select` with an always-appended
- *   "Other (type your answer)" row.
+ *   "Other (type your answer)" row (TUI: multiline editor, elsewhere: input).
  * - Multi-select question (`multiple: true`): `ctx.ui.select` loop toggling
  *   `[✓]` / `[ ]` per option, merging custom `Other` text into the checklist,
  *   and confirming with `✓ Done (N selected)`.
  * - Multi-question flow (`questions.length > 1`): step 2..N includes a
  *   "← Back to previous question" row so the user can return and revise
  *   earlier answers before finishing.
- * - Open question (no options): `ctx.ui.editor` in TUI mode (multiline) and
- *   `ctx.ui.input` elsewhere.
- * - Dismiss (Esc): returns a fixed non-error text so the model falls back to
- *   plain prose; no UI (print/JSON mode) is an explicit error.
+ * - Dismiss (Esc): keeps the answers already given and reports only the rest as
+ *   dismissed, so a half-finished batch survives; no UI (print/JSON mode) is an
+ *   explicit error.
  *
  * Every dialog runs with the animated working spinner hidden (see
  * `withoutWorkingSpinner`): a dialog can sit unanswered for an hour, and Pi's
@@ -48,16 +47,12 @@ export interface AskUserOption {
 
 export interface AskUserQuestion {
   question: string;
-  options?: AskUserOption[];
+  options: AskUserOption[];
   multiple?: boolean;
 }
 
 export interface AskUserParams {
-  questions?: AskUserQuestion[];
-  /** Legacy single-question fallback accepted at runtime. */
-  question?: string;
-  options?: AskUserOption[];
-  multiple?: boolean;
+  questions: AskUserQuestion[];
 }
 
 export interface AskUserToolResult {
@@ -87,9 +82,8 @@ const askUserParameters = {
     questions: {
       type: "array",
       minItems: 1,
-      maxItems: 4,
       description:
-        "1-4 decision or clarification questions. Pass 1 item for a single question, or 2-4 items to batch independent decisions in one call.",
+        "Decision or clarification questions. Pass 1 item for a single question, or several to batch independent decisions in one call.",
       items: {
         type: "object",
         properties: {
@@ -99,8 +93,10 @@ const askUserParameters = {
           },
           options: {
             type: "array",
+            minItems: 2,
+            maxItems: 8,
             description:
-              "2-4 concrete answer choices, each {label, description?}. Labels are 1-5 words; description is one line explaining the consequence. Omit for an open question (the user types a free-form answer).",
+              "2-8 concrete answer choices, each {label, description?}. Labels are 1-5 words; description is one line explaining the consequence.",
             items: {
               type: "object",
               properties: {
@@ -122,7 +118,7 @@ const askUserParameters = {
               "Set true when the user can select more than one option for this question (multi-select).",
           },
         },
-        required: ["question"],
+        required: ["question", "options"],
       },
     },
   },
@@ -136,10 +132,6 @@ function errorResult(text: string): AskUserToolResult {
 /** Fixed dismiss text: the model should fall back to prose, not re-ask. */
 const DISMISSED =
   "User dismissed the question without answering. Do not immediately re-ask; continue in plain prose or drop the question.";
-
-function dismissedResult(): AskUserToolResult {
-  return { content: [{ type: "text", text: DISMISSED }] };
-}
 
 function normalizeOptions(raw?: AskUserOption[]): AskUserOption[] {
   return (raw ?? [])
@@ -177,44 +169,25 @@ function optionIdentityError(questions: NormalizedQuestion[]): string | undefine
 function normalizeQuestions(
   params: AskUserParams,
 ): { questions: NormalizedQuestion[] } | { error: string } {
-  if (Array.isArray(params?.questions)) {
-    if (params.questions.length === 0 || params.questions.length > 4) {
-      return { error: "ask_user requires 1-4 items in the 'questions' array." };
-    }
-    const normalized: NormalizedQuestion[] = [];
-    for (const item of params.questions) {
-      const question = (item?.question ?? "").trim();
-      if (!question) {
-        return { error: "ask_user requires a non-empty 'question' for every item." };
-      }
-      const options = normalizeOptions(item?.options);
-      normalized.push({
-        question,
-        options,
-        multiple: Boolean(item?.multiple) && options.length > 0,
-      });
-    }
-    return { questions: normalized };
+  const raw = params?.questions;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { error: "ask_user requires a non-empty 'questions' array." };
   }
-
-  if (typeof params?.question === "string") {
-    const question = params.question.trim();
+  const normalized: NormalizedQuestion[] = [];
+  for (const [index, item] of raw.entries()) {
+    const question = (item?.question ?? "").trim();
     if (!question) {
-      return { error: "ask_user requires a non-empty 'question'." };
+      return { error: "ask_user requires a non-empty 'question' for every item." };
     }
-    const options = normalizeOptions(params.options);
-    return {
-      questions: [
-        {
-          question,
-          options,
-          multiple: Boolean(params.multiple) && options.length > 0,
-        },
-      ],
-    };
+    const options = normalizeOptions(item?.options);
+    if (options.length < 2 || options.length > 8) {
+      return {
+        error: `ask_user question ${index + 1} needs 2-8 options (got ${options.length}); the user can always type their own answer in the "${OTHER_LABEL}" row.`,
+      };
+    }
+    normalized.push({ question, options, multiple: Boolean(item?.multiple) });
   }
-
-  return { error: "ask_user requires a non-empty 'questions' array." };
+  return { questions: normalized };
 }
 
 /**
@@ -361,14 +334,25 @@ async function multiSelectDialog(
   }
 }
 
-function formatAnswers(questions: NormalizedQuestion[], states: QuestionState[]): string {
+/** `answered` is how many questions got a dialog result; the rest were dismissed. */
+function formatAnswers(
+  questions: NormalizedQuestion[],
+  states: QuestionState[],
+  answered: number,
+): string {
+  if (answered === 0) return DISMISSED;
   const formatted = questions
+    .slice(0, answered)
     .map((question, index) => {
       const answers = states[index]?.answers ?? [];
       return `"${question.question}"="${answers.length ? answers.join(", ") : "Unanswered"}"`;
     })
     .join(", ");
-  return `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`;
+  const status =
+    answered === questions.length
+      ? "You can now continue with the user's answers in mind."
+      : "The user dismissed the remaining questions without answering.";
+  return `User has answered your questions: ${formatted}. ${status}`;
 }
 
 function formatQuestionTitle(
@@ -421,39 +405,7 @@ export async function askUserExecute(
     const state = states[index]!;
     const title = formatQuestionTitle(q, index, questions.length, state);
 
-    // 1. Open question (no options)
-    if (q.options.length === 0) {
-      if (index === 0) {
-        const text = await collectFreeform(title, ctx, state.customText, signal);
-        if (text === undefined) return dismissedResult();
-        state.customText = text || undefined;
-        state.answers = text ? [text] : [];
-        index += 1;
-        continue;
-      }
-
-      const keepRow = state.customText ? `✓ Keep answer: ${state.customText}` : undefined;
-      const openRows = [...(keepRow ? [keepRow] : []), OTHER_LABEL, BACK_LABEL];
-      const selected = await selectDialog(ctx, title, openRows, signal);
-      if (selected === undefined) return dismissedResult();
-      if (selected === BACK_LABEL) {
-        index -= 1;
-        continue;
-      }
-      if (keepRow && selected === keepRow && state.customText) {
-        state.answers = [state.customText];
-        index += 1;
-        continue;
-      }
-      const text = await collectFreeform(title, ctx, state.customText, signal);
-      if (text === undefined) return dismissedResult();
-      state.customText = text || undefined;
-      state.answers = text ? [text] : [];
-      index += 1;
-      continue;
-    }
-
-    // 2. Multi-select question: toggle the whole set, then submit once.
+    // 1. Multi-select question: toggle the whole set, then submit once.
     if (q.multiple) {
       const outcome = await multiSelectDialog(
         ctx,
@@ -463,7 +415,7 @@ export async function askUserExecute(
         index > 0,
         signal,
       );
-      if (!outcome) return dismissedResult();
+      if (!outcome) break;
       if (outcome.kind === "back") {
         index -= 1;
         continue;
@@ -480,16 +432,14 @@ export async function askUserExecute(
       continue;
     }
 
-    // 3. Single-select question
+    // 2. Single-select question
     const optionRows = q.options.map((option) =>
       option.description ? `${option.label} — ${option.description}` : option.label,
     );
     const rows = [...optionRows, OTHER_LABEL, ...(index > 0 ? [BACK_LABEL] : [])];
 
     const selected = await selectDialog(ctx, title, rows, signal);
-    if (selected === undefined) {
-      return dismissedResult();
-    }
+    if (selected === undefined) break;
     if (index > 0 && selected === BACK_LABEL) {
       index -= 1;
       continue;
@@ -497,7 +447,7 @@ export async function askUserExecute(
     if (selected === OTHER_LABEL) {
       const text = await collectFreeform(title, ctx, state.customText, signal);
       if (text === undefined) {
-        if (signal?.aborted) return dismissedResult();
+        if (signal?.aborted) break;
         continue;
       }
       state.customText = text || undefined;
@@ -515,7 +465,7 @@ export async function askUserExecute(
   }
 
   return {
-    content: [{ type: "text", text: formatAnswers(questions, states) }],
+    content: [{ type: "text", text: formatAnswers(questions, states, index) }],
   };
 }
 
@@ -524,24 +474,8 @@ export default function askUserExtension(pi: ExtensionAPI): void {
     name: "ask_user",
     label: "Ask user",
     description:
-      "When the next step depends on a decision only the user can make, ask it here instead of ending your turn with a prose question — the user answers by picking options and can go back to revise earlier answers in a multi-question flow. Pass 1-4 items in questions: batch independent decisions into one call, and ask a single question first only when later questions depend on its answer. For each question, pass 2-4 options when choices can be enumerated, set multiple: true when several options can be chosen together, or omit options for a genuinely open question.\n\nUsage notes:\n- An \"Other (type your answer)\" row is always appended; do not include a separate free-form option.\n- Multi-select questions toggle rows and submit from the \"✓ Done (N selected)\" row; nothing submits on its own.\n- With 2+ questions, questions 2..N offer a \"← Back to previous question\" row so the user can revise an earlier answer.\n- A dismissed dialog means no answer — fall back to plain prose once and do not re-ask.",
-    promptSnippet:
-      "Ask the user 1-4 single- or multi-select decision questions — they pick options instead of typing.",
-    promptGuidelines: [
-      "Prefer ask_user over a prose question whenever your turn would otherwise end with a question only the user can answer",
-      "Batch 2-4 independent questions into one ask_user call; ask a single question first only when the next question depends on its answer",
-      "Set multiple: true when the user can pick more than one option; put your recommended option first and append '(Recommended)' to its label",
-      "Do not add a free-form option: an 'Other (type your answer)' row is appended automatically",
-      "Never ask what the context, the repo, or this session already answered — ask in prose only when you have no options to offer",
-    ],
+      "Ask the user structured questions, each with options; the user can also type their own answer. Use it for genuine preference calls the user must make.",
     parameters: askUserParameters as unknown as TSchema,
-    prepareArguments(args) {
-      const input = args as AskUserParams | null;
-      if (input && input.questions === undefined && typeof input.question === "string") {
-        return { questions: [{ question: input.question, options: input.options, multiple: input.multiple }] };
-      }
-      return args;
-    },
     // Same declaration as Pi's built-in read/bash/edit/write tools. With strict
     // JSON-schema sampling the provider itself constrains the argument text to a
     // valid object, so the whole class of "Invalid arguments: ... after JSON"

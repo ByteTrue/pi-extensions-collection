@@ -46,7 +46,7 @@ entry in `~/.pi/agent/settings.json`, for example
 | --- | --- |
 | [`background-terminal`](./background-terminal/) | `background_run` / `background_status` / `background_kill` tools plus the `/background` menu: pure-background execution whose exit wakes the agent with a `<shell>` notice; no lifetime by default, killed at session exit. Built-in `bash`/`powershell` stay untouched |
 | [`bash-timeout`](./bash-timeout/) | Optional 120s default timeout for the built-in `bash`/`powershell` tools; explicit `timeout: 0` disables it and larger values are honored (one event hook; registers no tools) |
-| [`ask-user`](./ask-user/) | `ask_user` tool: 1–4 single- or multi-select decision questions per call, with a row-by-row multiselect checklist and back-navigation |
+| [`ask-user`](./ask-user/) | `ask_user` tool: single- or multi-select decision questions (required options), with a row-by-row multiselect checklist and back-navigation |
 | [`goal`](./goal/) | `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until `goal_done` with evidence; untrusted-objective wrapper, 50-round and 3-stall guards, background-work wait, restart pause |
 | [`subagent`](./subagent/) | `subagent` / `subagent_status` / `subagent_stop` plus the `/subagent` menu: isolated child sessions whose `<subagent>` result arrives as a new message; `agent` and `description` required, live progress, budget guards, opencode's built-in subagent roles `general` and `explore` |
 
