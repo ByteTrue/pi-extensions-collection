@@ -18,7 +18,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        pi: [locked, "1.5.0"]
+        pi: [locked, "1.5.0", "1.7.0"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5

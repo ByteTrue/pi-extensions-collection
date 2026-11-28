@@ -9,7 +9,8 @@
     "background-terminal",
     "bash-timeout",
     "goal",
-    "subagent"
+    "subagent",
+    "tool-groups"
   ],
   "pi": {
     "extensions": [
@@ -17,7 +18,8 @@
       "./background-terminal/background-terminal.ts",
       "./bash-timeout/bash-timeout.ts",
       "./goal/goal.ts",
-      "./subagent/subagent.ts"
+      "./subagent/subagent.ts",
+      "./tool-groups/tool-groups.ts"
     ]
   },
   "scripts": {
