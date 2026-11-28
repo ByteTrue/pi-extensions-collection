@@ -27,7 +27,11 @@ jobs:
         with:
           cache: npm
       # npm 10 crashes in Arborist when overriding workspace peers on Windows.
-      - run: npm install --global npm@11.21.3
+      - name: Use npm 11 for workspace peer overrides
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/npm11" --no-save npm@11.21.3
+          node -e "require('node:fs').appendFileSync(process.env.GITHUB_PATH, require('node:path').join(process.env.RUNNER_TEMP, 'npm11', 'node_modules', '.bin') + require('node:os').EOL)"
       # Distribution gate: every extension directory has an entry in the root pi manifest.
       - run: node scripts/check-manifest.mjs
       - run: npm ci
