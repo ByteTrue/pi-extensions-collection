@@ -74,10 +74,9 @@ checkout's `node_modules`.
 root `pi` manifest, or when an entry is not a file inside its extension directory. CI runs it
 first, because a missing entry is silent: the extension never loads.
 
-## Design notes
+## Development workflow
 
-The rules this repo lives by — one git package, no npm publishing, no build step,
-dependencies installed by Pi, tool names globally unique, what has already been ruled
-out — are in [`bywork/memory/`](./bywork/memory), one file per topic. The previous
-workflow's records (spec, decisions, epics, probe notes) are archived read-only in
-[`archive/byissue/`](./archive/byissue).
+Repository conventions and agent guidance start in [`AGENTS.md`](./AGENTS.md).
+Specs and tasks live in GitHub Issues; see the [issue tracker conventions](./docs/agents/issue-tracker.md).
+Domain terms are defined in [`GLOSSARY.md`](./GLOSSARY.md). Historical records from
+the earlier workflow remain in [`archive/byissue/`](./archive/byissue).
