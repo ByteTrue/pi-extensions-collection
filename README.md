@@ -78,5 +78,4 @@ first, because a missing entry is silent: the extension never loads.
 
 Repository conventions and agent guidance start in [`AGENTS.md`](./AGENTS.md).
 Specs and tasks live in GitHub Issues; see the [issue tracker conventions](./docs/agents/issue-tracker.md).
-Domain terms are defined in [`GLOSSARY.md`](./GLOSSARY.md). Historical records from
-the earlier workflow remain in [`archive/byissue/`](./archive/byissue).
+Domain terms are defined in [`GLOSSARY.md`](./GLOSSARY.md).
