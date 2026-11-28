@@ -1,6 +1,6 @@
 # Tool groups
 
-Folds consecutive current-session tool calls into one summary, closed by default:
+Folds consecutive displayed-context tool calls into one summary, closed by default. History follows Pi's active branch and compaction, while live events remain visible until persisted:
 
 ```text
 ▸ read: 2 succeeded · bash: 1 running, 1 failed
@@ -13,6 +13,7 @@ counts, never the open/closed choice. A single call is also a group.
 ## Controls
 
 - **Alt+O** toggles the latest group.
+- **/tool-groups** opens a newest-first selector; arrows navigate, Enter toggles the selected group and closes the selector, and Escape cancels. Empty or non-TUI contexts do nothing.
 - **Ctrl+O** (Pi’s global tool-expansion action) opens or closes all groups.
 - In **fullscreen mode**, left-click a summary to toggle just that group.
 - Within an open group, native tool rows keep their own click-to-expand behavior.
@@ -23,6 +24,13 @@ renderer definition unchanged, including missing/throwing renderer fallbacks.
 Native argument streaming, partial results, error rendering, padding, renderer
 state, and invalidation are preserved. This extension does not execute tools or
 change messages. RPC, JSON, and print mode retain the original renderers.
+
+## Native terminal verification
+
+- Resume a session with persisted adjacent tool calls and confirm summaries follow the active compacted context.
+- Navigate to another tree branch while a live call is unpersisted; confirm the old summary and picker choice do not survive.
+- Open `/tool-groups` in regular scrollback with more groups than terminal rows, use arrows and Enter, then reopen and use Escape; keep the selected row visible.
+- Start a tool call and open the picker before its result is persisted; confirm it is listed once and updates in place.
 
 ## Install and develop
 
@@ -37,9 +45,8 @@ npm run typecheck -w tool-groups
 
 ## Current limits
 
-- Only calls observed since the current session start are grouped. History replay,
-  a `/tool-groups` picker, and advanced session navigation belong to follow-up #4.
-- Counts are top-level tools only; nested codemode aggregation belongs to #3.
+- Groups follow the active displayed branch; hidden/compacted calls are not reconstructed.
+- Persisted nested-call metadata is included in its parent group when available; nested results are not recorded by Pi. Live nested activity and nested codemode aggregation remain outside this extension (#3).
 - Pi still owns image output: images can remain visible while a group is closed
   and may appear twice when opened. No private host internals are used to hide them.
 - A renderer resolver loaded before this one that does not call `next()` can

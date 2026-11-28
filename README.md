@@ -49,7 +49,7 @@ entry in `~/.pi/agent/settings.json`, for example
 | [`ask-user`](./ask-user/) | `ask_user` tool: single- or multi-select decision questions (required options), with a row-by-row multiselect checklist and back-navigation |
 | [`goal`](./goal/) | `/goal`: one durable objective per session, continued automatically at Pi's settle boundary until `goal_done` with evidence; untrusted-objective wrapper, 50-round and 3-stall guards, background-work wait, restart pause |
 | [`subagent`](./subagent/) | `subagent` / `subagent_status` / `subagent_stop` plus the `/subagent` menu: isolated child sessions whose `<subagent>` result arrives as a new message; `agent` and `description` required, live progress, budget guards, opencode's built-in subagent roles `general` and `explore` |
-| [`tool-groups`](./tool-groups/) | Folds adjacent tool calls into per-name outcome summaries; `Alt+O` toggles the latest group, and `Ctrl+O` retains Pi's global expand/collapse behavior |
+| [`tool-groups`](./tool-groups/) | Replays displayed tool history and folds adjacent calls into outcome summaries; `/tool-groups` picks a historical group, `Alt+O` toggles the latest group, and `Ctrl+O` retains Pi's global expand/collapse behavior |
 
 ## Development
 

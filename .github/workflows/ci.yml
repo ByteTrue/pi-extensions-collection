@@ -58,7 +58,7 @@ jobs:
               'ask_user', 'background_kill', 'background_run', 'background_status',
               'goal_done', 'subagent', 'subagent_status', 'subagent_stop',
             ]);
-            assert.deepEqual(extensions.flatMap(e => [...e.commands.keys()]).sort(), ['background', 'goal', 'subagent']);
+            assert.deepEqual(extensions.flatMap(e => [...e.commands.keys()]).sort(), ['background', 'goal', 'subagent', 'tool-groups']);
             console.log(version + ': loaded ' + extensions.length + ' extensions');
           } finally {
             rmSync(scratch, { recursive: true, force: true });
