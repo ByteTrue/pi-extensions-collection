@@ -39,7 +39,16 @@ npm run typecheck -w tool-groups
 
 - Only calls observed since the current session start are grouped. History replay,
   a `/tool-groups` picker, and advanced session navigation belong to follow-up #4.
-- Counts are top-level tools only; nested codemode aggregation belongs to #3.
+- Codemode summaries use Pi's structured nested-call lifecycle and persisted metadata.
+  Reported internal calls replace the codemode wrapper count; tools without nested
+  calls keep the wrapper count. Pi bounds persisted metadata to 256 calls, 8 KiB
+  of arguments per call, and 32 KiB total argument data. Calls or arguments may
+  be omitted, and unfinished calls remain unfinished, so summaries marked
+  `incomplete` count only reported calls and are not totals. The extension does
+  not infer calls from codemode output text. Hosts or tools that do not report
+  structured nested-call metadata retain wrapper counts. Live events can report
+  more calls than the persisted cap; known calls remain counted, with the
+  incomplete marker retained when Pi marks its record incomplete.
 - Pi still owns image output: images can remain visible while a group is closed
   and may appear twice when opened. No private host internals are used to hide them.
 - A renderer resolver loaded before this one that does not call `next()` can
