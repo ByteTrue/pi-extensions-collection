@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  initTheme, ToolExecutionComponent, createReadToolDefinition, createBashToolDefinition,
+  initTheme, ToolExecutionComponent, createReadToolDefinition, createBashToolDefinition, SessionManager,
   type ExtensionAPI, type ExtensionContext, type ExtensionEvent,
   type ToolRendererResolver, type ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Text, ProcessTerminal, TuiMainScreen, TuiAltScreen, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, Text, ProcessTerminal, type Component, TuiMainScreen, TuiAltScreen, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import toolGroups from "./tool-groups.js";
 
 initTheme("dark", false);
@@ -17,12 +17,28 @@ function harness(fullscreen = false, mode: "tui" | "rpc" = "tui") {
   const handlers = new Map<string, (event: ExtensionEvent, ctx: ExtensionContext) => unknown>();
   const shortcuts = new Map<string, { handler: (ctx: ExtensionContext) => unknown }>();
   const resolvers: ToolRendererResolver[] = [];
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+  let session = SessionManager.inMemory();
+  let choices: string[] = [];
+  let selection: (component: Component) => Promise<void> = async component => { component.handleInput?.("\x1b"); };
+  let selector: Component | undefined;
+  const notices: string[] = [];
   const downstream: ToolRendererResolver = (name, next) => name === "downstream-only" ? { renderCall: () => new Text("downstream", 0, 0) } : next();
   let expanded = false;
   const widgets = new Map<string, unknown>();
   const ctx = {
-    mode, hasUI: true, cwd: process.cwd(),
+    mode, hasUI: mode === "tui", cwd: process.cwd(),
+    sessionManager: { buildContextEntries: () => session.buildContextEntries() },
     ui: {
+      custom: async (factory: Parameters<ExtensionContext["ui"]["custom"]>[0]) => {
+        let finish!: (value: unknown) => void;
+        const result = new Promise(resolve => { finish = resolve; });
+        selector = await factory(tui, {} as never, {} as never, finish);
+        choices = plain(selector.render(1000)).slice(1).filter(line => /^(→ |  )\d+\./.test(line)).map(line => line.slice(2));
+        await selection(selector);
+        return result;
+      },
+      notify: (message: string) => notices.push(message),
       getToolsExpanded: () => expanded,
       setToolsExpanded: (value: boolean) => { expanded = value; },
       setWidget: (key: string, factory: ((ui: TUI) => unknown) | undefined) => {
@@ -34,6 +50,7 @@ function harness(fullscreen = false, mode: "tui" | "rpc" = "tui") {
   toolGroups({
     on: (name: string, handler: (event: ExtensionEvent, ctx: ExtensionContext) => unknown) => handlers.set(name, handler),
     registerToolRenderer: (value: ToolRendererResolver) => { resolvers.push(value); },
+    registerCommand: (name: string, value: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => commands.set(name, value),
     registerShortcut: (key: string, value: { handler: (ctx: ExtensionContext) => unknown }) => shortcuts.set(key, value),
     getSettings: () => ({ terminal: { imageWidthCells: 60 } }),
   } as unknown as ExtensionAPI);
@@ -42,7 +59,15 @@ function harness(fullscreen = false, mode: "tui" | "rpc" = "tui") {
     index < resolvers.length ? resolvers[index]!(name, () => resolve(name, base, index + 1)) : base();
   const emit = async (event: ExtensionEvent) => { await handlers.get(event.type)?.(event, ctx); };
   return {
-    tui, ctx, emit, widgets,
+    tui, ctx, emit, widgets, notices,
+    get session() { return session; },
+    replaceSession: () => { session = SessionManager.inMemory(); },
+    choose: (value: typeof selection) => { selection = value; },
+    get choices() { return choices; },
+    command: () => commands.get("tool-groups")!.handler("", ctx),
+    keys: (...keys: string[]) => {
+      selection = async component => { for (const key of keys) component.handleInput?.(key); };
+    },
     start: () => emit({ type: "session_start", reason: "startup" }),
     toggle: () => shortcuts.get("alt+o")?.handler(ctx),
     row: (name: string, id: string, args = {}, definition?: ToolRenderers) =>
@@ -53,11 +78,190 @@ function harness(fullscreen = false, mode: "tui" | "rpc" = "tui") {
 let timestamp = 0;
 const call = (id: string, name = "read") => ({ type: "toolCall" as const, id, name, arguments: {} });
 function assistant(content: unknown[]) {
-  return { role: "assistant", content, timestamp: ++timestamp } as Extract<ExtensionEvent, {type: "message_start"}>["message"];
+  return { role: "assistant", content, timestamp: ++timestamp } as Extract<Extract<ExtensionEvent, {type: "message_start"}>["message"], {role: "assistant"}>;
 }
-const plain = (lines: readonly string[]) => lines.map(line => line.replace(/[[0-9;]*m/g, "").trimEnd());
+const plain = (lines: readonly string[]) => lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
 
 describe("tool groups through the extension entry", () => {
+  it("replays only displayed compaction-aware history on resume", async () => {
+    const h = harness();
+    h.session.appendMessage(assistant([call("hidden", "bash")]));
+    const kept = h.session.appendMessage(assistant([{ type: "text", text: "boundary" }, call("kept")]));
+    h.session.appendMessage({ role: "toolResult", toolCallId: "kept", toolName: "read", content: [], isError: false, timestamp: ++timestamp });
+    h.session.appendCompaction("old calls summarized", kept, 100);
+    await h.start();
+    expect(plain(h.row("read", "kept").render(100))).toEqual(["", "▸ read: 1 succeeded"]);
+    expect(plain(h.row("bash", "hidden").render(100)).join(" ")).not.toContain("▸");
+  });
+
+  it("merges persisted history with live messages and reconciles persistence without duplicates", async () => {
+    const h = harness();
+    h.session.appendMessage(assistant([call("old")]));
+    await h.start();
+    const live = assistant([call("live", "bash")]);
+    await h.emit({ type: "message_start", message: live });
+    await h.emit({ type: "tool_execution_end", toolCallId: "live", toolName: "bash", result: {}, isError: false });
+    expect(plain(h.row("read", "old").render(100))).toEqual(["", "▸ read: 1 running · bash: 1 succeeded"]);
+    h.session.appendMessage(live);
+    h.session.appendMessage({ role: "toolResult", toolCallId: "live", toolName: "bash", content: [], isError: false, timestamp: ++timestamp });
+    await h.emit({ type: "message_start", message: assistant([call("next", "write")]) });
+    expect(plain(h.row("read", "old").render(100))).toEqual(["", "▸ read: 1 running · bash: 1 succeeded · write: 1 running"]);
+  });
+
+  it("keeps distinct live messages when their timestamps match persisted messages", async () => {
+    const h = harness();
+    const persisted = assistant([call("persisted")]);
+    h.session.appendMessage(persisted);
+    await h.start();
+    const live = { ...assistant([call("live", "bash")]), timestamp: persisted.timestamp };
+    await h.emit({ type: "message_start", message: live });
+    expect(plain(h.row("read", "persisted").render(100))).toEqual(["", "▸ read: 1 running · bash: 1 running"]);
+    h.session.appendMessage(live);
+    await h.emit({ type: "message_start", message: assistant([call("next", "write")]) });
+    expect(plain(h.row("read", "persisted").render(100))).toEqual(["", "▸ read: 1 running · bash: 1 running · write: 1 running"]);
+  });
+
+  it("keeps the selected row visible in a long history", async () => {
+    const h = harness();
+    for (let index = 1; index <= 50; index++) {
+      h.session.appendMessage(assistant([{ type: "text", text: "break" }, call(String(index), "tool" + index)]));
+    }
+    await h.start();
+    h.choose(async component => {
+      const initial = plain(component.render(80));
+      expect(initial.length).toBeLessThanOrEqual(12);
+      expect(initial.join(" ")).toContain("→ 50. ▸ tool50: 1 running");
+      for (let index = 0; index < 40; index++) component.handleInput?.("\x1b[B");
+      const scrolled = plain(component.render(80));
+      expect(scrolled.length).toBeLessThanOrEqual(12);
+      expect(scrolled.join(" ")).toContain("→ 10. ▸ tool10: 1 running");
+      component.handleInput?.("\r");
+    });
+    await h.command();
+    expect(plain(h.row("tool10", "10").render(100))[1]).toContain("▾");
+    expect(plain(h.row("tool50", "50").render(100))[1]).toContain("▸");
+  });
+
+  it("restores nested metadata and toggles newest-first choices; cancel and stale choices are inert", async () => {
+    const h = harness();
+    h.session.appendMessage(assistant([call("first", "codemode")]));
+    h.session.appendMessage({ role: "toolResult", toolCallId: "first", toolName: "codemode", content: [], isError: false, nestedCalls: { complete: true, calls: [{ id: "first/0", name: "bash", status: "error" }] }, timestamp: ++timestamp });
+    h.session.appendMessage(assistant([{ type: "text", text: "separate" }, call("newest", "write")]));
+    await h.start();
+    expect(plain(h.row("codemode", "first").render(100))).toEqual(["", "▸ bash: 1 failed"]);
+    h.keys("\r");
+    await h.command();
+    expect(h.choices[0]).toBe("2. ▸ write: 1 running");
+    expect(plain(h.row("write", "newest").render(100))[1]).toContain("▾");
+    h.keys("\x1b");
+    await h.command();
+    h.choose(async component => {
+      await h.emit({ type: "session_tree", newLeafId: null, oldLeafId: null });
+      component.handleInput?.("\r");
+    });
+    await h.command();
+    expect(plain(h.row("write", "newest").render(100))[1]).toContain("▾");
+  });
+
+  it("reconciles restored nested metadata with live outcomes across replay and history changes", async () => {
+    const h = harness();
+    h.session.appendMessage(assistant([call("wrapper", "codemode")]));
+    const snapshot = {
+      role: "toolResult" as const, toolCallId: "wrapper", toolName: "codemode", content: [], isError: false, timestamp: ++timestamp,
+      nestedCalls: { complete: false, calls: [
+        { id: "child", name: "read", status: "unfinished" as const },
+        { id: "stale", name: "bash", status: "ok" as const },
+      ] },
+    };
+    h.session.appendMessage(snapshot);
+    await h.start();
+    const row = h.row("codemode", "wrapper");
+    expect(plain(row.render(120))).toEqual(["", "▸ read: 1 running · bash: 1 succeeded (incomplete)"]);
+    await h.toggle();
+    await h.emit({ type: "tool_execution_end", toolCallId: "child", parentToolCallId: "wrapper", toolName: "read", result: {}, isError: false });
+    await h.emit({ type: "tool_execution_end", toolCallId: "stale", parentToolCallId: "wrapper", toolName: "bash", result: {}, isError: true });
+    // A restored child identity also routes deeper live events to the wrapper.
+    await h.emit({ type: "tool_execution_end", toolCallId: "extra", parentToolCallId: "child", toolName: "write", result: {}, isError: false });
+    await h.emit({ type: "message_start", message: snapshot });
+    await h.emit({ type: "message_end", message: snapshot });
+    await h.command();
+    const expected = "▾ read: 1 succeeded · bash: 1 failed · write: 1 succeeded (incomplete)";
+    expect(plain(row.render(120))[1]).toBe(expected);
+    expect(h.choices).toEqual(["1. " + expected]);
+    expect(h.row("read", "child").render(120).length).toBeGreaterThan(0);
+
+    h.replaceSession();
+    h.session.appendMessage(assistant([call("wrapper", "codemode")]));
+    h.session.appendMessage(snapshot);
+    await h.emit({ type: "session_tree", newLeafId: null, oldLeafId: null });
+    expect(plain(row.render(120))[1]).toBe("▾ read: 1 running · bash: 1 succeeded (incomplete)");
+  });
+
+  it("does nothing for empty history and non-TUI command contexts", async () => {
+    const empty = harness(); await empty.start();
+    await empty.command();
+    expect(empty.choices).toEqual([]);
+    const rpc = harness(false, "rpc");
+    await rpc.start();
+    rpc.session.appendMessage(assistant([call("rpc-call")]));
+    await rpc.emit({ type: "session_tree", newLeafId: null, oldLeafId: null });
+    await rpc.command();
+    expect(rpc.choices).toEqual([]);
+  });
+
+  it("discards live calls when displayed history changes", async () => {
+    const h = harness(); await h.start();
+    await h.emit({ type: "message_start", message: assistant([call("abandoned")]) });
+    expect(plain(h.row("read", "abandoned").render(100))).toContain("▸ read: 1 running");
+    h.replaceSession();
+    h.session.appendMessage(assistant([call("branch")]));
+    await h.emit({ type: "session_tree", newLeafId: null, oldLeafId: null });
+    expect(plain(h.row("read", "abandoned").render(100)).join(" ")).not.toContain("▸");
+    expect(plain(h.row("read", "branch").render(100))).toEqual(["", "▸ read: 1 running"]);
+  });
+
+  it("selects with arrows and Enter and cancels with Escape in regular scrollback", async () => {
+    const h = harness();
+    h.session.appendMessage(assistant([call("first")]));
+    h.session.appendMessage(assistant([{ type: "text", text: "break" }, call("second", "write")]));
+    h.session.appendMessage(assistant([{ type: "text", text: "break" }, call("third", "bash")]));
+    await h.start();
+    h.keys("\x1b[B", "\x1b[B", "\x1b[A", "\r");
+    await h.command();
+    expect(h.choices.map(choice => choice.slice(5))).toEqual(["bash: 1 running", "write: 1 running", "read: 1 running"]);
+    expect(plain(h.row("write", "second").render(100))[1]).toContain("▾");
+    expect(plain(h.row("bash", "third").render(100))[1]).toContain("▸");
+    h.keys("\x1b[B", "\x1b");
+    await h.command();
+    expect(plain(h.row("write", "second").render(100))[1]).toContain("▾");
+  });
+
+  it("rebuilds after compaction, tree navigation, and session switch without leaking overlays", async () => {
+    const h = harness();
+    const old = h.session.appendMessage(assistant([call("old", "bash")]));
+    const kept = h.session.appendMessage(assistant([{ type: "text", text: "boundary" }, call("kept")]));
+    await h.start();
+    await h.emit({ type: "message_start", message: assistant([call("unpersisted", "write")]) });
+    await h.emit({ type: "tool_execution_end", toolCallId: "unpersisted", toolName: "write", result: {}, isError: true });
+    const compactId = h.session.appendCompaction("summary", kept, 100);
+    await h.emit({ type: "session_compact", compactionEntry: h.session.getEntry(compactId)!, fromExtension: false } as ExtensionEvent);
+    h.keys("\x1b"); await h.command();
+    expect(h.choices).toEqual(["1. ▸ read: 1 running"]);
+    h.session.branch(old);
+    await h.emit({ type: "session_tree", newLeafId: old, oldLeafId: compactId });
+    await h.command();
+    expect(h.choices).toEqual(["1. ▸ bash: 1 running"]);
+    h.choose(async component => {
+      h.replaceSession();
+      h.session.appendMessage(assistant([call("old", "write")]));
+      await h.emit({ type: "session_start", reason: "resume" });
+      component.handleInput?.("\r");
+    });
+    await h.command();
+    expect(plain(h.row("write", "old").render(100))).toEqual(["", "▸ write: 1 running"]);
+    expect(plain(h.row("write", "unpersisted").render(100)).join(" ")).not.toContain("▸");
+  });
+
   it("folds adjacent calls into one live summary and opens native text with Alt+O", async () => {
     const h = harness();
     await h.start();

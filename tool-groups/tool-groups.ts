@@ -1,8 +1,8 @@
 import {
-  ToolExecutionComponent,
+  ToolExecutionComponent, sessionEntryToContextMessages, getSelectListTheme,
   type ExtensionAPI, type ExtensionContext, type MessageStartEvent, type ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
-import { Container, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { Container, SelectList, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 
 type ToolRenderContext = Parameters<NonNullable<ToolRenderers["renderCall"]>>[2];
 type Call = { id: string; name: string };
@@ -20,7 +20,11 @@ export default function toolGroups(pi: ExtensionAPI) {
   const outcomes = new Map<string, Outcome>();
   const nestedStates = new Map<string, NestedState>();
   const nestedOwners = new Map<string, string>();
-  const messages: MessageStartEvent["message"][] = [];
+  const liveOutcomes = new Map<string, Outcome>();
+  let entryIds: string[] = [];
+  let historyVersion = 0;
+  type Message = MessageStartEvent["message"];
+  const messages: Message[] = [];
   let assistantIndex = -1;
 
   function syncGlobal() {
@@ -30,13 +34,54 @@ export default function toolGroups(pi: ExtensionAPI) {
     for (const group of groups) group.open = expanded;
   }
 
+  function messageKey(message: Message) {
+    return message.role === "toolResult"
+      ? `${message.role}:${message.timestamp}:${message.toolCallId}` : JSON.stringify(message);
+  }
+
+  function refreshHistory() {
+    messages.length = 0;
+    assistantIndex = -1;
+    liveOutcomes.clear();
+    nestedStates.clear();
+    nestedOwners.clear();
+    entryIds = [];
+    historyVersion++;
+    rebuild();
+  }
+
   function rebuild() {
+    if (!sessionContext) return;
+    const entries = sessionContext.sessionManager.buildContextEntries();
+    if (entryIds.some((id, index) => entries[index]?.id !== id)) {
+      messages.length = 0;
+      assistantIndex = -1;
+      liveOutcomes.clear();
+      nestedStates.clear();
+      nestedOwners.clear();
+      historyVersion++;
+    }
+    entryIds = entries.map(entry => entry.id);
+    const history = entries.flatMap(sessionEntryToContextMessages);
+    const persisted = new Set(history.map(messageKey));
+    const active = messages[assistantIndex];
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (persisted.has(messageKey(messages[index]!))) messages.splice(index, 1);
+    }
+    assistantIndex = active ? messages.indexOf(active) : -1;
     syncGlobal();
+    outcomes.clear();
     const previous = new Map(groups.map(group => [group.calls[0]!.id, group]));
     groups.length = 0;
     membership.clear();
     let group: Group | undefined;
-    for (const message of messages) {
+    for (const message of [...history, ...messages]) {
+      if (message.role === "toolResult") recordToolResult(message);
+      if (message.role === "assistant" && (message.stopReason === "aborted" || message.stopReason === "error")) {
+        for (const block of message.content) {
+          if (block.type === "toolCall" && !outcomes.has(block.id)) outcomes.set(block.id, "failed");
+        }
+      }
       if (message.role === "user") { group = undefined; continue; }
       if (message.role !== "assistant") continue;
       for (const block of message.content) {
@@ -50,6 +95,7 @@ export default function toolGroups(pi: ExtensionAPI) {
         membership.set(block.id, group);
       }
     }
+    for (const [id, outcome] of liveOutcomes) outcomes.set(id, outcome);
     tui?.requestRender();
   }
 
@@ -64,6 +110,7 @@ export default function toolGroups(pi: ExtensionAPI) {
     tui = undefined;
     sessionContext = ctx;
     globalExpanded = ctx.ui.getToolsExpanded();
+    refreshHistory();
     if (ctx.mode !== "tui") return;
     // The public widget factory supplies the host TUI without replacing the editor.
     ctx.ui.setWidget("tool-groups:acquire", (ui) => {
@@ -79,21 +126,52 @@ export default function toolGroups(pi: ExtensionAPI) {
     const nested = nestedStates.get(parent.id) ?? { calls: new Map<string, NestedCall>() };
     nested.complete = message.nestedCalls.complete;
     for (const call of message.nestedCalls.calls) {
-      nested.calls.set(call.id, {
-        id: call.id, name: call.name,
-        outcome: call.status === "ok" ? "succeeded" : call.status === "error" ? "failed" : nested.calls.get(call.id)?.outcome ?? "running",
-      });
+      const previous = nested.calls.get(call.id);
+      // Replayed snapshots must not downgrade completed live outcomes.
+      if (!previous || previous.outcome === "running") {
+        nested.calls.set(call.id, {
+          id: call.id, name: call.name,
+          outcome: call.status === "ok" ? "succeeded" : call.status === "error" ? "failed" : "running",
+        });
+      }
+      nestedOwners.set(call.id, parent.id);
     }
     nestedStates.set(parent.id, nested);
   }
 
-  pi.on("message_start", event => {
-    if (event.message.role === "toolResult") {
-      recordToolResult(event.message);
+  pi.on("session_tree", () => refreshHistory());
+  pi.on("session_compact", () => refreshHistory());
+  pi.registerCommand("tool-groups", {
+    description: "Toggle a historical tool group",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui" || !ctx.hasUI) return;
+      rebuild();
+      if (groups.length === 0) return;
+      const version = historyVersion;
+      const snapshot = groups.slice().reverse();
+      const selected = await ctx.ui.custom<number | undefined>((ui, _theme, _keys, done) => {
+        const list = new SelectList(snapshot.map((group, index) => ({
+          value: String(index), label: `${snapshot.length - index}. ${summary(group)}`,
+        })), Math.max(1, Math.min(10, ui.terminal.rows - 4)), getSelectListTheme());
+        list.onSelect = item => done(Number(item.value));
+        list.onCancel = () => done(undefined);
+        list.onSelectionChange = () => ui.requestRender();
+        return {
+          capturesViewportInput: true,
+          render: width => [truncateToWidth("Tool groups — ↑↓ select, Enter toggles, Escape cancels", width), ...list.render(width)],
+          handleInput: data => list.handleInput(data),
+          invalidate: () => list.invalidate(),
+        };
+      });
+      rebuild();
+      const group = selected === undefined ? undefined : snapshot[selected];
+      if (version !== historyVersion || !group || !groups.includes(group)) return;
+      group.open = !group.open;
       tui?.requestRender();
-      return;
-    }
-    if (event.message.role !== "assistant" && event.message.role !== "user") return;
+    },
+  });
+  pi.on("message_start", event => {
+    if (event.message.role !== "assistant" && event.message.role !== "user" && event.message.role !== "toolResult") return;
     messages.push(event.message);
     if (event.message.role === "assistant") assistantIndex = messages.length - 1;
     rebuild();
@@ -105,16 +183,13 @@ export default function toolGroups(pi: ExtensionAPI) {
   });
   pi.on("message_end", event => {
     if (event.message.role === "assistant" && assistantIndex >= 0) {
-      if (event.message.stopReason === "aborted" || event.message.stopReason === "error") {
-        for (const block of event.message.content) {
-          if (block.type === "toolCall" && !outcomes.has(block.id)) outcomes.set(block.id, "failed");
-        }
-      }
       messages[assistantIndex] = event.message;
       rebuild();
     } else if (event.message.role === "toolResult") {
-      recordToolResult(event.message);
-      tui?.requestRender();
+      const index = messages.findIndex(message => messageKey(message) === messageKey(event.message));
+      if (index < 0) messages.push(event.message);
+      else messages[index] = event.message;
+      rebuild();
     }
   });
   function recordNested(event: { parentToolCallId?: string; toolCallId: string; toolName: string }, outcome: Outcome) {
@@ -137,8 +212,9 @@ export default function toolGroups(pi: ExtensionAPI) {
       recordNested(event, event.isError ? "failed" : "succeeded");
       return;
     }
-    outcomes.set(event.toolCallId, event.isError ? "failed" : "succeeded");
-    tui?.requestRender();
+    if (!membership.has(event.toolCallId)) return;
+    liveOutcomes.set(event.toolCallId, event.isError ? "failed" : "succeeded");
+    rebuild();
   });
   pi.registerShortcut("alt+o", {
     description: "Toggle the latest tool group",
