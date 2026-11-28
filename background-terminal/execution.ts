@@ -90,7 +90,7 @@ export function createBackgroundBashOperations(killTree: KillTree, shellPath?: s
           child.removeListener("error", onError);
           child.removeListener("exit", onExit);
           for (const pipe of pipes) {
-            pipe.removeListener("readable", drain);
+            pipe.removeListener("readable", onReadable);
             pipe.removeListener("end", checkOutput);
             pipe.removeListener("error", failOutput);
             pipe.destroy();
@@ -158,6 +158,8 @@ export function createBackgroundBashOperations(killTree: KillTree, shellPath?: s
           }
           checkOutput();
         };
+        // Avoid reentrant Windows pipe reads on libuv < 1.52: https://github.com/libuv/libuv/pull/4784
+        const onReadable = () => { setImmediate(drain); };
         const onExit = (code: number | null) => {
           exited = true;
           exitCode = code;
@@ -176,7 +178,7 @@ export function createBackgroundBashOperations(killTree: KillTree, shellPath?: s
         child.once("exit", onExit);
         for (const pipe of pipes) {
           // Read explicitly: Node resumes stdio after child exit, even during a pending sink write.
-          pipe.on("readable", drain);
+          pipe.on("readable", onReadable);
           pipe.once("end", checkOutput);
           pipe.on("error", failOutput);
         }

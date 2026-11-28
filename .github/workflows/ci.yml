@@ -16,15 +16,22 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        pi: [locked, "1.5.0"]
+        pi: [locked, "1.5.0", "1.7.0"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           cache: npm
+      # npm 10 crashes in Arborist when overriding workspace peers on Windows.
+      - name: Use npm 11 for workspace peer overrides
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/npm11" --no-save npm@11.21.3
+          node -e "require('node:fs').appendFileSync(process.env.GITHUB_PATH, require('node:path').join(process.env.RUNNER_TEMP, 'npm11', 'node_modules', '.bin') + require('node:os').EOL)"
       # Distribution gate: every extension directory has an entry in the root pi manifest.
       - run: node scripts/check-manifest.mjs
       - run: npm ci
@@ -58,7 +65,7 @@ jobs:
               'ask_user', 'background_kill', 'background_run', 'background_status',
               'goal_done', 'subagent', 'subagent_status', 'subagent_stop',
             ]);
-            assert.deepEqual(extensions.flatMap(e => [...e.commands.keys()]).sort(), ['background', 'goal', 'subagent']);
+            assert.deepEqual(extensions.flatMap(e => [...e.commands.keys()]).sort(), ['background', 'goal', 'subagent', 'tool-groups']);
             console.log(version + ': loaded ' + extensions.length + ' extensions');
           } finally {
             rmSync(scratch, { recursive: true, force: true });
