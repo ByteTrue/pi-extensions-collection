@@ -7,6 +7,8 @@ import { Container, truncateToWidth, type Component, type TUI } from "@earendil-
 type ToolRenderContext = Parameters<NonNullable<ToolRenderers["renderCall"]>>[2];
 type Call = { id: string; name: string };
 type Outcome = "running" | "succeeded" | "failed";
+type NestedCall = Call & { outcome: Outcome };
+type NestedState = { calls: Map<string, NestedCall>; complete?: boolean };
 type Group = { calls: Call[]; open: boolean };
 
 export default function toolGroups(pi: ExtensionAPI) {
@@ -16,6 +18,8 @@ export default function toolGroups(pi: ExtensionAPI) {
   const groups: Group[] = [];
   const membership = new Map<string, Group>();
   const outcomes = new Map<string, Outcome>();
+  const nestedStates = new Map<string, NestedState>();
+  const nestedOwners = new Map<string, string>();
   const messages: MessageStartEvent["message"][] = [];
   let assistantIndex = -1;
 
@@ -53,6 +57,8 @@ export default function toolGroups(pi: ExtensionAPI) {
     groups.length = 0;
     membership.clear();
     outcomes.clear();
+    nestedStates.clear();
+    nestedOwners.clear();
     messages.length = 0;
     assistantIndex = -1;
     tui = undefined;
@@ -66,7 +72,27 @@ export default function toolGroups(pi: ExtensionAPI) {
     });
     ctx.ui.setWidget("tool-groups:acquire", undefined);
   });
+  function recordToolResult(message: Extract<MessageStartEvent["message"], { role: "toolResult" }>) {
+    outcomes.set(message.toolCallId, message.isError ? "failed" : "succeeded");
+    const parent = membership.get(message.toolCallId)?.calls.find(call => call.id === message.toolCallId);
+    if (parent?.name !== "codemode" || !message.nestedCalls) return;
+    const nested = nestedStates.get(parent.id) ?? { calls: new Map<string, NestedCall>() };
+    nested.complete = message.nestedCalls.complete;
+    for (const call of message.nestedCalls.calls) {
+      nested.calls.set(call.id, {
+        id: call.id, name: call.name,
+        outcome: call.status === "ok" ? "succeeded" : call.status === "error" ? "failed" : nested.calls.get(call.id)?.outcome ?? "running",
+      });
+    }
+    nestedStates.set(parent.id, nested);
+  }
+
   pi.on("message_start", event => {
+    if (event.message.role === "toolResult") {
+      recordToolResult(event.message);
+      tui?.requestRender();
+      return;
+    }
     if (event.message.role !== "assistant" && event.message.role !== "user") return;
     messages.push(event.message);
     if (event.message.role === "assistant") assistantIndex = messages.length - 1;
@@ -87,12 +113,30 @@ export default function toolGroups(pi: ExtensionAPI) {
       messages[assistantIndex] = event.message;
       rebuild();
     } else if (event.message.role === "toolResult") {
-      outcomes.set(event.message.toolCallId, event.message.isError ? "failed" : "succeeded");
+      recordToolResult(event.message);
       tui?.requestRender();
     }
   });
+  function recordNested(event: { parentToolCallId?: string; toolCallId: string; toolName: string }, outcome: Outcome) {
+    if (!event.parentToolCallId) return;
+    const ownerId = nestedOwners.get(event.parentToolCallId) ?? event.parentToolCallId;
+    const parent = membership.get(ownerId)?.calls.find(call => call.id === ownerId);
+    if (parent?.name !== "codemode") return;
+    const nested = nestedStates.get(ownerId) ?? { calls: new Map<string, NestedCall>() };
+    if (outcome !== "running" || !nested.calls.has(event.toolCallId)) {
+      nested.calls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, outcome });
+    }
+    nestedStates.set(ownerId, nested);
+    nestedOwners.set(event.toolCallId, ownerId);
+    tui?.requestRender();
+  }
+  pi.on("tool_execution_start", event => recordNested(event, "running"));
+  pi.on("tool_execution_update", event => recordNested(event, "running"));
   pi.on("tool_execution_end", event => {
-    if (event.parentToolCallId) return;
+    if (event.parentToolCallId) {
+      recordNested(event, event.isError ? "failed" : "succeeded");
+      return;
+    }
     outcomes.set(event.toolCallId, event.isError ? "failed" : "succeeded");
     tui?.requestRender();
   });
@@ -108,17 +152,29 @@ export default function toolGroups(pi: ExtensionAPI) {
 
   function summary(group: Group) {
     const counts = new Map<string, Map<Outcome, number>>();
+    let incomplete = false;
     for (const call of group.calls) {
+      const nested = call.name === "codemode" ? nestedStates.get(call.id) : undefined;
+      incomplete ||= nested?.complete === false;
+      if (nested && (nested.calls.size > 0 || nested.complete === false)) {
+        for (const child of nested.calls.values()) {
+          const byOutcome = counts.get(child.name) ?? new Map<Outcome, number>();
+          byOutcome.set(child.outcome, (byOutcome.get(child.outcome) ?? 0) + 1);
+          counts.set(child.name, byOutcome);
+        }
+        continue;
+      }
       const byOutcome = counts.get(call.name) ?? new Map<Outcome, number>();
       const outcome = outcomes.get(call.id) ?? "running";
       byOutcome.set(outcome, (byOutcome.get(outcome) ?? 0) + 1);
       counts.set(call.name, byOutcome);
     }
-    return (group.open ? "▾ " : "▸ ") + [...counts].map(([name, values]) =>
+    const body = [...counts].map(([name, values]) =>
       name + ": " + (["running", "succeeded", "failed"] as const)
         .filter(outcome => values.has(outcome))
         .map(outcome => values.get(outcome) + " " + outcome).join(", ")
     ).join(" · ");
+    return (group.open ? "▾ " : "▸ ") + (body || "codemode") + (incomplete ? " (incomplete)" : "");
   }
 
   pi.registerToolRenderer((name, next) => {

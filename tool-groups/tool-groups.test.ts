@@ -119,6 +119,102 @@ describe("tool groups through the extension entry", () => {
     expect(plain(h.row("read", "new").render(120))).toEqual(["", "▸ read: 1 running"]);
   });
 
+  it("summarizes live nested executions once and reconciles persisted metadata", async () => {
+    const h = harness(); await h.start();
+    const message = assistant([call("wrapper", "codemode")]);
+    await h.emit({ type: "message_start", message });
+    const row = h.row("codemode", "wrapper");
+    await h.emit({ type: "tool_execution_start", toolCallId: "nested-1", parentToolCallId: "wrapper", toolName: "read", args: {} });
+    expect(plain(row.render(100))).toEqual(["", "▸ read: 1 running"]);
+    await h.emit({ type: "message_update", message, assistantMessageEvent: { type: "text_start", contentIndex: 0 } } as unknown as ExtensionEvent);
+    expect(plain(row.render(100))).toEqual(["", "▸ read: 1 running"]);
+    await h.emit({ type: "tool_execution_end", toolCallId: "nested-1", parentToolCallId: "wrapper", toolName: "read", result: {}, isError: false });
+    await h.emit({ type: "tool_execution_start", toolCallId: "nested-2", parentToolCallId: "wrapper", toolName: "bash", args: {} });
+    await h.emit({ type: "tool_execution_end", toolCallId: "nested-2", parentToolCallId: "wrapper", toolName: "bash", result: {}, isError: true });
+    expect(plain(row.render(100))).toEqual(["", "▸ read: 1 succeeded · bash: 1 failed"]);
+    const result = { role: "toolResult" as const, toolCallId: "wrapper", toolName: "codemode", content: [], isError: false, timestamp: ++timestamp, nestedCalls: {
+      complete: true, calls: [
+        { id: "nested-1", name: "read", status: "ok" as const },
+        { id: "nested-2", name: "bash", status: "error" as const },
+      ],
+    } };
+    await h.emit({ type: "message_end", message: result });
+    expect(plain(row.render(100))).toEqual(["", "▸ read: 1 succeeded · bash: 1 failed"]);
+    const native = new ToolExecutionComponent("codemode", "wrapper", {}, {}, undefined, h.tui, h.ctx.cwd);
+    const output = { content: [{ type: "text" as const, text: "result" }], isError: false };
+    row.updateResult(output); native.updateResult(output);
+    await h.toggle();
+    const actual = [...row.render(100)]; actual.splice(1, 1);
+    expect(actual).toEqual(native.render(100));
+    await h.emit({ type: "message_start", message: { role: "user", content: "restore", timestamp: ++timestamp } });
+    const restoredHost = harness(); await restoredHost.start();
+    await restoredHost.emit({ type: "message_start", message });
+    const restored = restoredHost.row("codemode", "wrapper");
+    await restoredHost.emit({ type: "message_start", message: result });
+    expect(plain(restored.render(100))).toEqual(["", "▸ read: 1 succeeded · bash: 1 failed"]);
+  });
+
+  it("keeps completed outcomes through duplicate starts, updates and recursive calls", async () => {
+    const h = harness(); await h.start();
+    const message = assistant([call("wrapper", "codemode"), call("sibling", "write")]);
+    await h.emit({ type: "message_start", message });
+    const row = h.row("codemode", "wrapper");
+    const start = { type: "tool_execution_start" as const, toolCallId: "child", parentToolCallId: "wrapper", toolName: "read", args: {} };
+    await h.emit(start);
+    await h.emit({ ...start, type: "tool_execution_end", result: {}, isError: false });
+    await h.emit(start);
+    expect(plain(row.render(120))[1]).toBe("▸ read: 1 succeeded · write: 1 running");
+    await h.emit({ ...start, type: "tool_execution_update", partialResult: {} });
+    await h.emit({ ...start, toolCallId: "grandchild", parentToolCallId: "child", toolName: "bash" });
+    await h.emit({ ...start, type: "tool_execution_end", toolCallId: "grandchild", parentToolCallId: "child", toolName: "bash", result: {}, isError: true });
+    await h.emit({ type: "message_update", message, assistantMessageEvent: { type: "text_start", contentIndex: 0 } } as unknown as ExtensionEvent);
+    expect(plain(row.render(120))[1]).toBe("▸ read: 1 succeeded · bash: 1 failed · write: 1 running");
+    expect(h.row("write", "sibling").render(120)).toEqual([]);
+  });
+
+  it("counts codemode itself when no nested calls are reported", async () => {
+    const h = harness(); await h.start();
+    await h.emit({ type: "message_start", message: assistant([call("wrapper", "codemode")]) });
+    const row = h.row("codemode", "wrapper");
+    expect(plain(row.render(100))[1]).toBe("▸ codemode: 1 running");
+    await h.emit({ type: "message_end", message: { role: "toolResult", toolCallId: "wrapper", toolName: "codemode", content: [{ type: "text", text: "read: failed" }], isError: true, timestamp: ++timestamp, nestedCalls: { calls: [], complete: true } } });
+    expect(plain(row.render(100))[1]).toBe("▸ codemode: 1 failed");
+  });
+
+  it("retains completed live calls beyond a capped persisted snapshot", async () => {
+    const h = harness(); await h.start();
+    await h.emit({ type: "message_start", message: assistant([call("wrapper", "codemode")]) });
+    const row = h.row("codemode", "wrapper");
+    const calls = Array.from({ length: 257 }, (_, i) => ({ id: "child-" + i, name: "read", status: "ok" as const }));
+    for (const child of calls) {
+      const event = { toolCallId: child.id, parentToolCallId: "wrapper", toolName: child.name };
+      await h.emit({ ...event, type: "tool_execution_start", args: {} });
+      await h.emit({ ...event, type: "tool_execution_end", result: {}, isError: false });
+    }
+    await h.emit({ type: "message_end", message: {
+      role: "toolResult", toolCallId: "wrapper", toolName: "codemode", content: [], isError: false, timestamp: ++timestamp,
+      nestedCalls: { complete: false, calls: [{ ...calls[0]!, status: "unfinished" }, ...calls.slice(1, 256)] },
+    } });
+    expect(plain(row.render(100))).toEqual(["", "▸ read: 257 succeeded (incomplete)"]);
+  });
+
+  it("keeps known nested calls but marks capped metadata incomplete", async () => {
+    const h = harness(); await h.start();
+    const message = assistant([call("wrapper", "codemode")]);
+    await h.emit({ type: "message_start", message });
+    const row = h.row("codemode", "wrapper");
+    const result = { role: "toolResult" as const, toolCallId: "wrapper", toolName: "codemode", content: [], isError: false, timestamp: ++timestamp, nestedCalls: {
+      complete: false, calls: [{ id: "reported", name: "read", status: "unfinished" as const }],
+    } };
+    await h.emit({ type: "message_end", message: result });
+    expect(plain(row.render(100))).toEqual(["", "▸ read: 1 running (incomplete)"]);
+    await h.emit({ type: "message_start", message: { role: "user", content: "empty capped", timestamp: ++timestamp } });
+    await h.emit({ type: "message_start", message: assistant([call("empty", "codemode")]) });
+    const empty = h.row("codemode", "empty");
+    await h.emit({ type: "message_end", message: { ...result, toolCallId: "empty", nestedCalls: { complete: false, calls: [] } } });
+    expect(plain(empty.render(100))).toEqual(["", "▸ codemode (incomplete)"]);
+  });
+
   it("marks calls skipped by an aborted or errored assistant response failed", async () => {
     const h = harness(); await h.start();
     const message = { ...assistant([call("skipped")]), stopReason: "aborted" } as ReturnType<typeof assistant>;
@@ -211,7 +307,7 @@ describe("tool groups through the extension entry", () => {
       ["unknown", undefined], ["empty", {}], ["call-only", { renderCall: stateful.renderCall }],
       ["result-only", { renderResult: stateful.renderResult }],
       ["throwing", { renderCall: () => { throw Error("call"); }, renderResult: () => { throw Error("result"); } }],
-      ["stateful", stateful], ["self", { ...stateful, renderShell: "self" }],
+      ["stateful", stateful], ["self", { ...stateful, renderShell: "self" }], ["codemode", stateful],
     ];
     for (const [name, definition] of cases) {
       const id = name;
@@ -236,6 +332,15 @@ describe("tool groups through the extension entry", () => {
       const result = { content: [{ type: "text" as const, text: Array.from({length: 25}, (_, i) => "line " + i).join("\n") }], details: {}, isError: false, durationMs: 1234 };
       for (const partial of [true, false]) {
         for (const row of [grouped, native]) row.updateResult(result, partial);
+        if (name === "codemode" && partial) {
+          await h.emit({ type: "tool_execution_start", toolCallId: "child", parentToolCallId: id, toolName: "read", args: {} });
+          await h.emit({ type: "message_update", message: assistant([call(id, name)]), assistantMessageEvent: { type: "text_start", contentIndex: 0 } } as unknown as ExtensionEvent);
+          expect(plain(grouped.render(120))[1]).toBe("▾ read: 1 running");
+          await h.toggle();
+          await h.emit({ type: "tool_execution_end", toolCallId: "child", parentToolCallId: id, toolName: "read", result: {}, isError: true });
+          expect(plain(grouped.render(120))[1]).toBe("▸ read: 1 failed");
+          await h.toggle();
+        }
         compare(partial ? "partial" : "final");
       }
       for (const expanded of [true, false]) {
