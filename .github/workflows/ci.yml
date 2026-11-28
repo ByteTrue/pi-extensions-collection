@@ -16,6 +16,7 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
         pi: [locked, "1.5.0", "1.7.0"]
@@ -25,6 +26,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           cache: npm
+      # npm 10 crashes in Arborist when overriding workspace peers on Windows.
+      - run: npm install --global npm@11.21.3
       # Distribution gate: every extension directory has an entry in the root pi manifest.
       - run: node scripts/check-manifest.mjs
       - run: npm ci
