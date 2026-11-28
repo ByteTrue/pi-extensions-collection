@@ -171,16 +171,27 @@ describe("BackgroundManager", () => {
 
   it("writes a task journal and removes it when the task settles", async () => {
     const manager = createManager();
-    manager.init(() => {});
-    const task = manager.start('node -e ""', process.cwd(), SESSION_A);
+    const onExit = vi.fn();
+    manager.init(onExit);
+    let complete!: (result: { exitCode: number }) => void;
+    const completion = new Promise<{ exitCode: number }>((resolve) => { complete = resolve; });
+    const exec = vi.fn(() => completion);
+    const task = manager.start("unused", process.cwd(), SESSION_A, { operations: { exec } });
     const dir = join(tmpdir(), "background-terminal");
     const journal = join(dir, `${task.id}.journal.json`);
     const pid = join(dir, `${task.id}.pid`);
     const start = join(dir, `${task.id}.start`);
 
-    await vi.waitFor(() => expect(existsSync(journal)).toBe(true), { timeout: 8000 });
-    await vi.waitFor(() => expect(manager.get(task.id, SESSION_A)?.status).toBe("exited"), { timeout: 8000 });
-    await vi.waitFor(() => expect(existsSync(journal)).toBe(false), { timeout: 8000 });
+    // Hold completion so polling cannot miss a short-lived task's journal.
+    await vi.waitFor(() => expect(exec).toHaveBeenCalledOnce(), { timeout: 8000 });
+    try {
+      expect(existsSync(journal)).toBe(true);
+    } finally {
+      complete({ exitCode: 0 });
+    }
+    await vi.waitFor(() => expect(onExit).toHaveBeenCalledOnce(), { timeout: 8000 });
+    expect(manager.get(task.id, SESSION_A)?.status).toBe("exited");
+    expect(existsSync(journal)).toBe(false);
     expect(existsSync(pid)).toBe(false);
     expect(existsSync(start)).toBe(false);
 
